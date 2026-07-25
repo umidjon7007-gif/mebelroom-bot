@@ -1,18 +1,27 @@
 """
 Zaxira Bot - Mebel ustaxonasi uchun mahsulot kirim/chiqim va qoldiq kuzatuv boti.
 
-Buyruqlar:
-  /kirim <mahsulot> <miqdor>   - mahsulot keldi (zaxiraga qo'shiladi)
-  /chiqim <mahsulot> <miqdor>  - mahsulot ketdi/sotildi (zaxiradan ayiriladi)
-  /qoldiq                       - barcha mahsulotlar qoldig'ini ko'rsatadi
-  /qoldiq <mahsulot>            - bitta mahsulot qoldig'ini ko'rsatadi
-  /tarix <mahsulot> [soni]       - mahsulot bo'yicha oxirgi harakatlar tarixi
-  /ochir <mahsulot>              - mahsulotni ro'yxatdan o'chiradi (ehtiyot bo'ling)
-  /yordam yoki /start            - yordam matni
+Mahsulot nomi har doim shu tartibda yoziladi: <model> <detal>
+Masalan: "laura tumba", "vena shkaf". Bot birinchi so'zni model deb,
+qolganini detal deb tushunadi va shunga qarab guruhlaydi.
 
-Har bir yozuv kim tomonidan kiritilgani va vaqti bilan saqlanadi,
-shuning uchun butun jamoa (bir nechta xodim) bitta guruhda yoki
-shaxsiy chatda foydalanishi mumkin.
+Buyruqlar:
+  /kirim <model> <detal> <miqdor>   - mahsulot keldi (zaxiraga qo'shiladi)
+  /chiqim <model> <detal> <miqdor>  - mahsulot ketdi/sotildi (zaxiradan ayiriladi)
+  /qoldiq                            - barcha mahsulotlar qoldig'ini ko'rsatadi
+  /qoldiq <model> <detal>            - bitta mahsulot qoldig'ini ko'rsatadi
+  /modellar                          - modellar ro'yxatini tugmalar bilan ko'rsatadi,
+                                        bosilganda o'sha model bo'yicha barcha
+                                        detallar va qoldig'ini chiqaradi
+  /tarix <model> <detal> [soni]      - mahsulot bo'yicha oxirgi harakatlar tarixi
+  /ochir <model> <detal>             - mahsulotni ro'yxatdan o'chiradi (ehtiyot bo'ling)
+  /yordam yoki /start                - yordam matni
+
+Faqat egasi (OWNER_ID muhit o'zgaruvchisida ko'rsatilgan foydalanuvchi)
+/kirim, /chiqim va /ochir buyruqlaridan foydalana oladi. Boshqa hamma
+(butun jamoa) faqat /qoldiq, /modellar va /tarix orqali ko'rib turadi,
+o'zgartira olmaydi. Agar OWNER_ID sozlanmagan bo'lsa, cheklov ishlamaydi
+(hamma hamma narsani qila oladi).
 """
 
 import logging
@@ -20,8 +29,13 @@ import os
 import sqlite3
 from datetime import datetime
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -30,6 +44,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "zaxira.db")
+
+_owner_id_raw = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
 
 
 def get_conn():
@@ -45,6 +62,8 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS products (
             name TEXT PRIMARY KEY COLLATE NOCASE,
+            model TEXT NOT NULL COLLATE NOCASE DEFAULT '',
+            item TEXT NOT NULL COLLATE NOCASE DEFAULT '',
             quantity INTEGER NOT NULL DEFAULT 0
         )
         """
@@ -62,12 +81,38 @@ def init_db():
         )
         """
     )
+
+    # Eski bazalarda 'model' va 'item' ustunlari bo'lmasligi mumkin - qo'shib olamiz.
+    cur.execute("PRAGMA table_info(products)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "model" not in existing_columns:
+        cur.execute("ALTER TABLE products ADD COLUMN model TEXT NOT NULL COLLATE NOCASE DEFAULT ''")
+    if "item" not in existing_columns:
+        cur.execute("ALTER TABLE products ADD COLUMN item TEXT NOT NULL COLLATE NOCASE DEFAULT ''")
+
+    # Model/item bo'sh qolgan (eski) yozuvlarni 'name' asosida to'ldiramiz.
+    cur.execute("SELECT name FROM products WHERE model = '' OR item = ''")
+    for (name,) in cur.fetchall():
+        model, item = split_model_item(name)
+        cur.execute(
+            "UPDATE products SET model = ?, item = ? WHERE name = ?",
+            (model, item or name, name),
+        )
+
     conn.commit()
     conn.close()
 
 
 def normalize_product_name(name: str) -> str:
     return name.strip().lower()
+
+
+def split_model_item(product_display: str):
+    """'laura tumba' -> ('laura', 'tumba'). Bitta so'z bo'lsa item bo'sh qoladi."""
+    parts = product_display.strip().split(maxsplit=1)
+    model = parts[0] if parts else ""
+    item = parts[1] if len(parts) > 1 else ""
+    return model.lower(), item.lower()
 
 
 def parse_amount(raw: str) -> int:
@@ -77,37 +122,60 @@ def parse_amount(raw: str) -> int:
     return amount
 
 
+def is_owner(update: Update) -> bool:
+    if OWNER_ID is None:
+        return True
+    user = update.effective_user
+    return bool(user and user.id == OWNER_ID)
+
+
+async def deny_access(update: Update):
+    await update.message.reply_text(
+        "Kechirasiz, faqat egasi mahsulot kirim/chiqim/o'chirish qila oladi. "
+        "Siz /qoldiq, /modellar va /tarix orqali ko'rib turishingiz mumkin."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Assalomu alaykum! Men zaxira botiman.\n\n"
+        "Mahsulot nomini har doim shunday yozing: <model> <detal>\n"
+        "Misol: laura tumba, vena shkaf\n\n"
         "Buyruqlar:\n"
-        "/kirim <mahsulot> <miqdor> - mahsulot keldi\n"
-        "/chiqim <mahsulot> <miqdor> - mahsulot sotildi/ketdi\n"
+        "/kirim <model> <detal> <miqdor> - mahsulot keldi\n"
+        "/chiqim <model> <detal> <miqdor> - mahsulot sotildi/ketdi\n"
         "/qoldiq - barcha mahsulotlar qoldig'i\n"
-        "/qoldiq <mahsulot> - bitta mahsulot qoldig'i\n"
-        "/tarix <mahsulot> [soni] - oxirgi harakatlar\n"
-        "/ochir <mahsulot> - mahsulotni ro'yxatdan o'chirish\n\n"
+        "/qoldiq <model> <detal> - bitta mahsulot qoldig'i\n"
+        "/modellar - modellar bo'yicha tugmali ko'rinish\n"
+        "/tarix <model> <detal> [soni] - oxirgi harakatlar\n"
+        "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n\n"
         "Misol:\n"
-        "/kirim shkaf 5\n"
-        "/chiqim krovat 2"
+        "/kirim laura tumba 5\n"
+        "/chiqim vena shkaf 2"
     )
     await update.message.reply_text(text)
 
 
 async def kirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
     await change_stock(update, context, "kirim")
 
 
 async def chiqim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
     await change_stock(update, context, "chiqim")
 
 
 async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str):
     args = context.args
-    if len(args) < 2:
+    if len(args) < 3:
         cmd = "/kirim" if change_type == "kirim" else "/chiqim"
         await update.message.reply_text(
-            f"Foydalanish: {cmd} <mahsulot nomi> <miqdor>\nMisol: {cmd} shkaf 5"
+            f"Foydalanish: {cmd} <model> <detal> <miqdor>\nMisol: {cmd} laura tumba 5"
         )
         return
 
@@ -124,6 +192,13 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
         return
 
     product_key = normalize_product_name(product_display)
+    model, item = split_model_item(product_display)
+    if not item:
+        await update.message.reply_text(
+            "Mahsulot nomini <model> <detal> ko'rinishida yozing.\nMisol: laura tumba"
+        )
+        return
+
     user = update.effective_user
     user_name = user.full_name if user else "noma'lum"
     user_id = user.id if user else None
@@ -142,8 +217,8 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
             return
         current_qty = 0
         cur.execute(
-            "INSERT INTO products (name, quantity) VALUES (?, ?)",
-            (product_key, 0),
+            "INSERT INTO products (name, model, item, quantity) VALUES (?, ?, ?, ?)",
+            (product_key, model, item, 0),
         )
     else:
         current_qty = row[0]
@@ -214,10 +289,58 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Hozircha hech qanday model ro'yxatga olinmagan.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(model.capitalize(), callback_data=f"model:{model}")]
+        for (model,) in rows
+    ]
+    await update.message.reply_text(
+        "📋 Modelni tanlang:", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not query.data.startswith("model:"):
+        return
+    model = query.data.split(":", 1)[1]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT item, quantity FROM products WHERE model = ? ORDER BY item",
+        (model,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(f"'{model}' bo'yicha mahsulot topilmadi.")
+        return
+
+    total = sum(qty for _, qty in rows)
+    lines = [f"📦 {model.capitalize()} (jami {total} ta):\n"]
+    for item, quantity in rows:
+        lines.append(f"• {item}: {quantity} ta")
+    await query.edit_message_text("\n".join(lines))
+
+
 async def tarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("Foydalanish: /tarix <mahsulot> [soni]\nMisol: /tarix shkaf 10")
+        await update.message.reply_text("Foydalanish: /tarix <model> <detal> [soni]\nMisol: /tarix laura tumba 10")
         return
 
     limit = 10
@@ -256,9 +379,12 @@ async def tarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ochir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
     args = context.args
     if not args:
-        await update.message.reply_text("Foydalanish: /ochir <mahsulot>")
+        await update.message.reply_text("Foydalanish: /ochir <model> <detal>")
         return
     product_display = " ".join(args).strip()
     product_key = normalize_product_name(product_display)
@@ -291,8 +417,17 @@ def main():
     app.add_handler(CommandHandler("kirim", kirim))
     app.add_handler(CommandHandler("chiqim", chiqim))
     app.add_handler(CommandHandler("qoldiq", qoldiq))
+    app.add_handler(CommandHandler("modellar", modellar))
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
+    app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+
+    if OWNER_ID is None:
+        logger.warning(
+            "OWNER_ID sozlanmagan - hamma foydalanuvchi kirim/chiqim qila oladi."
+        )
+    else:
+        logger.info("OWNER_ID sozlangan: %s", OWNER_ID)
 
     logger.info("Bot ishga tushdi...")
     app.run_polling()
