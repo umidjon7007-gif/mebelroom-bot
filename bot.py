@@ -43,7 +43,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "zaxira.db")
+# Railway'da /data volume ulangan bo'lsa, baza o'sha doimiy papkada saqlanadi
+# (shunda deploy/qayta ishga tushganda ma'lumot o'chib qolmaydi). Aks holda
+# botning o'z papkasida saqlanadi (mahalliy sinov uchun yetarli).
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
+DB_PATH = os.path.join(DATA_DIR, "zaxira.db")
 
 _owner_id_raw = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
