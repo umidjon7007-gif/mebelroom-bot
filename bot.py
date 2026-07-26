@@ -15,6 +15,11 @@ Buyruqlar:
                                         detallar va qoldig'ini chiqaradi
   /tarix <model> <detal> [soni]      - mahsulot bo'yicha oxirgi harakatlar tarixi
   /ochir <model> <detal>             - mahsulotni ro'yxatdan o'chiradi (ehtiyot bo'ling)
+  /royxatga                          - bir nechta modelni bir martada ro'yxatga
+                                        qo'shadi (miqdori 0 dan boshlanadi), format:
+                                        /royxatga
+                                        laura: shkaf, tumba, krovat, kamod, parta
+                                        vena: shkaf, tumba, krovat, kamod, parta
   /yordam yoki /start                - yordam matni
 
 Faqat egasi (OWNER_ID muhit o'zgaruvchisida ko'rsatilgan foydalanuvchi)
@@ -152,7 +157,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/qoldiq <model> <detal> - bitta mahsulot qoldig'i\n"
         "/modellar - modellar bo'yicha tugmali ko'rinish\n"
         "/tarix <model> <detal> [soni] - oxirgi harakatlar\n"
-        "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n\n"
+        "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n"
+        "/royxatga - bir nechta modelni birdaniga qo'shish\n\n"
         "Misol:\n"
         "/kirim laura tumba 5\n"
         "/chiqim vena shkaf 2"
@@ -406,6 +412,79 @@ async def ochir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"'{product_display}' ro'yxatda topilmadi.")
 
 
+async def royxatga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    full_text = update.message.text or ""
+    # Birinchi qatordan buyruq nomini olib tashlaymiz (masalan "/royxatga").
+    lines = full_text.split("\n")
+    first_line = lines[0]
+    after_command = first_line.split(None, 1)
+    remaining_first_line = after_command[1] if len(after_command) > 1 else ""
+    body_lines = ([remaining_first_line] if remaining_first_line else []) + lines[1:]
+
+    entries = []  # (model, item)
+    errors = []
+    for raw_line in body_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            errors.append(f"'{line}' - qator 'model: detal1, detal2' ko'rinishida bo'lishi kerak")
+            continue
+        model_part, items_part = line.split(":", 1)
+        model = model_part.strip().lower()
+        items = [item.strip().lower() for item in items_part.split(",") if item.strip()]
+        if not model or not items:
+            errors.append(f"'{line}' - model yoki detallar bo'sh")
+            continue
+        for item in items:
+            entries.append((model, item))
+
+    if not entries:
+        await update.message.reply_text(
+            "Foydalanish:\n"
+            "/royxatga\n"
+            "laura: shkaf, tumba, krovat, kamod, parta\n"
+            "vena: shkaf, tumba, krovat, kamod, parta"
+        )
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    added = []
+    skipped = []
+    for model, item in entries:
+        product_display = f"{model} {item}"
+        product_key = normalize_product_name(product_display)
+        cur.execute("SELECT 1 FROM products WHERE name = ?", (product_key,))
+        if cur.fetchone() is not None:
+            skipped.append(product_display)
+            continue
+        cur.execute(
+            "INSERT INTO products (name, model, item, quantity) VALUES (?, ?, ?, 0)",
+            (product_key, model, item),
+        )
+        added.append(product_display)
+    conn.commit()
+    conn.close()
+
+    lines_out = []
+    if added:
+        lines_out.append(f"✅ Qo'shildi ({len(added)} ta, hammasi 0 ta bilan):")
+        lines_out.extend(f"• {name}" for name in added)
+    if skipped:
+        lines_out.append(f"\n⏭ Allaqachon bor edi, o'tkazib yuborildi ({len(skipped)} ta):")
+        lines_out.extend(f"• {name}" for name in skipped)
+    if errors:
+        lines_out.append("\n⚠️ Xato qatorlar:")
+        lines_out.extend(f"• {err}" for err in errors)
+
+    await update.message.reply_text("\n".join(lines_out))
+
+
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -424,6 +503,7 @@ def main():
     app.add_handler(CommandHandler("modellar", modellar))
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
+    app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
 
     if OWNER_ID is None:
