@@ -32,7 +32,7 @@ o'zgartira olmaydi. Agar OWNER_ID sozlanmagan bo'lsa, cheklov ishlamaydi
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -90,6 +90,21 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT COLLATE NOCASE,          -- NULL bo'lsa - butun komplekt
+            amount INTEGER NOT NULL,
+            deadline TEXT NOT NULL,             -- ISO sana: YYYY-MM-DD
+            deadline_display TEXT NOT NULL,     -- masalan '5 avgust'
+            customer TEXT,
+            status TEXT NOT NULL DEFAULT 'kutilmoqda',  -- yoki 'bajarildi'
+            created_at TEXT NOT NULL
+        )
+        """
+    )
 
     # Eski bazalarda 'model' va 'item' ustunlari bo'lmasligi mumkin - qo'shib olamiz.
     cur.execute("PRAGMA table_info(products)")
@@ -122,6 +137,22 @@ def split_model_item(product_display: str):
     model = parts[0] if parts else ""
     item = parts[1] if len(parts) > 1 else ""
     return model.lower(), item.lower()
+
+
+MONTH_NAMES = {
+    "yanvar": 1,
+    "fevral": 2,
+    "mart": 3,
+    "aprel": 4,
+    "may": 5,
+    "iyun": 6,
+    "iyul": 7,
+    "avgust": 8,
+    "sentyabr": 9,
+    "oktyabr": 10,
+    "noyabr": 11,
+    "dekabr": 12,
+}
 
 
 def parse_amount(raw: str) -> int:
@@ -158,7 +189,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/modellar - modellar bo'yicha tugmali ko'rinish\n"
         "/tarix <model> <detal> [soni] - oxirgi harakatlar\n"
         "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n"
-        "/royxatga - bir nechta modelni birdaniga qo'shish\n\n"
+        "/royxatga - bir nechta modelni birdaniga qo'shish\n"
+        "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
+        "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
+        "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
+        "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n\n"
         "Misol:\n"
         "/kirim laura tumba 5\n"
         "/chiqim vena shkaf 2"
@@ -485,6 +520,235 @@ async def royxatga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines_out))
 
 
+def find_month_index(tokens):
+    """Ro'yxatdan oy nomi va undan oldingi kun raqamini topadi.
+    Qaytaradi: (oy_indeksi, kun) yoki None agar topilmasa."""
+    for i, tok in enumerate(tokens):
+        if tok.lower() in MONTH_NAMES and i > 0 and tokens[i - 1].isdigit():
+            return i, int(tokens[i - 1])
+    return None
+
+
+def compute_deadline(day: int, month: int):
+    """Bugundan keyingi eng yaqin shu kun/oyni topadi (o'tib ketgan bo'lsa - keyingi yil)."""
+    today = date.today()
+    year = today.year
+    try:
+        deadline = date(year, month, day)
+    except ValueError:
+        return None
+    if deadline < today:
+        try:
+            deadline = date(year + 1, month, day)
+        except ValueError:
+            return None
+    return deadline
+
+
+UZ_MONTH_BY_NUM = {v: k for k, v in MONTH_NAMES.items()}
+
+
+async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Foydalanish:\n"
+        "/buyurtma <model> komplekt <kun> <oy> [mijoz]\n"
+        "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz]\n\n"
+        "Misol:\n"
+        "/buyurtma vena komplekt 5 avgust\n"
+        "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon"
+    )
+    if len(args) < 3:
+        await update.message.reply_text(usage)
+        return
+
+    found = find_month_index(args)
+    if found is None:
+        await update.message.reply_text(
+            "Sanani tushunolmadim. Oy nomini to'g'ri yozing (masalan: avgust) "
+            "va undan oldin kunni yozing (masalan: 5 avgust).\n\n" + usage
+        )
+        return
+
+    month_idx, day = found
+    month = MONTH_NAMES[args[month_idx].lower()]
+    deadline = compute_deadline(day, month)
+    if deadline is None:
+        await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
+        return
+
+    before = args[: month_idx - 1]
+    customer_tokens = args[month_idx + 1 :]
+    customer = " ".join(customer_tokens).strip() or None
+
+    if not before:
+        await update.message.reply_text(usage)
+        return
+
+    model = before[0].lower()
+    item = None
+    amount = 1
+
+    if len(before) >= 2 and before[1].lower() == "komplekt":
+        remaining = before[2:]
+        if remaining and remaining[0].isdigit():
+            amount = int(remaining[0])
+    else:
+        if len(before) < 3:
+            await update.message.reply_text(usage)
+            return
+        item = before[1].lower()
+        if not before[2].isdigit():
+            await update.message.reply_text("Miqdor son bo'lishi kerak. Misol: laura shkaf 2 5 avgust")
+            return
+        amount = int(before[2])
+
+    deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+        """,
+        (model, item, amount, deadline.isoformat(), deadline_display, customer, datetime.now().isoformat(timespec="seconds")),
+    )
+    order_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    what = f"{model} komplekt" if item is None else f"{model} {item}"
+    lines = [
+        "📝 Yangi buyurtma qabul qilindi:",
+        f"№{order_id} — {what}" + (f" ({amount} ta)" if item else ""),
+        f"Muddat: {deadline_display}",
+    ]
+    if customer:
+        lines.append(f"Kimdan: {customer}")
+    lines.append("Holati: Kutilmoqda")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, model, item, amount, deadline, deadline_display, customer
+        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Hozircha bajarilmagan buyurtma yo'q.")
+        return
+
+    today = date.today()
+    lines = ["📋 Bajarilmagan buyurtmalar:\n"]
+    for order_id, model, item, amount, deadline_iso, deadline_display, customer in rows:
+        deadline_date = date.fromisoformat(deadline_iso)
+        days_left = (deadline_date - today).days
+        if days_left > 0:
+            days_text = f"{days_left} kun qoldi"
+        elif days_left == 0:
+            days_text = "bugun"
+        else:
+            days_text = f"muddati {abs(days_left)} kun o'tgan"
+
+        what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
+        line = f"№{order_id} — {what} — {deadline_display} ({days_text})"
+        if customer:
+            line += f" — {customer}"
+        lines.append(line)
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Foydalanish: /bajarildi <buyurtma raqami>\nMisol: /bajarildi 12")
+        return
+
+    order_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT model, item, amount FROM orders WHERE id = ? AND status = 'kutilmoqda'",
+        (order_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan.")
+        return
+
+    model, item, amount = row
+
+    if item is not None:
+        targets = [(model, item)]
+    else:
+        cur.execute("SELECT item FROM products WHERE model = ?", (model,))
+        targets = [(model, row_item) for (row_item,) in cur.fetchall()]
+
+    if not targets:
+        conn.close()
+        await update.message.reply_text(
+            f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."
+        )
+        return
+
+    user = update.effective_user
+    user_name = user.full_name if user else "noma'lum"
+    user_id = user.id if user else None
+    now = datetime.now().isoformat(timespec="seconds")
+
+    result_lines = []
+    for target_model, target_item in targets:
+        product_key = normalize_product_name(f"{target_model} {target_item}")
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
+        prow = cur.fetchone()
+        current_qty = prow[0] if prow else 0
+        new_qty = current_qty - amount
+        shortage = new_qty < 0
+        if shortage:
+            new_qty = 0
+
+        cur.execute(
+            "UPDATE products SET quantity = ? WHERE name = ?",
+            (new_qty, product_key),
+        )
+        cur.execute(
+            """
+            INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at)
+            VALUES (?, 'chiqim', ?, ?, ?, ?)
+            """,
+            (product_key, amount, user_name, user_id, now),
+        )
+        warn = " ⚠️ yetarli emas edi!" if shortage else ""
+        result_lines.append(f"• {target_item}: -{amount}{warn}")
+
+    cur.execute("UPDATE orders SET status = 'bajarildi' WHERE id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+
+    what = f"{model} komplekt" if item is None else f"{model} {item}"
+    lines = [f"✅ №{order_id} buyurtma bajarildi deb belgilandi.", f"{what} zaxiradan chiqarildi:"]
+    lines.extend(result_lines)
+    await update.message.reply_text("\n".join(lines))
+
+
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -504,6 +768,9 @@ def main():
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("royxatga", royxatga))
+    app.add_handler(CommandHandler("buyurtma", buyurtma))
+    app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
+    app.add_handler(CommandHandler("bajarildi", bajarildi))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
 
     if OWNER_ID is None:
