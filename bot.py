@@ -32,7 +32,7 @@ o'zgartira olmaydi. Agar OWNER_ID sozlanmagan bo'lsa, cheklov ishlamaydi
 import logging
 import os
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -56,6 +56,9 @@ DB_PATH = os.path.join(DATA_DIR, "zaxira.db")
 
 _owner_id_raw = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
+
+LOW_STOCK_THRESHOLD = 3
+TASHKENT_TZ = timezone(timedelta(hours=5))
 
 
 def get_conn():
@@ -189,11 +192,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/modellar - modellar bo'yicha tugmali ko'rinish\n"
         "/tarix <model> <detal> [soni] - oxirgi harakatlar\n"
         "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n"
+        "/tozalash hammasi - barcha sonlarni 0 ga qaytarish\n"
         "/royxatga - bir nechta modelni birdaniga qo'shish\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
         "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n\n"
+        "Avtomatik xabarlar:\n"
+        f"- Har kuni ertalab: {LOW_STOCK_THRESHOLD} tadan kam qolgan mahsulotlar haqida ogohlantirish\n"
+        "- Har yakshanba kechqurun: haftalik sotuv hisoboti\n\n"
         "Misol:\n"
         "/kirim laura tumba 5\n"
         "/chiqim vena shkaf 2"
@@ -445,6 +452,35 @@ async def ochir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"'{product_display}' ro'yxatdan o'chirildi.")
     else:
         await update.message.reply_text(f"'{product_display}' ro'yxatda topilmadi.")
+
+
+async def tozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or args[0].lower() != "hammasi":
+        await update.message.reply_text(
+            "Bu buyruq BARCHA mahsulotlar sonini 0 ga qaytaradi "
+            "(ro'yxat - model va detal nomlari - saqlanib qoladi).\n\n"
+            "Tasdiqlash uchun aynan shu yozing:\n"
+            "/tozalash hammasi"
+        )
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM products")
+    total = cur.fetchone()[0]
+    cur.execute("UPDATE products SET quantity = 0")
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🧹 Tozalandi. {total} ta mahsulotning barchasi 0 taga qaytarildi.\n"
+        "Endi /kirim orqali haqiqiy sonlarni qaytadan kiritishingiz mumkin."
+    )
 
 
 async def royxatga(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -749,6 +785,81 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def job_kam_qoldi(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, quantity FROM products WHERE quantity <= ? ORDER BY quantity ASC, name ASC",
+        (LOW_STOCK_THRESHOLD,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    lines = [f"⚠️ Kam qolgan mahsulotlar ({LOW_STOCK_THRESHOLD} tadan kam):\n"]
+    for name, quantity in rows:
+        lines.append(f"• {name}: {quantity} ta")
+    lines.append("\nKesish xizmatiga buyurtma berishni unutmang.")
+
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+
+
+async def job_haftalik_hisobot(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT product, SUM(amount) FROM transactions
+        WHERE change_type = 'chiqim' AND created_at >= ?
+        GROUP BY product ORDER BY SUM(amount) DESC
+        """,
+        (week_ago,),
+    )
+    sold_rows = cur.fetchall()
+
+    cur.execute(
+        """
+        SELECT p.model, SUM(t.amount) FROM transactions t
+        JOIN products p ON p.name = t.product
+        WHERE t.change_type = 'chiqim' AND t.created_at >= ?
+        GROUP BY p.model ORDER BY SUM(t.amount) DESC
+        """,
+        (week_ago,),
+    )
+    model_rows = cur.fetchall()
+    conn.close()
+
+    if not sold_rows:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text="📊 Haftalik hisobot:\n\nBu hafta hech qanday chiqim (sotuv) qayd etilmagan.",
+        )
+        return
+
+    total_sold = sum(amount for _, amount in sold_rows)
+    lines = [f"📊 Haftalik hisobot (oxirgi 7 kun):\n", f"Jami sotildi: {total_sold} ta\n"]
+
+    lines.append("Mahsulotlar bo'yicha:")
+    for product, amount in sold_rows:
+        lines.append(f"• {product}: {amount} ta")
+
+    if model_rows:
+        top_model, top_amount = model_rows[0]
+        lines.append(f"\n🏆 Eng ko'p sotilgan model: {top_model.capitalize()} ({top_amount} ta)")
+
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+
+
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -767,11 +878,29 @@ def main():
     app.add_handler(CommandHandler("modellar", modellar))
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
+    app.add_handler(CommandHandler("tozalash", tozalash))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
     app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
     app.add_handler(CommandHandler("bajarildi", bajarildi))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+
+    if app.job_queue is not None:
+        # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
+        app.job_queue.run_daily(
+            job_kam_qoldi, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har yakshanba kuni soat 20:00 (Toshkent vaqti) haftalik hisobot yuboradi.
+        app.job_queue.run_daily(
+            job_haftalik_hisobot,
+            time=time(hour=20, minute=0, tzinfo=TASHKENT_TZ),
+            days=(6,),
+        )
+    else:
+        logger.warning(
+            "job_queue mavjud emas - avtomatik ogohlantirish va hisobot ishlamaydi. "
+            "requirements.txt da 'python-telegram-bot[job-queue]' borligini tekshiring."
+        )
 
     if OWNER_ID is None:
         logger.warning(
