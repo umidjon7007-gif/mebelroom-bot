@@ -34,12 +34,19 @@ import os
 import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(
@@ -179,9 +186,27 @@ async def deny_access(update: Update):
     )
 
 
+MENU_BUTTONS = {
+    "qoldiq": "📦 Qoldiq",
+    "modellar": "📋 Modellar",
+    "buyurtmalar": "📝 Buyurtmalar",
+    "yordam": "❓ Yordam",
+}
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
+        [MENU_BUTTONS["buyurtmalar"], MENU_BUTTONS["yordam"]],
+    ],
+    resize_keyboard=True,
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Assalomu alaykum! Men zaxira botiman.\n\n"
+        "Pastdagi tugmalardan foydalanishingiz mumkin, yoki buyruqlarni "
+        "to'g'ridan-to'g'ri yozing.\n\n"
         "Mahsulot nomini har doim shunday yozing: <model> <detal>\n"
         "Misol: laura tumba, vena shkaf\n\n"
         "Buyruqlar:\n"
@@ -205,7 +230,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kirim laura tumba 5\n"
         "/chiqim vena shkaf 2"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 
 async def kirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -872,6 +897,10 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "yordam", "help"], start))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['qoldiq']}$"), qoldiq))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yordam']}$"), start))
     app.add_handler(CommandHandler("kirim", kirim))
     app.add_handler(CommandHandler("chiqim", chiqim))
     app.add_handler(CommandHandler("qoldiq", qoldiq))
