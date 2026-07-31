@@ -191,10 +191,13 @@ MENU_BUTTONS = {
     "modellar": "📋 Modellar",
     "buyurtmalar": "📝 Buyurtmalar",
     "yordam": "❓ Yordam",
+    "kirim": "📥 Kirim",
+    "chiqim": "📤 Chiqim",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
+        [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
         [MENU_BUTTONS["buyurtmalar"], MENU_BUTTONS["yordam"]],
     ],
@@ -248,7 +251,10 @@ async def chiqim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str):
-    args = context.args
+    await change_stock_core(update, context, change_type, context.args)
+
+
+async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args):
     if len(args) < 3:
         cmd = "/kirim" if change_type == "kirim" else "/chiqim"
         await update.message.reply_text(
@@ -333,6 +339,37 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
         f"Yangi qoldiq: {new_qty} ta.\n"
         f"Kiritdi: {user_name}"
     )
+
+
+async def kirim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    context.user_data["awaiting"] = "kirim"
+    await update.message.reply_text(
+        "📥 Kirim uchun model, detal va miqdorni yozing.\nMisol: laura shkaf 5"
+    )
+
+
+async def chiqim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    context.user_data["awaiting"] = "chiqim"
+    await update.message.reply_text(
+        "📤 Chiqim uchun model, detal va miqdorni yozing.\nMisol: laura shkaf 2"
+    )
+
+
+async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    awaiting = context.user_data.get("awaiting")
+    if not awaiting:
+        return  # oddiy xabar, buyruq emas - e'tiborsiz qoldiramiz
+
+    context.user_data["awaiting"] = None
+    text = (update.message.text or "").strip()
+    args = text.split()
+    await change_stock_core(update, context, awaiting, args)
 
 
 async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -901,6 +938,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yordam']}$"), start))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['kirim']}$"), kirim_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
     app.add_handler(CommandHandler("kirim", kirim))
     app.add_handler(CommandHandler("chiqim", chiqim))
     app.add_handler(CommandHandler("qoldiq", qoldiq))
