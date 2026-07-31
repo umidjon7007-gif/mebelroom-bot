@@ -204,6 +204,9 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+FINISH_BUTTON = "✅ Tayyor"
+FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -347,7 +350,11 @@ async def kirim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["awaiting"] = "kirim"
     await update.message.reply_text(
-        "📥 Kirim uchun model, detal va miqdorni yozing.\nMisol: laura shkaf 5"
+        "📥 Kirim rejimi yoqildi.\n"
+        "Model, detal va miqdorni yozing (misol: laura shkaf 5).\n"
+        "Xohlagancha ketma-ket yozishingiz mumkin.\n"
+        "Tugatganingizda '✅ Tayyor' tugmasini bosing.",
+        reply_markup=FINISH_MENU,
     )
 
 
@@ -357,8 +364,17 @@ async def chiqim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["awaiting"] = "chiqim"
     await update.message.reply_text(
-        "📤 Chiqim uchun model, detal va miqdorni yozing.\nMisol: laura shkaf 2"
+        "📤 Chiqim rejimi yoqildi.\n"
+        "Model, detal va miqdorni yozing (misol: laura shkaf 2).\n"
+        "Xohlagancha ketma-ket yozishingiz mumkin.\n"
+        "Tugatganingizda '✅ Tayyor' tugmasini bosing.",
+        reply_markup=FINISH_MENU,
     )
+
+
+async def tayyor_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting"] = None
+    await update.message.reply_text("Tayyor. Bosh menyuga qaytdik.", reply_markup=MAIN_MENU)
 
 
 async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,10 +382,11 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
     if not awaiting:
         return  # oddiy xabar, buyruq emas - e'tiborsiz qoldiramiz
 
-    context.user_data["awaiting"] = None
     text = (update.message.text or "").strip()
     args = text.split()
     await change_stock_core(update, context, awaiting, args)
+    # awaiting rejimi saqlanib qoladi - foydalanuvchi '✅ Tayyor' bosguncha
+    # ketma-ket yana mahsulot yozishi mumkin.
 
 
 async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,6 +957,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yordam']}$"), start))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['kirim']}$"), kirim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
     app.add_handler(CommandHandler("kirim", kirim))
     app.add_handler(CommandHandler("chiqim", chiqim))
