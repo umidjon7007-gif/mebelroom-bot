@@ -224,6 +224,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/tarix <model> <detal> [soni] - oxirgi harakatlar\n"
         "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n"
         "/tozalash hammasi - barcha sonlarni 0 ga qaytarish\n"
+        "/modelnomi <eski> <yangi> - model nomini o'zgartirish\n"
         "/royxatga - bir nechta modelni birdaniga qo'shish\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
@@ -560,6 +561,82 @@ async def tozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧹 Tozalandi. {total} ta mahsulotning barchasi 0 taga qaytarildi.\n"
         "Endi /kirim orqali haqiqiy sonlarni qaytadan kiritishingiz mumkin."
     )
+
+
+async def modelnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text(
+            "Foydalanish: /modelnomi <eski nom> <yangi nom>\n"
+            "Misol: /modelnomi laura sofia\n\n"
+            "Bu butun modelning (barcha detallari, sonlari va tarixi bilan) "
+            "nomini o'zgartiradi."
+        )
+        return
+
+    old_model = args[0].lower()
+    new_model = args[1].lower()
+
+    if old_model == new_model:
+        await update.message.reply_text("Eski va yangi nom bir xil.")
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name, item FROM products WHERE model = ?", (old_model,))
+    rows = cur.fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"'{old_model}' nomli model topilmadi.")
+        return
+
+    renamed = []
+    conflicts = []
+    for old_name, item in rows:
+        new_name = normalize_product_name(f"{new_model} {item}")
+        cur.execute("SELECT 1 FROM products WHERE name = ?", (new_name,))
+        if cur.fetchone() is not None:
+            conflicts.append(item)
+            continue
+        cur.execute(
+            "UPDATE products SET name = ?, model = ? WHERE name = ?",
+            (new_name, new_model, old_name),
+        )
+        cur.execute(
+            "UPDATE transactions SET product = ? WHERE product = ?",
+            (new_name, old_name),
+        )
+        renamed.append(item)
+
+    if renamed:
+        cur.execute(
+            "UPDATE orders SET model = ? WHERE model = ? AND item IN (%s)"
+            % ",".join("?" for _ in renamed),
+            [new_model, old_model, *renamed],
+        )
+
+    conn.commit()
+    conn.close()
+
+    lines = []
+    if renamed:
+        lines.append(
+            f"✅ '{old_model}' → '{new_model}' deb o'zgartirildi ({len(renamed)} ta detal):"
+        )
+        lines.extend(f"• {new_model} {item}" for item in renamed)
+    if conflicts:
+        lines.append(
+            f"\n⚠️ Quyidagilar o'tkazib yuborildi, chunki '{new_model}' modelida "
+            "shu nomli detal allaqachon bor edi:"
+        )
+        lines.extend(f"• {item}" for item in conflicts)
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def royxatga(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -966,6 +1043,7 @@ def main():
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
+    app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
     app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
