@@ -391,6 +391,14 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
     # ketma-ket yana mahsulot yozishi mumkin.
 
 
+def stock_indicator(quantity: int) -> str:
+    if quantity <= 0:
+        return "🔴"
+    if quantity <= LOW_STOCK_THRESHOLD:
+        return "🟡"
+    return "🟢"
+
+
 async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     conn = get_conn()
@@ -405,7 +413,9 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row is None:
             await update.message.reply_text(f"'{product_display}' ro'yxatda topilmadi.")
         else:
-            await update.message.reply_text(f"{row[0]}: {row[1]} ta qoldi.")
+            await update.message.reply_text(
+                f"{stock_indicator(row[1])} {row[0]}: {row[1]} ta qoldi."
+            )
         return
 
     cur.execute("SELECT name, quantity FROM products ORDER BY name")
@@ -418,7 +428,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📦 Zaxira qoldig'i:\n"]
     for name, quantity in rows:
-        lines.append(f"• {name}: {quantity} ta")
+        lines.append(f"{stock_indicator(quantity)} {name}: {quantity} ta")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -466,7 +476,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(qty for _, qty in rows)
     lines = [f"📦 {model.capitalize()} (jami {total} ta):\n"]
     for item, quantity in rows:
-        lines.append(f"• {item}: {quantity} ta")
+        lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
     await query.edit_message_text("\n".join(lines))
 
 
