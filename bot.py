@@ -225,6 +225,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ochir <model> <detal> - mahsulotni ro'yxatdan o'chirish\n"
         "/tozalash hammasi - barcha sonlarni 0 ga qaytarish\n"
         "/modelnomi <eski> <yangi> - model nomini o'zgartirish\n"
+        "/detalnomi <model> <eski detal> <yangi detal> - detal nomini o'zgartirish\n"
         "/royxatga - bir nechta modelni birdaniga qo'shish\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
@@ -639,6 +640,59 @@ async def modelnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def detalnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) != 3:
+        await update.message.reply_text(
+            "Foydalanish: /detalnomi <model> <eski detal> <yangi detal>\n"
+            "Misol: /detalnomi neo shkaf 'shkaf oq'\n\n"
+            "Eslatma: agar yangi detal nomida bo'sh joy bo'lsa, uni tirnoqsiz "
+            "ham yozishingiz mumkin - masalan:\n"
+            "/detalnomi neo shkaf shkaf-oq"
+        )
+        return
+
+    model, old_item, new_item = (a.lower() for a in args)
+
+    old_name = normalize_product_name(f"{model} {old_item}")
+    new_name = normalize_product_name(f"{model} {new_item}")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM products WHERE name = ?", (old_name,))
+    if cur.fetchone() is None:
+        conn.close()
+        await update.message.reply_text(f"'{old_name}' ro'yxatda topilmadi.")
+        return
+
+    cur.execute("SELECT 1 FROM products WHERE name = ?", (new_name,))
+    if cur.fetchone() is not None:
+        conn.close()
+        await update.message.reply_text(f"'{new_name}' allaqachon mavjud, boshqa nom tanlang.")
+        return
+
+    cur.execute(
+        "UPDATE products SET name = ?, item = ? WHERE name = ?",
+        (new_name, new_item, old_name),
+    )
+    cur.execute(
+        "UPDATE transactions SET product = ? WHERE product = ?",
+        (new_name, old_name),
+    )
+    cur.execute(
+        "UPDATE orders SET item = ? WHERE model = ? AND item = ?",
+        (new_item, model, old_item),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ '{old_name}' → '{new_name}' deb o'zgartirildi.")
+
+
 async def royxatga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -1044,6 +1098,7 @@ def main():
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
+    app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
     app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
