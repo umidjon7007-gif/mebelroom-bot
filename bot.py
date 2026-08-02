@@ -646,17 +646,16 @@ async def detalnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
-    if len(args) != 3:
+    if len(args) < 3:
         await update.message.reply_text(
             "Foydalanish: /detalnomi <model> <eski detal> <yangi detal>\n"
-            "Misol: /detalnomi neo shkaf 'shkaf oq'\n\n"
-            "Eslatma: agar yangi detal nomida bo'sh joy bo'lsa, uni tirnoqsiz "
-            "ham yozishingiz mumkin - masalan:\n"
-            "/detalnomi neo shkaf shkaf-oq"
+            "Misol: /detalnomi neo shkaf shkaf oq"
         )
         return
 
-    model, old_item, new_item = (a.lower() for a in args)
+    model = args[0].lower()
+    old_item = args[1].lower()
+    new_item = " ".join(args[2:]).lower()
 
     old_name = normalize_product_name(f"{model} {old_item}")
     new_name = normalize_product_name(f"{model} {new_item}")
