@@ -64,6 +64,9 @@ DB_PATH = os.path.join(DATA_DIR, "zaxira.db")
 _owner_id_raw = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
 
+_group_chat_id_raw = os.environ.get("GROUP_CHAT_ID", "").strip()
+GROUP_CHAT_ID = int(_group_chat_id_raw) if _group_chat_id_raw.lstrip("-").isdigit() else None
+
 LOW_STOCK_THRESHOLD = 3
 TASHKENT_TZ = timezone(timedelta(hours=5))
 
@@ -208,6 +211,13 @@ FINISH_BUTTON = "✅ Tayyor"
 FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True)
 
 
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"Chat ID: {chat.id}\nTuri: {chat.type}"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Assalomu alaykum! Men zaxira botiman.\n\n"
@@ -233,6 +243,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n\n"
         "Avtomatik xabarlar:\n"
         f"- Har kuni ertalab: {LOW_STOCK_THRESHOLD} tadan kam qolgan mahsulotlar haqida ogohlantirish\n"
+        "- Har kuni ertalab: guruhga to'liq qoldiq hisoboti (agar sozlangan bo'lsa)\n"
         "- Har yakshanba kechqurun: haftalik sotuv hisoboti\n\n"
         "Misol:\n"
         "/kirim laura tumba 5\n"
@@ -1004,6 +1015,26 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
+    if GROUP_CHAT_ID is None:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name, quantity FROM products ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    lines = ["📦 Kunlik zaxira qoldig'i:\n"]
+    for name, quantity in rows:
+        lines.append(f"{stock_indicator(quantity)} {name}: {quantity} ta")
+
+    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
+
+
 async def job_kam_qoldi(context: ContextTypes.DEFAULT_TYPE):
     if OWNER_ID is None:
         return
@@ -1091,6 +1122,7 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "yordam", "help"], start))
+    app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['qoldiq']}$"), qoldiq))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
@@ -1118,6 +1150,10 @@ def main():
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
         app.job_queue.run_daily(
             job_kam_qoldi, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni ertalab soat 9:00 (Toshkent vaqti) guruhga to'liq qoldiqni yuboradi.
+        app.job_queue.run_daily(
+            job_kunlik_qoldiq, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
         )
         # Har yakshanba kuni soat 20:00 (Toshkent vaqti) haftalik hisobot yuboradi.
         app.job_queue.run_daily(
