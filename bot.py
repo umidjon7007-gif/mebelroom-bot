@@ -31,6 +31,7 @@ o'zgartira olmaydi. Agar OWNER_ID sozlanmagan bo'lsa, cheklov ishlamaydi
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -820,6 +821,17 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
+    # "12-avgust" kabi chiziqcha bilan yozilgan sanalarni ham qabul qilamiz.
+    fixed_args = []
+    for tok in args:
+        m = re.match(r"^(\d{1,2})-([a-zA-Z']+)$", tok)
+        if m:
+            fixed_args.append(m.group(1))
+            fixed_args.append(m.group(2))
+        else:
+            fixed_args.append(tok)
+    args = fixed_args
+
     usage = (
         "Foydalanish:\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz]\n"
@@ -855,23 +867,37 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
 
-    model = before[0].lower()
     item = None
     amount = 1
 
-    if len(before) >= 2 and before[1].lower() == "komplekt":
-        remaining = before[2:]
+    # "komplekt" kalit so'zini qidiramiz - undan oldingi hammasi model nomi
+    # (bir yoki bir necha so'zdan iborat bo'lishi mumkin, masalan "bella spalniy").
+    komplekt_idx = None
+    for i, tok in enumerate(before):
+        if tok.lower() == "komplekt":
+            komplekt_idx = i
+            break
+
+    if komplekt_idx is not None and komplekt_idx > 0:
+        model = " ".join(before[:komplekt_idx]).lower()
+        remaining = before[komplekt_idx + 1 :]
         if remaining and remaining[0].isdigit():
             amount = int(remaining[0])
     else:
-        if len(before) < 3:
+        # "komplekt" yo'q - oxirgi ikkita so'z <detal> <miqdor> bo'lishi kerak,
+        # undan oldingisi (bir yoki bir necha so'z) - model nomi.
+        if len(before) < 3 or not before[-1].isdigit():
+            await update.message.reply_text(
+                "Miqdor son bo'lishi kerak va oxirida bo'lishi kerak.\n"
+                "Misol: laura shkaf 2 5 avgust\n\n" + usage
+            )
+            return
+        amount = int(before[-1])
+        item = before[-2].lower()
+        model = " ".join(before[:-2]).lower()
+        if not model:
             await update.message.reply_text(usage)
             return
-        item = before[1].lower()
-        if not before[2].isdigit():
-            await update.message.reply_text("Miqdor son bo'lishi kerak. Misol: laura shkaf 2 5 avgust")
-            return
-        amount = int(before[2])
 
     deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
 
