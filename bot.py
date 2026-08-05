@@ -68,6 +68,9 @@ OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
 _group_chat_id_raw = os.environ.get("GROUP_CHAT_ID", "").strip()
 GROUP_CHAT_ID = int(_group_chat_id_raw) if _group_chat_id_raw.lstrip("-").isdigit() else None
 
+_worker_chat_id_raw = os.environ.get("WORKER_CHAT_ID", "").strip()
+WORKER_CHAT_ID = int(_worker_chat_id_raw) if _worker_chat_id_raw.lstrip("-").isdigit() else None
+
 LOW_STOCK_THRESHOLD = 3
 TASHKENT_TZ = timezone(timedelta(hours=5))
 
@@ -116,6 +119,16 @@ def init_db():
             customer TEXT,
             status TEXT NOT NULL DEFAULT 'kutilmoqda',  -- yoki 'bajarildi'
             created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT NOT NULL COLLATE NOCASE,
+            soni INTEGER NOT NULL,
+            PRIMARY KEY (model, item)
         )
         """
     )
@@ -237,6 +250,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/tozalash hammasi - barcha sonlarni 0 ga qaytarish\n"
         "/modelnomi <eski> <yangi> - model nomini o'zgartirish\n"
         "/detalnomi <model> <eski detal> <yangi detal> - detal nomini o'zgartirish\n"
+        "/komplekttarkibi <model> - komplekt tarkibini ko'rish\n"
+        "/komplekttarkibi <model> <detal> <soni> - komplektda detaldan nechta ketishini sozlash\n"
         "/royxatga - bir nechta modelni birdaniga qo'shish\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
@@ -245,6 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Avtomatik xabarlar:\n"
         f"- Har kuni ertalab: {LOW_STOCK_THRESHOLD} tadan kam qolgan mahsulotlar haqida ogohlantirish\n"
         "- Har kuni ertalab: guruhga to'liq qoldiq hisoboti (agar sozlangan bo'lsa)\n"
+        "- Har kuni 9:00 va 14:00 da: ishchiga bajarilmagan buyurtmalar eslatmasi (agar sozlangan bo'lsa)\n"
         "- Har yakshanba kechqurun: haftalik sotuv hisoboti\n\n"
         "Misol:\n"
         "/kirim laura tumba 5\n"
@@ -584,6 +600,99 @@ async def tozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧹 Tozalandi. {total} ta mahsulotning barchasi 0 taga qaytarildi.\n"
         "Endi /kirim orqali haqiqiy sonlarni qaytadan kiritishingiz mumkin."
     )
+
+
+async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = [a.lower() for a in context.args]
+    usage = (
+        "Foydalanish:\n"
+        "/komplekttarkibi <model> - hozirgi tarkibni ko'rsatadi\n"
+        "/komplekttarkibi <model> <detal> <soni> - tarkibni sozlaydi\n\n"
+        "Misol:\n"
+        "/komplekttarkibi bella spalniy\n"
+        "/komplekttarkibi bella spalniy tumba 2"
+    )
+
+    if not args:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    # Ko'p so'zli modellarni to'g'ri aniqlash uchun avval uzunlarini tekshiramiz.
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    matched_model = None
+    remaining = None
+    for candidate in all_models:
+        candidate_tokens = candidate.split()
+        if args[: len(candidate_tokens)] == candidate_tokens:
+            matched_model = candidate
+            remaining = args[len(candidate_tokens) :]
+            break
+
+    if matched_model is None:
+        conn.close()
+        await update.message.reply_text(
+            f"Model topilmadi. Mavjud modellar: {', '.join(sorted(set(all_models)))}"
+        )
+        return
+
+    if not remaining:
+        cur.execute("SELECT item FROM products WHERE model = ? ORDER BY item", (matched_model,))
+        items = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (matched_model,))
+        overrides = dict(cur.fetchall())
+        conn.close()
+
+        lines = [f"📐 '{matched_model}' komplekt tarkibi (1 komplekt uchun):\n"]
+        for item in items:
+            soni = overrides.get(item, 1)
+            standart = "" if item in overrides else " (standart)"
+            lines.append(f"• {item}: {soni} ta{standart}")
+        lines.append(
+            "\nO'zgartirish uchun: /komplekttarkibi <model> <detal> <soni>\n"
+            f"Misol: /komplekttarkibi {matched_model} tumba 2"
+        )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if len(remaining) == 2 and remaining[1].isdigit():
+        item, soni = remaining[0], int(remaining[1])
+        if soni <= 0:
+            conn.close()
+            await update.message.reply_text("Soni musbat butun son bo'lishi kerak.")
+            return
+
+        product_key = normalize_product_name(f"{matched_model} {item}")
+        cur.execute("SELECT 1 FROM products WHERE name = ?", (product_key,))
+        if cur.fetchone() is None:
+            conn.close()
+            await update.message.reply_text(f"'{product_key}' ro'yxatda topilmadi.")
+            return
+
+        cur.execute(
+            "INSERT INTO komplekt_tarkibi (model, item, soni) VALUES (?, ?, ?) "
+            "ON CONFLICT(model, item) DO UPDATE SET soni = excluded.soni",
+            (matched_model, item, soni),
+        )
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"✅ Endi 1 '{matched_model}' komplektida '{item}' dan {soni} ta bo'ladi.\n"
+            "Bu keyingi /bajarildi buyurtmalarida shu bo'yicha hisoblanadi."
+        )
+        return
+
+    conn.close()
+    await update.message.reply_text(usage)
 
 
 async def modelnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -926,21 +1035,9 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, model, item, amount, deadline, deadline_display, customer
-        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-
+def format_buyurtmalar_text(rows):
     if not rows:
-        await update.message.reply_text("Hozircha bajarilmagan buyurtma yo'q.")
-        return
+        return "Hozircha bajarilmagan buyurtma yo'q."
 
     today = date.today()
     lines = ["📋 Bajarilmagan buyurtmalar:\n"]
@@ -960,7 +1057,26 @@ async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             line += f" — {customer}"
         lines.append(line)
 
-    await update.message.reply_text("\n".join(lines))
+    return "\n".join(lines)
+
+
+def fetch_pending_orders():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, model, item, amount, deadline, deadline_display, customer
+        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = fetch_pending_orders()
+    await update.message.reply_text(format_buyurtmalar_text(rows))
 
 
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1006,13 +1122,22 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else None
     now = datetime.now().isoformat(timespec="seconds")
 
+    # Komplekt buyurtmasi bo'lsa, har bir detal uchun kerakli sonni
+    # komplekt_tarkibi jadvalidan olamiz (sozlanmagan bo'lsa - standart 1).
+    per_item_qty = {}
+    if item is None:
+        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (model,))
+        per_item_qty = dict(cur.fetchall())
+
     result_lines = []
     for target_model, target_item in targets:
+        deduct = amount * per_item_qty.get(target_item, 1) if item is None else amount
+
         product_key = normalize_product_name(f"{target_model} {target_item}")
         cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
         prow = cur.fetchone()
         current_qty = prow[0] if prow else 0
-        new_qty = current_qty - amount
+        new_qty = current_qty - deduct
         shortage = new_qty < 0
         if shortage:
             new_qty = 0
@@ -1026,10 +1151,10 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at)
             VALUES (?, 'chiqim', ?, ?, ?, ?)
             """,
-            (product_key, amount, user_name, user_id, now),
+            (product_key, deduct, user_name, user_id, now),
         )
         warn = " ⚠️ yetarli emas edi!" if shortage else ""
-        result_lines.append(f"• {target_item}: -{amount}{warn}")
+        result_lines.append(f"• {target_item}: -{deduct}{warn}")
 
     cur.execute("UPDATE orders SET status = 'bajarildi' WHERE id = ?", (order_id,))
     conn.commit()
@@ -1039,6 +1164,15 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"✅ №{order_id} buyurtma bajarildi deb belgilandi.", f"{what} zaxiradan chiqarildi:"]
     lines.extend(result_lines)
     await update.message.reply_text("\n".join(lines))
+
+
+async def job_buyurtma_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    if WORKER_CHAT_ID is None:
+        return
+
+    rows = fetch_pending_orders()
+    text = format_buyurtmalar_text(rows)
+    await context.bot.send_message(chat_id=WORKER_CHAT_ID, text=text)
 
 
 async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
@@ -1165,6 +1299,7 @@ def main():
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
+    app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
@@ -1180,6 +1315,13 @@ def main():
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) guruhga to'liq qoldiqni yuboradi.
         app.job_queue.run_daily(
             job_kunlik_qoldiq, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni soat 9:00 va 14:00 da ishchiga bajarilmagan buyurtmalarni eslatadi.
+        app.job_queue.run_daily(
+            job_buyurtma_eslatma, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        app.job_queue.run_daily(
+            job_buyurtma_eslatma, time=time(hour=14, minute=0, tzinfo=TASHKENT_TZ)
         )
         # Har yakshanba kuni soat 20:00 (Toshkent vaqti) haftalik hisobot yuboradi.
         app.job_queue.run_daily(
