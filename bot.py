@@ -446,18 +446,9 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    cur.execute("SELECT name, quantity FROM products ORDER BY name")
-    rows = cur.fetchall()
     conn.close()
-
-    if not rows:
-        await update.message.reply_text("Hozircha hech qanday mahsulot ro'yxatga olinmagan.")
-        return
-
-    lines = ["📦 Zaxira qoldig'i:\n"]
-    for name, quantity in rows:
-        lines.append(f"{stock_indicator(quantity)} {name}: {quantity} ta")
-    await update.message.reply_text("\n".join(lines))
+    # Argumentsiz chaqirilsa - modellar tugmalarini ko'rsatamiz (xuddi /modellar kabi).
+    await modellar(update, context)
 
 
 async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1181,16 +1172,20 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT name, quantity FROM products ORDER BY name")
+    cur.execute("SELECT model, item, quantity FROM products ORDER BY model, item")
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
         return
 
-    lines = ["📦 Kunlik zaxira qoldig'i:\n"]
-    for name, quantity in rows:
-        lines.append(f"{stock_indicator(quantity)} {name}: {quantity} ta")
+    lines = ["📦 Kunlik zaxira qoldig'i:"]
+    current_model = None
+    for model, item, quantity in rows:
+        if model != current_model:
+            lines.append(f"\n🔹 {model.capitalize()}")
+            current_model = model
+        lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
 
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
 
