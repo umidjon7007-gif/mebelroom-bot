@@ -257,7 +257,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buyurtma <model> komplekt <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
-        "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n\n"
+        "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n"
+        "/bekor <raqam> - buyurtmani bekor qiladi (zaxiraga tegmaydi)\n\n"
         "Avtomatik xabarlar:\n"
         f"- Har kuni ertalab: {LOW_STOCK_THRESHOLD} tadan kam qolgan mahsulotlar haqida ogohlantirish\n"
         "- Har kuni ertalab: guruhga to'liq qoldiq hisoboti (agar sozlangan bo'lsa)\n"
@@ -1047,6 +1048,39 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Foydalanish: /bekor <buyurtma raqami>\nMisol: /bekor 14")
+        return
+
+    order_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item FROM orders WHERE id = ? AND status = 'kutilmoqda'", (order_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(
+            f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan/bekor qilingan."
+        )
+        return
+
+    cur.execute("UPDATE orders SET status = 'bekor qilindi' WHERE id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+
+    model, item = row
+    what = f"{model} komplekt" if item is None else f"{model} {item}"
+    await update.message.reply_text(
+        f"🗑 №{order_id} ({what}) bekor qilindi. Zaxiraga hech qanday ta'sir qilmadi."
+    )
+
+
 def format_buyurtmalar_text(rows):
     if not rows:
         return "Hozircha bajarilmagan buyurtma yo'q."
@@ -1321,6 +1355,7 @@ def main():
     app.add_handler(CommandHandler("buyurtma", buyurtma))
     app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
     app.add_handler(CommandHandler("bajarildi", bajarildi))
+    app.add_handler(CommandHandler("bekor", bekor))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
 
     if app.job_queue is not None:
