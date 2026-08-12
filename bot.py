@@ -219,10 +219,11 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [MENU_BUTTONS["buyurtmalar"], MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
+    is_persistent=True,
 )
 
 FINISH_BUTTON = "✅ Tayyor"
-FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True)
+FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True, is_persistent=True)
 
 
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,15 +931,17 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fixed_args.append(m.group(2))
         else:
             fixed_args.append(tok)
-    args = fixed_args
+    args = [a.lower() for a in fixed_args]
 
     usage = (
         "Foydalanish:\n"
         "/buyurtma <model> komplekt <kun> <oy> [mijoz]\n"
-        "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz]\n\n"
+        "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz]\n"
+        "/buyurtma <model> <detal1> <miqdor1> <detal2> <miqdor2> ... <kun> <oy> [mijoz]\n\n"
         "Misol:\n"
         "/buyurtma vena komplekt 5 avgust\n"
-        "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon"
+        "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon\n"
+        "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust"
     )
     if len(args) < 3:
         await update.message.reply_text(usage)
@@ -953,7 +956,7 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     month_idx, day = found
-    month = MONTH_NAMES[args[month_idx].lower()]
+    month = MONTH_NAMES[args[month_idx]]
     deadline = compute_deadline(day, month)
     if deadline is None:
         await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
@@ -967,59 +970,77 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
 
-    item = None
-    amount = 1
-
-    # "komplekt" kalit so'zini qidiramiz - undan oldingi hammasi model nomi
-    # (bir yoki bir necha so'zdan iborat bo'lishi mumkin, masalan "bella spalniy").
-    komplekt_idx = None
-    for i, tok in enumerate(before):
-        if tok.lower() == "komplekt":
-            komplekt_idx = i
-            break
-
-    if komplekt_idx is not None and komplekt_idx > 0:
-        model = " ".join(before[:komplekt_idx]).lower()
-        remaining = before[komplekt_idx + 1 :]
-        if remaining and remaining[0].isdigit():
-            amount = int(remaining[0])
-    else:
-        # "komplekt" yo'q - oxirgi ikkita so'z <detal> <miqdor> bo'lishi kerak,
-        # undan oldingisi (bir yoki bir necha so'z) - model nomi.
-        if len(before) < 3 or not before[-1].isdigit():
-            await update.message.reply_text(
-                "Miqdor son bo'lishi kerak va oxirida bo'lishi kerak.\n"
-                "Misol: laura shkaf 2 5 avgust\n\n" + usage
-            )
-            return
-        amount = int(before[-1])
-        item = before[-2].lower()
-        model = " ".join(before[:-2]).lower()
-        if not model:
-            await update.message.reply_text(usage)
-            return
-
-    deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
-
+    # Modelni bazadagi haqiqiy modellar bilan solishtirib topamiz
+    # (ko'p so'zli modellarni ham, masalan "bella spalniy", to'g'ri aniqlash uchun).
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
-        """,
-        (model, item, amount, deadline.isoformat(), deadline_display, customer, datetime.now().isoformat(timespec="seconds")),
-    )
-    order_id = cur.lastrowid
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    model = None
+    rest = None
+    for candidate in all_models:
+        candidate_tokens = candidate.split()
+        if before[: len(candidate_tokens)] == candidate_tokens:
+            model = candidate
+            rest = before[len(candidate_tokens) :]
+            break
+
+    if model is None:
+        conn.close()
+        await update.message.reply_text(
+            f"Model topilmadi. Mavjud modellar: {', '.join(sorted(set(all_models)))}"
+        )
+        return
+
+    if not rest:
+        conn.close()
+        await update.message.reply_text(usage)
+        return
+
+    # Buyurtma turlari: komplekt, bitta detal, yoki bir nechta detal-miqdor jufti.
+    entries = []  # (item_or_None, amount)
+
+    if rest[0] == "komplekt":
+        amount = 1
+        remaining = rest[1:]
+        if remaining and remaining[0].isdigit():
+            amount = int(remaining[0])
+        entries.append((None, amount))
+    elif len(rest) % 2 == 0 and all(rest[i].isdigit() for i in range(1, len(rest), 2)):
+        # juft-juft: detal miqdor detal miqdor ...
+        for i in range(0, len(rest), 2):
+            entries.append((rest[i], int(rest[i + 1])))
+    else:
+        conn.close()
+        await update.message.reply_text(
+            "Detal va miqdorni juft-juft yozing (masalan: shkaf 1 tumba 2), "
+            "yoki 'komplekt' deb yozing.\n\n" + usage
+        )
+        return
+
+    deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
+    created = []
+    now = datetime.now().isoformat(timespec="seconds")
+    for item, amount in entries:
+        cur.execute(
+            """
+            INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            """,
+            (model, item, amount, deadline.isoformat(), deadline_display, customer, now),
+        )
+        created.append((cur.lastrowid, item, amount))
+
     conn.commit()
     conn.close()
 
-    what = f"{model} komplekt" if item is None else f"{model} {item}"
-    lines = [
-        "📝 Yangi buyurtma qabul qilindi:",
-        f"№{order_id} — {what}" + (f" ({amount} ta)" if item else ""),
-        f"Muddat: {deadline_display}",
-    ]
+    lines = ["📝 Yangi buyurtma qabul qilindi:"]
+    for order_id, item, amount in created:
+        what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
+        lines.append(f"№{order_id} — {what}")
+    lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
     lines.append("Holati: Kutilmoqda")
