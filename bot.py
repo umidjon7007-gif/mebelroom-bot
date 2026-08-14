@@ -1430,7 +1430,39 @@ def fetch_pending_orders():
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = fetch_pending_orders()
-    await update.message.reply_text(format_buyurtmalar_text(rows))
+    text = format_buyurtmalar_text(rows)
+    if not rows:
+        await update.message.reply_text(text)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"✅ №{row[0]} topshirildi", callback_data=f"orddone:{row[0]}")]
+        for row in rows
+    ]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Faqat egasi bajara oladi.", show_alert=True)
+        return
+    await query.answer()
+
+    order_id = int(query.data.split(":", 1)[1])
+    result_text = await bajarildi_core(order_id, update.effective_user)
+    await query.message.reply_text(result_text)
+
+    rows = fetch_pending_orders()
+    text = format_buyurtmalar_text(rows)
+    if rows:
+        buttons = [
+            [InlineKeyboardButton(f"✅ №{row[0]} topshirildi", callback_data=f"orddone:{row[0]}")]
+            for row in rows
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await query.edit_message_text(text)
 
 
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1444,6 +1476,12 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     order_id = int(args[0])
+    user = update.effective_user
+    text = await bajarildi_core(order_id, user)
+    await update.message.reply_text(text)
+
+
+async def bajarildi_core(order_id: int, user) -> str:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -1453,8 +1491,7 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = cur.fetchone()
     if row is None:
         conn.close()
-        await update.message.reply_text(f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan.")
-        return
+        return f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan."
 
     model, item, amount = row
 
@@ -1466,12 +1503,8 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not targets:
         conn.close()
-        await update.message.reply_text(
-            f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."
-        )
-        return
+        return f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."
 
-    user = update.effective_user
     user_name = user.full_name if user else "noma'lum"
     user_id = user.id if user else None
     now = datetime.now().isoformat(timespec="seconds")
@@ -1517,7 +1550,7 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     what = f"{model} komplekt" if item is None else f"{model} {item}"
     lines = [f"✅ №{order_id} buyurtma bajarildi deb belgilandi.", f"{what} zaxiradan chiqarildi:"]
     lines.extend(result_lines)
-    await update.message.reply_text("\n".join(lines))
+    return "\n".join(lines)
 
 
 async def job_buyurtma_eslatma(context: ContextTypes.DEFAULT_TYPE):
@@ -1667,6 +1700,7 @@ def main():
     app.add_handler(CommandHandler("bekor", bekor))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
+    app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
 
     if app.job_queue is not None:
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
