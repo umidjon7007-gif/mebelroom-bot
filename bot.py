@@ -210,13 +210,15 @@ MENU_BUTTONS = {
     "yordam": "❓ Yordam",
     "kirim": "📥 Kirim",
     "chiqim": "📤 Chiqim",
+    "yangi_buyurtma": "🆕 Buyurtma",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
-        [MENU_BUTTONS["buyurtmalar"], MENU_BUTTONS["yordam"]],
+        [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
+        [MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -404,6 +406,25 @@ async def chiqim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtma_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    context.user_data["awaiting"] = "buyurtma"
+    await update.message.reply_text(
+        "🆕 Buyurtma rejimi yoqildi.\n\n"
+        "Butun komplekt uchun:\n"
+        "<model> komplekt <kun> <oy> [mijoz]\n"
+        "Misol: vena komplekt 5 avgust Mavaviy dokon\n\n"
+        "Bitta yoki bir nechta detal uchun:\n"
+        "<model> <detal> <miqdor> [<detal> <miqdor> ...] <kun> <oy> [mijoz]\n"
+        "Misol: maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust\n\n"
+        "Xohlagancha ketma-ket yozishingiz mumkin.\n"
+        "Tugatganingizda '✅ Tayyor' tugmasini bosing.",
+        reply_markup=FINISH_MENU,
+    )
+
+
 async def tayyor_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting"] = None
     await update.message.reply_text("Tayyor. Bosh menyuga qaytdik.", reply_markup=MAIN_MENU)
@@ -416,9 +437,13 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = (update.message.text or "").strip()
     args = text.split()
-    await change_stock_core(update, context, awaiting, args)
+
+    if awaiting == "buyurtma":
+        await buyurtma_core(update, context, args)
+    else:
+        await change_stock_core(update, context, awaiting, args)
     # awaiting rejimi saqlanib qoladi - foydalanuvchi '✅ Tayyor' bosguncha
-    # ketma-ket yana mahsulot yozishi mumkin.
+    # ketma-ket yana mahsulot/buyurtma yozishi mumkin.
 
 
 def stock_indicator(quantity: int) -> str:
@@ -921,11 +946,13 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
         return
+    await buyurtma_core(update, context, context.args)
 
-    args = context.args
+
+async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_args):
     # "12-avgust" kabi chiziqcha bilan yozilgan sanalarni ham qabul qilamiz.
     fixed_args = []
-    for tok in args:
+    for tok in raw_args:
         m = re.match(r"^(\d{1,2})-([a-zA-Z']+)$", tok)
         if m:
             fixed_args.append(m.group(1))
@@ -1339,6 +1366,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yordam']}$"), start))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['kirim']}$"), kirim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
     app.add_handler(CommandHandler("kirim", kirim))
