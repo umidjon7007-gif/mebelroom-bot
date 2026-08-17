@@ -1389,28 +1389,32 @@ async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def format_single_order_line(row):
+    order_id, model, item, amount, deadline_iso, deadline_display, customer = row
+    today = date.today()
+    deadline_date = date.fromisoformat(deadline_iso)
+    days_left = (deadline_date - today).days
+    if days_left > 0:
+        days_text = f"{days_left} kun qoldi"
+    elif days_left == 0:
+        days_text = "bugun"
+    else:
+        days_text = f"muddati {abs(days_left)} kun o'tgan"
+
+    what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
+    line = f"№{order_id} — {what} — {deadline_display} ({days_text})"
+    if customer:
+        line += f" — {customer}"
+    return line
+
+
 def format_buyurtmalar_text(rows):
     if not rows:
         return "Hozircha bajarilmagan buyurtma yo'q."
 
-    today = date.today()
     lines = ["📋 Bajarilmagan buyurtmalar:\n"]
-    for order_id, model, item, amount, deadline_iso, deadline_display, customer in rows:
-        deadline_date = date.fromisoformat(deadline_iso)
-        days_left = (deadline_date - today).days
-        if days_left > 0:
-            days_text = f"{days_left} kun qoldi"
-        elif days_left == 0:
-            days_text = "bugun"
-        else:
-            days_text = f"muddati {abs(days_left)} kun o'tgan"
-
-        what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
-        line = f"№{order_id} — {what} — {deadline_display} ({days_text})"
-        if customer:
-            line += f" — {customer}"
-        lines.append(line)
-
+    for row in rows:
+        lines.append(format_single_order_line(row))
     return "\n".join(lines)
 
 
@@ -1430,16 +1434,18 @@ def fetch_pending_orders():
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = fetch_pending_orders()
-    text = format_buyurtmalar_text(rows)
     if not rows:
-        await update.message.reply_text(text)
+        await update.message.reply_text("Hozircha bajarilmagan buyurtma yo'q.")
         return
 
-    buttons = [
-        [InlineKeyboardButton(f"✅ №{row[0]} topshirildi", callback_data=f"orddone:{row[0]}")]
-        for row in rows
-    ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text(f"📋 Bajarilmagan buyurtmalar ({len(rows)} ta):")
+    for row in rows:
+        order_id = row[0]
+        text = format_single_order_line(row)
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"✅ №{order_id} topshirildi", callback_data=f"orddone:{order_id}")]]
+        )
+        await update.message.reply_text(text, reply_markup=button)
 
 
 async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1451,18 +1457,7 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     order_id = int(query.data.split(":", 1)[1])
     result_text = await bajarildi_core(order_id, update.effective_user)
-    await query.message.reply_text(result_text)
-
-    rows = fetch_pending_orders()
-    text = format_buyurtmalar_text(rows)
-    if rows:
-        buttons = [
-            [InlineKeyboardButton(f"✅ №{row[0]} topshirildi", callback_data=f"orddone:{row[0]}")]
-            for row in rows
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else:
-        await query.edit_message_text(text)
+    await query.edit_message_text(result_text, reply_markup=None)
 
 
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
