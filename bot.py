@@ -294,7 +294,7 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
 async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args):
     if len(args) < 3:
         cmd = "/kirim" if change_type == "kirim" else "/chiqim"
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"Foydalanish: {cmd} <model> <detal> <miqdor>\nMisol: {cmd} laura tumba 5"
         )
         return
@@ -302,19 +302,19 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     *name_parts, amount_raw = args
     product_display = " ".join(name_parts).strip()
     if not product_display:
-        await update.message.reply_text("Mahsulot nomini kiriting.")
+        await update.effective_message.reply_text("Mahsulot nomini kiriting.")
         return
 
     try:
         amount = parse_amount(amount_raw)
     except ValueError:
-        await update.message.reply_text("Miqdor musbat butun son bo'lishi kerak. Misol: 5")
+        await update.effective_message.reply_text("Miqdor musbat butun son bo'lishi kerak. Misol: 5")
         return
 
     product_key = normalize_product_name(product_display)
     model, item = split_model_item(product_display)
     if not item:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Mahsulot nomini <model> <detal> ko'rinishida yozing.\nMisol: laura tumba"
         )
         return
@@ -331,7 +331,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if row is None:
         if change_type == "chiqim":
             conn.close()
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"'{product_display}' ro'yxatda yo'q, undan chiqim qilib bo'lmaydi."
             )
             return
@@ -348,7 +348,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     else:
         if current_qty < amount:
             conn.close()
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"Xatolik: '{product_display}' dan faqat {current_qty} ta qolgan, "
                 f"{amount} tani chiqarib bo'lmaydi."
             )
@@ -371,39 +371,152 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     verb = "qo'shildi" if change_type == "kirim" else "ayirildi"
     emoji = "📥" if change_type == "kirim" else "📤"
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"{emoji} '{product_display}': {amount} ta {verb}.\n"
         f"Yangi qoldiq: {new_qty} ta.\n"
         f"Kiritdi: {user_name}"
     )
 
 
-async def kirim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sb_start(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
     if not is_owner(update):
         await deny_access(update)
         return
-    context.user_data["awaiting"] = "kirim"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    models = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    if not models:
+        await update.message.reply_text("Hozircha hech qanday model ro'yxatga olinmagan.")
+        return
+
+    context.user_data["sb"] = {"mode": mode}
+    title = "📥 Kirim" if mode == "kirim" else "📤 Chiqim"
+    buttons = [[InlineKeyboardButton(m.capitalize(), callback_data=f"sb:model:{m}")] for m in models]
+    buttons.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="sb:cancel")])
     await update.message.reply_text(
-        "📥 Kirim rejimi yoqildi.\n"
-        "Model, detal va miqdorni yozing (misol: laura shkaf 5).\n"
-        "Xohlagancha ketma-ket yozishingiz mumkin.\n"
-        "Tugatganingizda '✅ Tayyor' tugmasini bosing.",
-        reply_markup=FINISH_MENU,
+        f"{title} — modelni tanlang:", reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+
+async def kirim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await sb_start(update, context, "kirim")
 
 
 async def chiqim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        await deny_access(update)
-        return
-    context.user_data["awaiting"] = "chiqim"
-    await update.message.reply_text(
-        "📤 Chiqim rejimi yoqildi.\n"
-        "Model, detal va miqdorni yozing (misol: laura shkaf 2).\n"
-        "Xohlagancha ketma-ket yozishingiz mumkin.\n"
-        "Tugatganingizda '✅ Tayyor' tugmasini bosing.",
-        reply_markup=FINISH_MENU,
+    await sb_start(update, context, "chiqim")
+
+
+def sb_item_keyboard(sb):
+    buttons = [
+        [InlineKeyboardButton(it, callback_data=f"sb:item:{i}")]
+        for i, it in enumerate(sb["item_list"])
+    ]
+    buttons.append([InlineKeyboardButton("🔁 Boshqa model", callback_data="sb:restart")])
+    buttons.append([InlineKeyboardButton("✅ Tugatish", callback_data="sb:done")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def sb_qty_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➖", callback_data="sb:qty:-1"),
+                InlineKeyboardButton("➕", callback_data="sb:qty:+1"),
+            ],
+            [InlineKeyboardButton("✅ Tasdiqlash", callback_data="sb:qty:confirm")],
+            [InlineKeyboardButton("⬅️ Orqaga", callback_data="sb:qty:cancel")],
+        ]
     )
+
+
+def sb_qty_text(sb):
+    title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+    return f"{title} — {sb['model'].capitalize()} {sb['current_item']}\n\nHozirgi son: {sb['qty_value']} ta"
+
+
+async def sb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Faqat egasi qila oladi.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data
+
+    sb = context.user_data.get("sb")
+
+    if data == "sb:cancel":
+        context.user_data["sb"] = None
+        await query.edit_message_text("Bekor qilindi.")
+        return
+
+    if data == "sb:restart":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+        models = [row[0] for row in cur.fetchall()]
+        conn.close()
+        title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+        buttons = [[InlineKeyboardButton(m.capitalize(), callback_data=f"sb:model:{m}")] for m in models]
+        buttons.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="sb:cancel")])
+        await query.edit_message_text(f"{title} — modelni tanlang:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "sb:done":
+        context.user_data["sb"] = None
+        await query.edit_message_text("Tayyor.")
+        return
+
+    if sb is None:
+        await query.edit_message_text("Sessiya tugagan. Qaytadan tugmani bosing.")
+        return
+
+    if data.startswith("sb:model:"):
+        model = data.split(":", 2)[2]
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT item FROM products WHERE model = ? ORDER BY item", (model,))
+        item_list = [row[0] for row in cur.fetchall()]
+        conn.close()
+        sb["model"] = model
+        sb["item_list"] = item_list
+        title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+        await query.edit_message_text(
+            f"{title} — {model.capitalize()} — detalni tanlang:", reply_markup=sb_item_keyboard(sb)
+        )
+        return
+
+    if data.startswith("sb:item:"):
+        idx = int(data.split(":", 2)[2])
+        sb["current_item"] = sb["item_list"][idx]
+        sb["qty_value"] = 1
+        await query.edit_message_text(sb_qty_text(sb), reply_markup=sb_qty_keyboard())
+        return
+
+    if data in ("sb:qty:+1", "sb:qty:-1"):
+        delta = 1 if data.endswith("+1") else -1
+        sb["qty_value"] = max(1, sb["qty_value"] + delta)
+        await query.edit_message_text(sb_qty_text(sb), reply_markup=sb_qty_keyboard())
+        return
+
+    if data == "sb:qty:cancel":
+        title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+        await query.edit_message_text(
+            f"{title} — {sb['model'].capitalize()} — detalni tanlang:", reply_markup=sb_item_keyboard(sb)
+        )
+        return
+
+    if data == "sb:qty:confirm":
+        args = [sb["model"], sb["current_item"], str(sb["qty_value"])]
+        await change_stock_core(update, context, sb["mode"], args)
+        title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+        await query.edit_message_text(
+            f"{title} — {sb['model'].capitalize()} — yana detal tanlang:", reply_markup=sb_item_keyboard(sb)
+        )
+        return
 
 
 def ob_item_menu_text(ob):
@@ -1696,6 +1809,7 @@ def main():
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
+    app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
 
     if app.job_queue is not None:
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
