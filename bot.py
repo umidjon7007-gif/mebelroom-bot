@@ -132,6 +132,44 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS narxlar (
+            item TEXT PRIMARY KEY COLLATE NOCASE,  -- detal nomi, yoki 'komplekt'
+            rate INTEGER NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workers (
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS work_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker TEXT NOT NULL COLLATE NOCASE,
+            order_id INTEGER,
+            model TEXT,
+            item TEXT,
+            amount INTEGER NOT NULL,
+            rate INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            paid INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    # Boshlang'ich ishchilar (agar hali qo'shilmagan bo'lsa).
+    for default_worker in ("Hojiakbar", "Abdulloh"):
+        cur.execute(
+            "INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)",
+            (default_worker, datetime.now().isoformat(timespec="seconds")),
+        )
 
     # Eski bazalarda 'model' va 'item' ustunlari bo'lmasligi mumkin - qo'shib olamiz.
     cur.execute("PRAGMA table_info(products)")
@@ -260,7 +298,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz] - buyurtma qabul qilish\n"
         "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
         "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n"
-        "/bekor <raqam> - buyurtmani bekor qiladi (zaxiraga tegmaydi)\n\n"
+        "/bekor <raqam> - buyurtmani bekor qiladi (zaxiraga tegmaydi)\n"
+        "/narx <detal> <summa> - detal (yoki 'komplekt') narxini belgilash\n"
+        "/narxlar - barcha narxlarni ko'rish\n"
+        "/ishchilar - ishchilar ro'yxati\n"
+        "/maosh [ism] - to'lanmagan maoshlarni ko'rish\n"
+        "/tolandi <ism> - ishchi maoshini to'landi deb belgilash\n\n"
         "Avtomatik xabarlar:\n"
         f"- Har kuni ertalab: {LOW_STOCK_THRESHOLD} tadan kam qolgan mahsulotlar haqida ogohlantirish\n"
         "- Har kuni ertalab: guruhga to'liq qoldiq hisoboti (agar sozlangan bo'lsa)\n"
@@ -834,6 +877,16 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await ob_finalize_order(update, context)
         return
 
+    if awaiting == "worker_name_for_order":
+        order_id = context.user_data.get("pending_order_id")
+        context.user_data["awaiting"] = None
+        context.user_data["pending_order_id"] = None
+        if order_id is None:
+            return
+        result_text = await bajarildi_core(order_id, update.effective_user, text)
+        await update.message.reply_text(result_text)
+        return
+
     args = text.split()
     await change_stock_core(update, context, awaiting, args)
     # awaiting rejimi saqlanib qoladi - foydalanuvchi '✅ Tayyor' bosguncha
@@ -1012,6 +1065,71 @@ async def tozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧹 Tozalandi. {total} ta mahsulotning barchasi 0 taga qaytarildi.\n"
         "Endi /kirim orqali haqiqiy sonlarni qaytadan kiritishingiz mumkin."
     )
+
+
+async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Foydalanish: /narx <detal> <summa>\n"
+        "Misol: /narx shkaf 20000\n"
+        "Komplekt uchun: /narx komplekt 100000"
+    )
+    if len(args) < 2 or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    rate = int(args[-1])
+    item = " ".join(args[:-1]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO narxlar (item, rate) VALUES (?, ?) "
+        "ON CONFLICT(item) DO UPDATE SET rate = excluded.rate",
+        (item, rate),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ '{item}' narxi: {rate:,} so'm deb belgilandi.".replace(",", " "))
+
+
+async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT item, rate FROM narxlar ORDER BY item")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "Hozircha hech qanday narx belgilanmagan.\nQo'shish: /narx <detal> <summa>"
+        )
+        return
+
+    lines = ["💰 Narxlar:\n"]
+    for item, rate in rows:
+        lines.append(f"• {item}: {rate:,} so'm".replace(",", " "))
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM workers ORDER BY name")
+    rows = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Hozircha hech qanday ishchi qo'shilmagan.")
+        return
+
+    lines = ["👷 Ishchilar:\n"] + [f"• {name}" for name in rows]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1569,7 +1687,37 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     order_id = int(query.data.split(":", 1)[1])
-    result_text = await bajarildi_core(order_id, update.effective_user)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM workers ORDER BY name")
+    workers = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    buttons = [
+        [InlineKeyboardButton(w, callback_data=f"workerdone:{order_id}:{w}")] for w in workers
+    ]
+    buttons.append([InlineKeyboardButton("➕ Yangi ishchi", callback_data=f"workerdone:{order_id}:__new__")])
+    await query.edit_message_text("👷 Buyurtmani kim topshirdi?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Faqat egasi bajara oladi.", show_alert=True)
+        return
+    await query.answer()
+
+    _, order_id_str, worker = query.data.split(":", 2)
+    order_id = int(order_id_str)
+
+    if worker == "__new__":
+        context.user_data["awaiting"] = "worker_name_for_order"
+        context.user_data["pending_order_id"] = order_id
+        await query.edit_message_text("✍️ Yangi ishchining ismini yozing:")
+        return
+
+    result_text = await bajarildi_core(order_id, update.effective_user, worker)
     await query.edit_message_text(result_text, reply_markup=None)
 
 
@@ -1579,17 +1727,21 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("Foydalanish: /bajarildi <buyurtma raqami>\nMisol: /bajarildi 12")
+    if not args or not args[0].isdigit() or len(args) < 2:
+        await update.message.reply_text(
+            "Foydalanish: /bajarildi <buyurtma raqami> <ishchi ismi>\n"
+            "Misol: /bajarildi 12 Hojiakbar"
+        )
         return
 
     order_id = int(args[0])
+    worker = " ".join(args[1:])
     user = update.effective_user
-    text = await bajarildi_core(order_id, user)
+    text = await bajarildi_core(order_id, user, worker)
     await update.message.reply_text(text)
 
 
-async def bajarildi_core(order_id: int, user) -> str:
+async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -1652,13 +1804,123 @@ async def bajarildi_core(order_id: int, user) -> str:
         result_lines.append(f"• {target_item}: -{deduct}{warn}")
 
     cur.execute("UPDATE orders SET status = 'bajarildi' WHERE id = ?", (order_id,))
+
+    payment_line = ""
+    if worker:
+        # To'lov hisobi: komplekt buyurtmasi bo'lsa "komplekt" narxi * buyurtma soni,
+        # aks holda o'sha detal narxi * buyurtma soni (zaxiradan chiqarilgan aniq
+        # miqdordan mustaqil - komplekt tarkibidagi ko'paytmalarga qarab emas).
+        rate_key = "komplekt" if item is None else item
+        cur.execute("SELECT rate FROM narxlar WHERE item = ?", (rate_key,))
+        rrow = cur.fetchone()
+        rate = rrow[0] if rrow else 0
+        total = amount * rate
+
+        cur.execute(
+            "INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)",
+            (worker, now),
+        )
+        cur.execute(
+            """
+            INSERT INTO work_log (worker, order_id, model, item, amount, rate, total, paid, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (worker, order_id, model, rate_key, amount, rate, total, now),
+        )
+        if rate == 0:
+            payment_line = f"\n👷 {worker} — narx belgilanmagan ('{rate_key}' uchun /narx bilan belgilang)."
+        else:
+            payment_line = f"\n👷 {worker} — {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+
     conn.commit()
     conn.close()
 
     what = f"{model} komplekt" if item is None else f"{model} {item}"
     lines = [f"✅ №{order_id} buyurtma bajarildi deb belgilandi.", f"{what} zaxiradan chiqarildi:"]
     lines.extend(result_lines)
+    if payment_line:
+        lines.append(payment_line)
     return "\n".join(lines)
+
+
+async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if args:
+        worker = " ".join(args)
+        cur.execute(
+            """
+            SELECT model, item, amount, rate, total, created_at
+            FROM work_log WHERE worker = ? AND paid = 0 ORDER BY created_at
+            """,
+            (worker,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text(f"👷 {worker} — to'lanmagan ish topilmadi.")
+            return
+
+        total_sum = sum(r[4] for r in rows)
+        lines = [f"👷 {worker} — to'lanmagan ishlar ({len(rows)} ta):\n"]
+        for model, item, amount, rate, total, created_at in rows:
+            lines.append(f"• {model} {item} x{amount} = {total:,} so'm".replace(",", " "))
+        lines.append(f"\n💰 Jami: {total_sum:,} so'm".replace(",", " "))
+        lines.append(f"\nTo'langanda: /tolandi {worker}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    cur.execute(
+        "SELECT worker, SUM(total) FROM work_log WHERE paid = 0 GROUP BY worker ORDER BY worker"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Hozircha hech kimga to'lanmagan ish yo'q.")
+        return
+
+    lines = ["💰 To'lanmagan maoshlar:\n"]
+    for worker, total in rows:
+        lines.append(f"• {worker}: {total:,} so'm".replace(",", " "))
+    lines.append("\nBatafsil: /maosh <ism>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Foydalanish: /tolandi <ishchi ismi>\nMisol: /tolandi Hojiakbar")
+        return
+
+    worker = " ".join(args)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT SUM(total), COUNT(*) FROM work_log WHERE worker = ? AND paid = 0", (worker,))
+    total, count = cur.fetchone()
+    if not total:
+        conn.close()
+        await update.message.reply_text(f"👷 {worker} — to'lanmagan ish topilmadi.")
+        return
+
+    cur.execute("UPDATE work_log SET paid = 1 WHERE worker = ? AND paid = 0", (worker,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ {worker} — {total:,} so'm ({count} ta ish) to'landi deb belgilandi.".replace(",", " ")
+    )
 
 
 async def job_buyurtma_eslatma(context: ContextTypes.DEFAULT_TYPE):
@@ -1800,6 +2062,11 @@ def main():
     app.add_handler(CommandHandler("tozalash", tozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
+    app.add_handler(CommandHandler("narx", narx))
+    app.add_handler(CommandHandler("narxlar", narxlar))
+    app.add_handler(CommandHandler("ishchilar", ishchilar))
+    app.add_handler(CommandHandler("maosh", maosh))
+    app.add_handler(CommandHandler("tolandi", tolandi))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
@@ -1809,6 +2076,7 @@ def main():
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
+    app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
     app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
 
     if app.job_queue is not None:
