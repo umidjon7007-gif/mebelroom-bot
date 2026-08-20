@@ -135,8 +135,10 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS narxlar (
-            item TEXT PRIMARY KEY COLLATE NOCASE,  -- detal nomi, yoki 'komplekt'
-            rate INTEGER NOT NULL
+            turi TEXT NOT NULL COLLATE NOCASE,     -- 'upakovka' yoki 'yigish'
+            item TEXT NOT NULL COLLATE NOCASE,     -- detal nomi, yoki 'komplekt'
+            rate INTEGER NOT NULL,
+            PRIMARY KEY (turi, item)
         )
         """
     )
@@ -150,9 +152,19 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS worker_accounts (
+            telegram_id INTEGER PRIMARY KEY,
+            worker_name TEXT NOT NULL COLLATE NOCASE,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS work_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             worker TEXT NOT NULL COLLATE NOCASE,
+            turi TEXT NOT NULL COLLATE NOCASE,  -- 'upakovka' yoki 'yigish'
             order_id INTEGER,
             model TEXT,
             item TEXT,
@@ -164,6 +176,32 @@ def init_db():
         )
         """
     )
+    # Eski bazalarda 'turi' ustuni bo'lmasligi mumkin - qo'shib olamiz.
+    cur.execute("PRAGMA table_info(work_log)")
+    work_log_columns = {row[1] for row in cur.fetchall()}
+    if "turi" not in work_log_columns:
+        cur.execute("ALTER TABLE work_log ADD COLUMN turi TEXT NOT NULL COLLATE NOCASE DEFAULT 'yigish'")
+
+    cur.execute("PRAGMA table_info(narxlar)")
+    narxlar_columns = {row[1] for row in cur.fetchall()}
+    if "turi" not in narxlar_columns:
+        # Eski (turi'siz) narxlar jadvali bo'lsa, uni 'yigish' turi bilan qayta quramiz.
+        cur.execute("ALTER TABLE narxlar RENAME TO narxlar_old")
+        cur.execute(
+            """
+            CREATE TABLE narxlar (
+                turi TEXT NOT NULL COLLATE NOCASE,
+                item TEXT NOT NULL COLLATE NOCASE,
+                rate INTEGER NOT NULL,
+                PRIMARY KEY (turi, item)
+            )
+            """
+        )
+        cur.execute(
+            "INSERT INTO narxlar (turi, item, rate) SELECT 'yigish', item, rate FROM narxlar_old"
+        )
+        cur.execute("DROP TABLE narxlar_old")
+
     # Boshlang'ich ishchilar (agar hali qo'shilmagan bo'lsa).
     for default_worker in ("Hojiakbar", "Abdulloh"):
         cur.execute(
@@ -234,6 +272,24 @@ def is_owner(update: Update) -> bool:
     return bool(user and user.id == OWNER_ID)
 
 
+def get_linked_worker(update: Update):
+    """Agar shu Telegram foydalanuvchisi biror ishchiga bog'langan bo'lsa, ismini qaytaradi."""
+    user = update.effective_user
+    if not user:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT worker_name FROM worker_accounts WHERE telegram_id = ?", (user.id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def can_kirim(update: Update) -> bool:
+    """Kirim (upakovka) qilish huquqi: egasi yoki bog'langan ishchi."""
+    return is_owner(update) or get_linked_worker(update) is not None
+
+
 async def deny_access(update: Update):
     await update.message.reply_text(
         "Kechirasiz, faqat egasi mahsulot kirim/chiqim/o'chirish qila oladi. "
@@ -299,7 +355,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
         "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n"
         "/bekor <raqam> - buyurtmani bekor qiladi (zaxiraga tegmaydi)\n"
-        "/narx <detal> <summa> - detal (yoki 'komplekt') narxini belgilash\n"
+        "/narx <upakovka|yigish> <detal> <summa> - narx belgilash\n"
+        "/ishchiulash <ism> <telegram ID> - ishchini botga ulash (kirim huquqi)\n"
         "/narxlar - barcha narxlarni ko'rish\n"
         "/ishchilar - ishchilar ro'yxati\n"
         "/maosh [ism] - to'lanmagan maoshlarni ko'rish\n"
@@ -317,7 +374,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def kirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not can_kirim(update):
         await deny_access(update)
         return
     await change_stock(update, context, "kirim")
@@ -409,20 +466,50 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         """,
         (product_key, change_type, amount, user_name, user_id, datetime.now().isoformat(timespec="seconds")),
     )
+
+    payment_line = ""
+    if change_type == "kirim":
+        # Agar shu foydalanuvchi bog'langan ishchi bo'lsa, kirim = upakovka ishi
+        # deb hisoblab, avtomatik to'lovni yozib qo'yamiz.
+        cur.execute("SELECT worker_name FROM worker_accounts WHERE telegram_id = ?", (user_id,))
+        wrow = cur.fetchone()
+        if wrow:
+            worker = wrow[0]
+            cur.execute("SELECT rate FROM narxlar WHERE turi = 'upakovka' AND item = ?", (item,))
+            rrow = cur.fetchone()
+            rate = rrow[0] if rrow else 0
+            total = amount * rate
+            now = datetime.now().isoformat(timespec="seconds")
+            cur.execute(
+                """
+                INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
+                VALUES (?, 'upakovka', NULL, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (worker, model, item, amount, rate, total, now),
+            )
+            if rate == 0:
+                payment_line = f"\n📦 {worker} — upakovka narxi belgilanmagan ('{item}' uchun /narx upakovka {item} <summa> bilan belgilang)."
+            else:
+                payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+
     conn.commit()
     conn.close()
 
     verb = "qo'shildi" if change_type == "kirim" else "ayirildi"
     emoji = "📥" if change_type == "kirim" else "📤"
-    await update.effective_message.reply_text(
+    text = (
         f"{emoji} '{product_display}': {amount} ta {verb}.\n"
         f"Yangi qoldiq: {new_qty} ta.\n"
         f"Kiritdi: {user_name}"
     )
+    if payment_line:
+        text += payment_line
+    await update.effective_message.reply_text(text)
 
 
 async def sb_start(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    if not is_owner(update):
+    allowed = can_kirim(update) if mode == "kirim" else is_owner(update)
+    if not allowed:
         await deny_access(update)
         return
 
@@ -483,13 +570,14 @@ def sb_qty_text(sb):
 
 async def sb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_owner(update):
-        await query.answer("Faqat egasi qila oladi.", show_alert=True)
+    sb = context.user_data.get("sb")
+    mode = sb.get("mode") if sb else None
+    allowed = is_owner(update) or (mode == "kirim" and get_linked_worker(update) is not None)
+    if not allowed:
+        await query.answer("Faqat egasi (yoki ruxsat berilgan ishchi kirim uchun) qila oladi.", show_alert=True)
         return
     await query.answer()
     data = query.data
-
-    sb = context.user_data.get("sb")
 
     if data == "sb:cancel":
         context.user_data["sb"] = None
@@ -1074,62 +1162,121 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     usage = (
-        "Foydalanish: /narx <detal> <summa>\n"
-        "Misol: /narx shkaf 20000\n"
-        "Komplekt uchun: /narx komplekt 100000"
+        "Foydalanish: /narx <upakovka|yigish> <detal> <summa>\n"
+        "Misol: /narx upakovka shkaf 5000\n"
+        "Misol: /narx yigish shkaf 15000\n"
+        "Komplekt uchun: /narx yigish komplekt 100000"
     )
-    if len(args) < 2 or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
+    turi = args[0].lower()
     rate = int(args[-1])
-    item = " ".join(args[:-1]).lower()
+    item = " ".join(args[1:-1]).lower()
+    if not item:
+        await update.message.reply_text(usage)
+        return
 
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO narxlar (item, rate) VALUES (?, ?) "
-        "ON CONFLICT(item) DO UPDATE SET rate = excluded.rate",
-        (item, rate),
+        "INSERT INTO narxlar (turi, item, rate) VALUES (?, ?, ?) "
+        "ON CONFLICT(turi, item) DO UPDATE SET rate = excluded.rate",
+        (turi, item, rate),
     )
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ '{item}' narxi: {rate:,} so'm deb belgilandi.".replace(",", " "))
+    turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+    await update.message.reply_text(
+        f"✅ {turi_label} — '{item}' narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
+    )
 
 
 async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT item, rate FROM narxlar ORDER BY item")
+    cur.execute("SELECT turi, item, rate FROM narxlar ORDER BY turi, item")
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
         await update.message.reply_text(
-            "Hozircha hech qanday narx belgilanmagan.\nQo'shish: /narx <detal> <summa>"
+            "Hozircha hech qanday narx belgilanmagan.\nQo'shish: /narx <upakovka|yigish> <detal> <summa>"
         )
         return
 
-    lines = ["💰 Narxlar:\n"]
-    for item, rate in rows:
+    lines = ["💰 Narxlar:"]
+    current_turi = None
+    for turi, item, rate in rows:
+        if turi != current_turi:
+            label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+            lines.append(f"\n📦 {label}:" if turi == "upakovka" else f"\n🚚 {label}:")
+            current_turi = turi
         lines.append(f"• {item}: {rate:,} so'm".replace(",", " "))
     await update.message.reply_text("\n".join(lines))
+
 
 
 async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT name FROM workers ORDER BY name")
-    rows = [row[0] for row in cur.fetchall()]
+    names = [row[0] for row in cur.fetchall()]
+    cur.execute("SELECT worker_name, telegram_id FROM worker_accounts")
+    linked = dict(cur.fetchall())
     conn.close()
 
-    if not rows:
+    if not names:
         await update.message.reply_text("Hozircha hech qanday ishchi qo'shilmagan.")
         return
 
-    lines = ["👷 Ishchilar:\n"] + [f"• {name}" for name in rows]
+    lines = ["👷 Ishchilar:\n"]
+    for name in names:
+        if name in linked:
+            lines.append(f"• {name} — bog'langan (kirim qila oladi)")
+        else:
+            lines.append(f"• {name} — bog'lanmagan")
+    lines.append("\nBog'lash: /ishchiulash <ism> <telegram ID>")
     await update.message.reply_text("\n".join(lines))
+
+
+async def ishchiulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2 or not args[-1].isdigit():
+        await update.message.reply_text(
+            "Foydalanish: /ishchiulash <ism> <telegram ID>\n"
+            "Misol: /ishchiulash Hojiakbar 6926878775\n\n"
+            "Telegram ID ni olish uchun: ishchi botga shaxsiy chatda /chatid deb yozadi."
+        )
+        return
+
+    telegram_id = int(args[-1])
+    worker = " ".join(args[:-1])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)",
+        (worker, datetime.now().isoformat(timespec="seconds")),
+    )
+    cur.execute(
+        "INSERT INTO worker_accounts (telegram_id, worker_name, created_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET worker_name = excluded.worker_name",
+        (telegram_id, worker, datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ {worker} — Telegram ID {telegram_id} bilan bog'landi.\n"
+        f"Endi u botga /kirim orqali mahsulot kirim qila oladi (upakovka ishi sifatida hisoblanadi)."
+    )
 
 
 async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1811,7 +1958,7 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
         # aks holda o'sha detal narxi * buyurtma soni (zaxiradan chiqarilgan aniq
         # miqdordan mustaqil - komplekt tarkibidagi ko'paytmalarga qarab emas).
         rate_key = "komplekt" if item is None else item
-        cur.execute("SELECT rate FROM narxlar WHERE item = ?", (rate_key,))
+        cur.execute("SELECT rate FROM narxlar WHERE turi = 'yigish' AND item = ?", (rate_key,))
         rrow = cur.fetchone()
         rate = rrow[0] if rrow else 0
         total = amount * rate
@@ -1822,15 +1969,15 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
         )
         cur.execute(
             """
-            INSERT INTO work_log (worker, order_id, model, item, amount, rate, total, paid, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
+            VALUES (?, 'yigish', ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (worker, order_id, model, rate_key, amount, rate, total, now),
         )
         if rate == 0:
-            payment_line = f"\n👷 {worker} — narx belgilanmagan ('{rate_key}' uchun /narx bilan belgilang)."
+            payment_line = f"\n👷 {worker} — yig'ish narxi belgilanmagan ('{rate_key}' uchun /narx yigish {rate_key} <summa> bilan belgilang)."
         else:
-            payment_line = f"\n👷 {worker} — {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+            payment_line = f"\n👷 {worker} — yig'ish: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
 
     conn.commit()
     conn.close()
@@ -1856,7 +2003,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker = " ".join(args)
         cur.execute(
             """
-            SELECT model, item, amount, rate, total, created_at
+            SELECT turi, model, item, amount, rate, total, created_at
             FROM work_log WHERE worker = ? AND paid = 0 ORDER BY created_at
             """,
             (worker,),
@@ -1868,10 +2015,12 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"👷 {worker} — to'lanmagan ish topilmadi.")
             return
 
-        total_sum = sum(r[4] for r in rows)
+        total_sum = sum(r[5] for r in rows)
         lines = [f"👷 {worker} — to'lanmagan ishlar ({len(rows)} ta):\n"]
-        for model, item, amount, rate, total, created_at in rows:
-            lines.append(f"• {model} {item} x{amount} = {total:,} so'm".replace(",", " "))
+        for turi, model, item, amount, rate, total, created_at in rows:
+            icon = "📦" if turi == "upakovka" else "🚚"
+            model_part = f"{model} " if model else ""
+            lines.append(f"{icon} {model_part}{item} x{amount} = {total:,} so'm".replace(",", " "))
         lines.append(f"\n💰 Jami: {total_sum:,} so'm".replace(",", " "))
         lines.append(f"\nTo'langanda: /tolandi {worker}")
         await update.message.reply_text("\n".join(lines))
@@ -2065,6 +2214,7 @@ def main():
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("narxlar", narxlar))
     app.add_handler(CommandHandler("ishchilar", ishchilar))
+    app.add_handler(CommandHandler("ishchiulash", ishchiulash))
     app.add_handler(CommandHandler("maosh", maosh))
     app.add_handler(CommandHandler("tolandi", tolandi))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
