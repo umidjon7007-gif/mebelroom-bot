@@ -136,9 +136,10 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS narxlar (
             turi TEXT NOT NULL COLLATE NOCASE,     -- 'upakovka' yoki 'yigish'
+            model TEXT NOT NULL COLLATE NOCASE DEFAULT '',  -- '' = barcha modellar uchun umumiy
             item TEXT NOT NULL COLLATE NOCASE,     -- detal nomi, yoki 'komplekt'
             rate INTEGER NOT NULL,
-            PRIMARY KEY (turi, item)
+            PRIMARY KEY (turi, model, item)
         )
         """
     )
@@ -191,14 +192,33 @@ def init_db():
             """
             CREATE TABLE narxlar (
                 turi TEXT NOT NULL COLLATE NOCASE,
+                model TEXT NOT NULL COLLATE NOCASE DEFAULT '',
                 item TEXT NOT NULL COLLATE NOCASE,
                 rate INTEGER NOT NULL,
-                PRIMARY KEY (turi, item)
+                PRIMARY KEY (turi, model, item)
             )
             """
         )
         cur.execute(
-            "INSERT INTO narxlar (turi, item, rate) SELECT 'yigish', item, rate FROM narxlar_old"
+            "INSERT INTO narxlar (turi, model, item, rate) SELECT 'yigish', '', item, rate FROM narxlar_old"
+        )
+        cur.execute("DROP TABLE narxlar_old")
+    elif "model" not in narxlar_columns:
+        # 'turi' bor, lekin 'model' yo'q - shuni qo'shib, mavjud narxlarni umumiy ('') deb belgilaymiz.
+        cur.execute("ALTER TABLE narxlar RENAME TO narxlar_old")
+        cur.execute(
+            """
+            CREATE TABLE narxlar (
+                turi TEXT NOT NULL COLLATE NOCASE,
+                model TEXT NOT NULL COLLATE NOCASE DEFAULT '',
+                item TEXT NOT NULL COLLATE NOCASE,
+                rate INTEGER NOT NULL,
+                PRIMARY KEY (turi, model, item)
+            )
+            """
+        )
+        cur.execute(
+            "INSERT INTO narxlar (turi, model, item, rate) SELECT turi, '', item, rate FROM narxlar_old"
         )
         cur.execute("DROP TABLE narxlar_old")
 
@@ -355,7 +375,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buyurtmalar - bajarilmagan buyurtmalar ro'yxati\n"
         "/bajarildi <raqam> - buyurtmani bajarilgan deb belgilaydi va zaxiradan chiqaradi\n"
         "/bekor <raqam> - buyurtmani bekor qiladi (zaxiraga tegmaydi)\n"
-        "/narx <upakovka|yigish> <detal> <summa> - narx belgilash\n"
+        "/narx <upakovka|yigish> <detal> <summa> - narx belgilash (barcha modellar)\n"
+        "/modelnarx <upakovka|yigish> <model> <detal> <summa> - faqat bitta modelga maxsus narx\n"
         "/ishchiulash <ism> <telegram ID> - ishchini botga ulash (kirim huquqi)\n"
         "/narxlar - barcha narxlarni ko'rish\n"
         "/ishchilar - ishchilar ro'yxati\n"
@@ -475,9 +496,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         wrow = cur.fetchone()
         if wrow:
             worker = wrow[0]
-            cur.execute("SELECT rate FROM narxlar WHERE turi = 'upakovka' AND item = ?", (item,))
-            rrow = cur.fetchone()
-            rate = rrow[0] if rrow else 0
+            rate = get_rate(cur, "upakovka", model, item)
             total = amount * rate
             now = datetime.now().isoformat(timespec="seconds")
             cur.execute(
@@ -981,6 +1000,24 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
     # ketma-ket yana mahsulot yozishi mumkin.
 
 
+def get_rate(cur, turi: str, model: str, item: str) -> int:
+    """Narxni topadi: avval model uchun maxsus belgilangan narxni, topilmasa
+    umumiy (barcha modellar uchun) narxni qaytaradi. Hech narsa topilmasa 0."""
+    cur.execute(
+        "SELECT rate FROM narxlar WHERE turi = ? AND model = ? AND item = ?",
+        (turi, model, item),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute(
+        "SELECT rate FROM narxlar WHERE turi = ? AND model = '' AND item = ?",
+        (turi, item),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
 def stock_indicator(quantity: int) -> str:
     if quantity <= 0:
         return "🔴"
@@ -1165,7 +1202,8 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Foydalanish: /narx <upakovka|yigish> <detal> <summa>\n"
         "Misol: /narx upakovka shkaf 5000\n"
         "Misol: /narx yigish shkaf 15000\n"
-        "Komplekt uchun: /narx yigish komplekt 100000"
+        "Komplekt uchun: /narx yigish komplekt 100000\n\n"
+        "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish> <model> <detal> <summa>"
     )
     if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
@@ -1181,8 +1219,8 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO narxlar (turi, item, rate) VALUES (?, ?, ?) "
-        "ON CONFLICT(turi, item) DO UPDATE SET rate = excluded.rate",
+        "INSERT INTO narxlar (turi, model, item, rate) VALUES (?, '', ?, ?) "
+        "ON CONFLICT(turi, model, item) DO UPDATE SET rate = excluded.rate",
         (turi, item, rate),
     )
     conn.commit()
@@ -1190,14 +1228,70 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
     await update.message.reply_text(
-        f"✅ {turi_label} — '{item}' narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
+        f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
+    )
+
+
+async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = [a.lower() for a in context.args]
+    usage = (
+        "Foydalanish: /modelnarx <upakovka|yigish> <model> <detal> <summa>\n"
+        "Misol: /modelnarx yigish bella spalniy shkaf 20000\n\n"
+        "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
+    )
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish") or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    turi = args[0]
+    rate = int(args[-1])
+    middle = args[1:-1]  # <model...> <detal>
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    model = None
+    item = None
+    for candidate in all_models:
+        candidate_tokens = candidate.split()
+        if middle[: len(candidate_tokens)] == candidate_tokens:
+            model = candidate
+            item = " ".join(middle[len(candidate_tokens) :])
+            break
+
+    if model is None or not item:
+        conn.close()
+        await update.message.reply_text(
+            f"Model yoki detal topilmadi.\nMavjud modellar: {', '.join(sorted(set(all_models)))}\n\n"
+            + usage
+        )
+        return
+
+    cur.execute(
+        "INSERT INTO narxlar (turi, model, item, rate) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(turi, model, item) DO UPDATE SET rate = excluded.rate",
+        (turi, model, item, rate),
+    )
+    conn.commit()
+    conn.close()
+
+    turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+    await update.message.reply_text(
+        f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {rate:,} so'm.".replace(",", " ")
     )
 
 
 async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT turi, item, rate FROM narxlar ORDER BY turi, item")
+    cur.execute("SELECT turi, model, item, rate FROM narxlar ORDER BY turi, model, item")
     rows = cur.fetchall()
     conn.close()
 
@@ -1209,12 +1303,15 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
-    for turi, item, rate in rows:
+    for turi, model, item, rate in rows:
         if turi != current_turi:
             label = "Upakovka" if turi == "upakovka" else "Yig'ish"
             lines.append(f"\n📦 {label}:" if turi == "upakovka" else f"\n🚚 {label}:")
             current_turi = turi
-        lines.append(f"• {item}: {rate:,} so'm".replace(",", " "))
+        if model:
+            lines.append(f"• {model} {item} (maxsus): {rate:,} so'm".replace(",", " "))
+        else:
+            lines.append(f"• {item}: {rate:,} so'm".replace(",", " "))
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1958,9 +2055,7 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
         # aks holda o'sha detal narxi * buyurtma soni (zaxiradan chiqarilgan aniq
         # miqdordan mustaqil - komplekt tarkibidagi ko'paytmalarga qarab emas).
         rate_key = "komplekt" if item is None else item
-        cur.execute("SELECT rate FROM narxlar WHERE turi = 'yigish' AND item = ?", (rate_key,))
-        rrow = cur.fetchone()
-        rate = rrow[0] if rrow else 0
+        rate = get_rate(cur, "yigish", model, rate_key)
         total = amount * rate
 
         cur.execute(
@@ -2212,6 +2307,7 @@ def main():
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
     app.add_handler(CommandHandler("narx", narx))
+    app.add_handler(CommandHandler("modelnarx", modelnarx))
     app.add_handler(CommandHandler("narxlar", narxlar))
     app.add_handler(CommandHandler("ishchilar", ishchilar))
     app.add_handler(CommandHandler("ishchiulash", ishchiulash))
