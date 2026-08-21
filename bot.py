@@ -1852,6 +1852,49 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     await update.message.reply_text("\n".join(lines))
 
 
+async def guruhlash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2 or not all(a.isdigit() for a in args):
+        await update.message.reply_text(
+            "Eski (alohida) buyurtmalarni bitta guruhga birlashtiradi.\n\n"
+            "Foydalanish: /guruhlash <yangi_raqam> <eski_raqam1> <eski_raqam2> ...\n"
+            "Misol: /guruhlash 25 25 26 27 28 29"
+        )
+        return
+
+    new_guruh_id = int(args[0])
+    order_ids = [int(a) for a in args]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id, model, item FROM orders WHERE id IN ({','.join('?' for _ in order_ids)})",
+        order_ids,
+    )
+    found = cur.fetchall()
+    if not found:
+        conn.close()
+        await update.message.reply_text("Bu raqamlar bilan hech qanday buyurtma topilmadi.")
+        return
+
+    cur.execute(
+        f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in order_ids)})",
+        [new_guruh_id] + order_ids,
+    )
+    conn.commit()
+    conn.close()
+
+    lines = [f"✅ {len(found)} ta buyurtma №{new_guruh_id} guruhiga birlashtirildi:"]
+    for oid, model, item in found:
+        what = f"{model} komplekt" if item is None else f"{model} {item}"
+        lines.append(f"• №{oid} — {what}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -2359,6 +2402,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmalar", buyurtmalar))
     app.add_handler(CommandHandler("bajarildi", bajarildi))
     app.add_handler(CommandHandler("bekor", bekor))
+    app.add_handler(CommandHandler("guruhlash", guruhlash))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
