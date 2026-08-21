@@ -111,6 +111,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guruh_id INTEGER,                   -- bitta seansda birga yaratilgan buyurtmalar guruhi
             model TEXT NOT NULL COLLATE NOCASE,
             item TEXT COLLATE NOCASE,          -- NULL bo'lsa - butun komplekt
             amount INTEGER NOT NULL,
@@ -122,6 +123,12 @@ def init_db():
         )
         """
     )
+    cur.execute("PRAGMA table_info(orders)")
+    orders_columns = {row[1] for row in cur.fetchall()}
+    if "guruh_id" not in orders_columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN guruh_id INTEGER")
+        # Eski buyurtmalar - har biri o'zining alohida guruhi (o'z ID'si bilan).
+        cur.execute("UPDATE orders SET guruh_id = id WHERE guruh_id IS NULL")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -823,13 +830,20 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (model, item, amount, deadline.isoformat(), deadline_display, customer, now),
         )
         created.append((cur.lastrowid, item, amount))
+
+    guruh_id = created[0][0]
+    cur.execute(
+        f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
+        [guruh_id] + [oid for oid, _, _ in created],
+    )
     conn.commit()
     conn.close()
 
-    lines = ["📝 Yangi buyurtma qabul qilindi:"]
-    for order_id, item, amount in created:
-        what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
-        lines.append(f"№{order_id} — {what}")
+    what_all = ", ".join(
+        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
+        for _, item, amount in created
+    )
+    lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
@@ -985,12 +999,12 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if awaiting == "worker_name_for_order":
-        order_id = context.user_data.get("pending_order_id")
+        guruh_id = context.user_data.get("pending_order_id")
         context.user_data["awaiting"] = None
         context.user_data["pending_order_id"] = None
-        if order_id is None:
+        if guruh_id is None:
             return
-        result_text = await bajarildi_core(order_id, update.effective_user, text)
+        result_text = await bajarildi_group_core(guruh_id, update.effective_user, text)
         await update.message.reply_text(result_text)
         return
 
@@ -1817,13 +1831,20 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         )
         created.append((cur.lastrowid, item, amount))
 
+    guruh_id = created[0][0]
+    cur.execute(
+        f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
+        [guruh_id] + [oid for oid, _, _ in created],
+    )
+
     conn.commit()
     conn.close()
 
-    lines = ["📝 Yangi buyurtma qabul qilindi:"]
-    for order_id, item, amount in created:
-        what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
-        lines.append(f"№{order_id} — {what}")
+    what_all = ", ".join(
+        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
+        for _, item, amount in created
+    )
+    lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
@@ -1841,33 +1862,35 @@ async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Foydalanish: /bekor <buyurtma raqami>\nMisol: /bekor 14")
         return
 
-    order_id = int(args[0])
+    guruh_id = int(args[0])
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT model, item FROM orders WHERE id = ? AND status = 'kutilmoqda'", (order_id,))
-    row = cur.fetchone()
-    if row is None:
+    cur.execute(
+        "SELECT model, item FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'", (guruh_id,)
+    )
+    rows = cur.fetchall()
+    if not rows:
         conn.close()
         await update.message.reply_text(
-            f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan/bekor qilingan."
+            f"№{guruh_id} buyurtma topilmadi yoki allaqachon bajarilgan/bekor qilingan."
         )
         return
 
-    cur.execute("UPDATE orders SET status = 'bekor qilindi' WHERE id = ?", (order_id,))
+    cur.execute("UPDATE orders SET status = 'bekor qilindi' WHERE guruh_id = ?", (guruh_id,))
     conn.commit()
     conn.close()
 
-    model, item = row
-    what = f"{model} komplekt" if item is None else f"{model} {item}"
+    what_all = ", ".join(
+        (f"{model} komplekt" if item is None else f"{model} {item}") for model, item in rows
+    )
     await update.message.reply_text(
-        f"🗑 №{order_id} ({what}) bekor qilindi. Zaxiraga hech qanday ta'sir qilmadi."
+        f"🗑 №{guruh_id} ({what_all}) bekor qilindi. Zaxiraga hech qanday ta'sir qilmadi."
     )
 
 
-def format_single_order_line(row):
-    order_id, model, item, amount, deadline_iso, deadline_display, customer = row
+def format_group_text(group):
     today = date.today()
-    deadline_date = date.fromisoformat(deadline_iso)
+    deadline_date = date.fromisoformat(group["deadline"])
     days_left = (deadline_date - today).days
     if days_left > 0:
         days_text = f"{days_left} kun qoldi"
@@ -1876,49 +1899,56 @@ def format_single_order_line(row):
     else:
         days_text = f"muddati {abs(days_left)} kun o'tgan"
 
-    what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
-    line = f"№{order_id} — {what} — {deadline_display} ({days_text})"
-    if customer:
-        line += f" — {customer}"
-    return line
-
-
-def format_buyurtmalar_text(rows):
-    if not rows:
-        return "Hozircha bajarilmagan buyurtma yo'q."
-
-    lines = ["📋 Bajarilmagan buyurtmalar:\n"]
-    for row in rows:
-        lines.append(format_single_order_line(row))
+    lines = [f"📋 Buyurtma №{group['guruh_id']} — {group['deadline_display']} ({days_text})"]
+    if group["customer"]:
+        lines.append(f"Mijoz: {group['customer']}")
+    lines.append("")
+    for _, model, item, amount in group["items"]:
+        what = f"{model} komplekt" if item is None else f"{model} {item}"
+        lines.append(f"• {what}: {amount} ta")
     return "\n".join(lines)
 
 
-def fetch_pending_orders():
+def fetch_pending_order_groups():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, model, item, amount, deadline, deadline_display, customer
-        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC
+        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer
+        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC, guruh_id ASC, id ASC
         """
     )
     rows = cur.fetchall()
     conn.close()
-    return rows
+
+    groups = {}
+    order_of_groups = []
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer in rows:
+        gid = guruh_id if guruh_id is not None else oid
+        if gid not in groups:
+            groups[gid] = {
+                "guruh_id": gid,
+                "deadline": deadline_iso,
+                "deadline_display": deadline_display,
+                "customer": customer,
+                "items": [],
+            }
+            order_of_groups.append(gid)
+        groups[gid]["items"].append((oid, model, item, amount))
+    return [groups[gid] for gid in order_of_groups]
 
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = fetch_pending_orders()
-    if not rows:
+    groups = fetch_pending_order_groups()
+    if not groups:
         await update.message.reply_text("Hozircha bajarilmagan buyurtma yo'q.")
         return
 
-    await update.message.reply_text(f"📋 Bajarilmagan buyurtmalar ({len(rows)} ta):")
-    for row in rows:
-        order_id = row[0]
-        text = format_single_order_line(row)
+    await update.message.reply_text(f"📋 Bajarilmagan buyurtmalar ({len(groups)} ta):")
+    for group in groups:
+        text = format_group_text(group)
         button = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"✅ №{order_id} topshirildi", callback_data=f"orddone:{order_id}")]]
+            [[InlineKeyboardButton(f"✅ №{group['guruh_id']} topshirildi", callback_data=f"orddone:{group['guruh_id']}")]]
         )
         await update.message.reply_text(text, reply_markup=button)
 
@@ -1930,7 +1960,7 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
 
-    order_id = int(query.data.split(":", 1)[1])
+    guruh_id = int(query.data.split(":", 1)[1])
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1939,9 +1969,9 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     buttons = [
-        [InlineKeyboardButton(w, callback_data=f"workerdone:{order_id}:{w}")] for w in workers
+        [InlineKeyboardButton(w, callback_data=f"workerdone:{guruh_id}:{w}")] for w in workers
     ]
-    buttons.append([InlineKeyboardButton("➕ Yangi ishchi", callback_data=f"workerdone:{order_id}:__new__")])
+    buttons.append([InlineKeyboardButton("➕ Yangi ishchi", callback_data=f"workerdone:{guruh_id}:__new__")])
     await query.edit_message_text("👷 Buyurtmani kim topshirdi?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -1952,16 +1982,16 @@ async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await query.answer()
 
-    _, order_id_str, worker = query.data.split(":", 2)
-    order_id = int(order_id_str)
+    _, guruh_id_str, worker = query.data.split(":", 2)
+    guruh_id = int(guruh_id_str)
 
     if worker == "__new__":
         context.user_data["awaiting"] = "worker_name_for_order"
-        context.user_data["pending_order_id"] = order_id
+        context.user_data["pending_order_id"] = guruh_id
         await query.edit_message_text("✍️ Yangi ishchining ismini yozing:")
         return
 
-    result_text = await bajarildi_core(order_id, update.effective_user, worker)
+    result_text = await bajarildi_group_core(guruh_id, update.effective_user, worker)
     await query.edit_message_text(result_text, reply_markup=None)
 
 
@@ -1978,27 +2008,17 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    order_id = int(args[0])
+    guruh_id = int(args[0])
     worker = " ".join(args[1:])
     user = update.effective_user
-    text = await bajarildi_core(order_id, user, worker)
+    text = await bajarildi_group_core(guruh_id, user, worker)
     await update.message.reply_text(text)
 
 
-async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT model, item, amount FROM orders WHERE id = ? AND status = 'kutilmoqda'",
-        (order_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return f"№{order_id} buyurtma topilmadi yoki allaqachon bajarilgan."
-
-    model, item, amount = row
-
+def fulfill_single_order(cur, order_id, model, item, amount, worker, user_name, user_id, now):
+    """Bitta buyurtma qatorini zaxiradan chiqaradi va (agar worker berilgan bo'lsa)
+    to'lovni hisoblab work_log ga yozadi. Natijani (result_lines, payment_total, payment_note) qaytaradi.
+    Tranzaksiyani boshqarish (commit/close) chaqiruvchiga qoladi."""
     if item is not None:
         targets = [(model, item)]
     else:
@@ -2006,15 +2026,8 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
         targets = [(model, row_item) for (row_item,) in cur.fetchall()]
 
     if not targets:
-        conn.close()
-        return f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."
+        return [f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."], 0, None
 
-    user_name = user.full_name if user else "noma'lum"
-    user_id = user.id if user else None
-    now = datetime.now().isoformat(timespec="seconds")
-
-    # Komplekt buyurtmasi bo'lsa, har bir detal uchun kerakli sonni
-    # komplekt_tarkibi jadvalidan olamiz (sozlanmagan bo'lsa - standart 1).
     per_item_qty = {}
     if item is None:
         cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (model,))
@@ -2033,10 +2046,7 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
         if shortage:
             new_qty = 0
 
-        cur.execute(
-            "UPDATE products SET quantity = ? WHERE name = ?",
-            (new_qty, product_key),
-        )
+        cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
         cur.execute(
             """
             INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at)
@@ -2045,43 +2055,69 @@ async def bajarildi_core(order_id: int, user, worker: str = None) -> str:
             (product_key, deduct, user_name, user_id, now),
         )
         warn = " ⚠️ yetarli emas edi!" if shortage else ""
-        result_lines.append(f"• {target_item}: -{deduct}{warn}")
+        what = f"{model} komplekt" if item is None else f"{model} {item}"
+        result_lines.append(f"• {target_item}: -{deduct}{warn}" if item is None else f"• {what}: -{deduct}{warn}")
 
-    cur.execute("UPDATE orders SET status = 'bajarildi' WHERE id = ?", (order_id,))
-
-    payment_line = ""
+    payment_total = 0
+    payment_note = None
     if worker:
-        # To'lov hisobi: komplekt buyurtmasi bo'lsa "komplekt" narxi * buyurtma soni,
-        # aks holda o'sha detal narxi * buyurtma soni (zaxiradan chiqarilgan aniq
-        # miqdordan mustaqil - komplekt tarkibidagi ko'paytmalarga qarab emas).
         rate_key = "komplekt" if item is None else item
         rate = get_rate(cur, "yigish", model, rate_key)
-        total = amount * rate
+        payment_total = amount * rate
 
-        cur.execute(
-            "INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)",
-            (worker, now),
-        )
+        cur.execute("INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)", (worker, now))
         cur.execute(
             """
             INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
             VALUES (?, 'yigish', ?, ?, ?, ?, ?, ?, 0, ?)
             """,
-            (worker, order_id, model, rate_key, amount, rate, total, now),
+            (worker, order_id, model, rate_key, amount, rate, payment_total, now),
         )
         if rate == 0:
-            payment_line = f"\n👷 {worker} — yig'ish narxi belgilanmagan ('{rate_key}' uchun /narx yigish {rate_key} <summa> bilan belgilang)."
-        else:
-            payment_line = f"\n👷 {worker} — yig'ish: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+            payment_note = f"'{model} {rate_key}' uchun narx belgilanmagan"
 
+    return result_lines, payment_total, payment_note
+
+
+async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'",
+        (guruh_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        return f"№{guruh_id} buyurtma topilmadi yoki allaqachon bajarilgan."
+
+    user_name = user.full_name if user else "noma'lum"
+    user_id = user.id if user else None
+    now = datetime.now().isoformat(timespec="seconds")
+
+    all_result_lines = []
+    total_payment = 0
+    missing_rates = []
+    for order_id, model, item, amount in rows:
+        result_lines, payment_total, payment_note = fulfill_single_order(
+            cur, order_id, model, item, amount, worker, user_name, user_id, now
+        )
+        all_result_lines.extend(result_lines)
+        total_payment += payment_total
+        if payment_note:
+            missing_rates.append(payment_note)
+
+    cur.execute("UPDATE orders SET status = 'bajarildi' WHERE guruh_id = ?", (guruh_id,))
     conn.commit()
     conn.close()
 
-    what = f"{model} komplekt" if item is None else f"{model} {item}"
-    lines = [f"✅ №{order_id} buyurtma bajarildi deb belgilandi.", f"{what} zaxiradan chiqarildi:"]
-    lines.extend(result_lines)
-    if payment_line:
-        lines.append(payment_line)
+    lines = [f"✅ №{guruh_id} buyurtma bajarildi deb belgilandi.", "Zaxiradan chiqarildi:"]
+    lines.extend(all_result_lines)
+    if worker:
+        if total_payment > 0:
+            lines.append(f"\n👷 {worker} — yig'ish: {total_payment:,} so'm hisoblandi.".replace(",", " "))
+        if missing_rates:
+            lines.append("\n⚠️ Narx belgilanmagan: " + ", ".join(missing_rates))
     return "\n".join(lines)
 
 
@@ -2171,8 +2207,12 @@ async def job_buyurtma_eslatma(context: ContextTypes.DEFAULT_TYPE):
     if WORKER_CHAT_ID is None:
         return
 
-    rows = fetch_pending_orders()
-    text = format_buyurtmalar_text(rows)
+    groups = fetch_pending_order_groups()
+    if not groups:
+        await context.bot.send_message(chat_id=WORKER_CHAT_ID, text="Hozircha bajarilmagan buyurtma yo'q.")
+        return
+
+    text = "\n\n".join(format_group_text(g) for g in groups)
     await context.bot.send_message(chat_id=WORKER_CHAT_ID, text=text)
 
 
