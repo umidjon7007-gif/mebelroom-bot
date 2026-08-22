@@ -253,6 +253,53 @@ def init_db():
             (model, item or name, name),
         )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_group_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT,
+            item TEXT,
+            amount INTEGER,
+            deadline TEXT,
+            deadline_display TEXT,
+            customer TEXT,
+            raw_text TEXT,
+            source_chat_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'kutilmoqda',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_setting(key: str, value: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -353,6 +400,27 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(
         f"Chat ID: {chat.id}\nTuri: {chat.type}"
+    )
+
+
+async def buyurtmaguruhi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "Bu buyruqni buyurtma qabul qilinadigan GURUH ichida yuboring "
+            "(masalan 'ZAKAZ MIRANDA MAYA' guruhida)."
+        )
+        return
+    set_setting("order_intake_group_id", str(chat.id))
+    await update.message.reply_text(
+        f"✅ Bu guruh ({chat.title}) endi buyurtma qabul qiluvchi guruh sifatida belgilandi.\n\n"
+        "Endi bu guruhga yozilgan xabarlarni bot o'qib, sizga (shaxsiy xabarda) "
+        "\"shunday tushundim\" deb tasdiqlash uchun yuboradi.\n\n"
+        "⚠️ MUHIM: bot barcha xabarlarni ko'rishi uchun BotFather'da shu botga "
+        "/setprivacy → Disable qilib qo'yish kerak (agar hali qilinmagan bo'lsa)."
     )
 
 
@@ -1712,6 +1780,229 @@ def compute_deadline(day: int, month: int):
 UZ_MONTH_BY_NUM = {v: k for k, v in MONTH_NAMES.items()}
 
 
+GENERIC_ITEM_WORDS = ["shkaf", "tumba", "krovat", "kamod", "parta"]
+
+
+def parse_deadline_from_text(text: str):
+    """Matndan 'Muddat: 21-22 avgust', '29-Avgust', '5 avgust' kabi sanalarni topadi.
+    Qaytaradi: (day, month_num, deadline_display) yoki None."""
+    lowered = text.lower()
+
+    # 1) Oraliq: "21-22 avgust" - oxirgi kunni muddat deb olamiz.
+    m = re.search(r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s+([a-zʻʼ']+)", lowered)
+    if m:
+        day = int(m.group(2))
+        month_word = m.group(3)
+        if month_word in MONTH_NAMES:
+            return day, MONTH_NAMES[month_word], f"{day} {month_word}"
+
+    # 2) Chiziqcha bilan qo'shilgan: "29-Avgust"
+    m = re.search(r"(\d{1,2})\s*[-–]\s*([a-zʻʼ']+)", lowered)
+    if m:
+        day = int(m.group(1))
+        month_word = m.group(2)
+        if month_word in MONTH_NAMES:
+            return day, MONTH_NAMES[month_word], f"{day} {month_word}"
+
+    # 3) Oddiy bo'shliq bilan: "5 avgust"
+    m = re.search(r"(\d{1,2})\s+([a-zʻʼ']+)", lowered)
+    if m:
+        day = int(m.group(1))
+        month_word = m.group(2)
+        if month_word in MONTH_NAMES:
+            return day, MONTH_NAMES[month_word], f"{day} {month_word}"
+
+    return None
+
+
+def parse_model_from_text(text: str, all_models):
+    """Matn ichidan (istalgan joyidan) bazadagi modellardan birini qidiradi.
+    Ko'p so'zli modellarni ustuvor qiladi (masalan 'bella spalniy' > 'bella')."""
+    tokens = re.findall(r"[a-zA-Zʻʼ'\u0400-\u04FF]+", text.lower())
+    candidates = sorted(set(all_models), key=lambda m: -len(m.split()))
+    for candidate in candidates:
+        cand_tokens = candidate.split()
+        n = len(cand_tokens)
+        for i in range(len(tokens) - n + 1):
+            if tokens[i : i + n] == cand_tokens:
+                return candidate
+    return None
+
+
+def parse_item_from_text(text: str, model: str):
+    """Modeldan keyin komplekt yoki aniq detalni aniqlashga harakat qiladi.
+    Qaytaradi: (item_or_None, amount, komplekt_aniq_topilganmi)."""
+    lowered = text.lower()
+
+    amount = 1
+    if "komplekt" in lowered:
+        return None, amount, True
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT item FROM products WHERE model = ?", (model,))
+    model_items = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    candidate_items = model_items or GENERIC_ITEM_WORDS
+    for item in sorted(candidate_items, key=lambda x: -len(x)):
+        m = re.search(rf"\b{re.escape(item.lower())}\b", lowered)
+        if m:
+            qty_m = re.search(rf"(\d+)\s*ta\b.{{0,20}}\b{re.escape(item.lower())}\b", lowered)
+            if not qty_m:
+                qty_m = re.search(rf"\b{re.escape(item.lower())}\b.{{0,20}}?(\d+)\s*ta\b", lowered)
+            if qty_m:
+                amount = int(qty_m.group(1))
+            return item, amount, False
+
+    # Aniq detal topilmadi - komplekt deb taxmin qilamiz, lekin noaniq deb belgilaymiz.
+    return None, amount, False
+
+
+async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, sender_name):
+    if OWNER_ID is None:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    model = parse_model_from_text(text, all_models)
+    if model is None:
+        return  # Model aniqlanmadi - bu guruh xabari buyurtma emas bo'lishi mumkin, e'tiborsiz qoldiramiz.
+
+    deadline_info = parse_deadline_from_text(text)
+    item, amount, komplekt_aniq = parse_item_from_text(text, model)
+
+    lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
+    lines.append(f"Taxminiy model: {model}")
+    if item is None:
+        lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
+    else:
+        lines.append(f"Taxminiy detal: {item} ({amount} ta)")
+
+    if deadline_info:
+        day, month, deadline_display = deadline_info
+        lines.append(f"Taxminiy muddat: {deadline_display}")
+    else:
+        lines.append("Muddat: ❗ topilmadi")
+
+    lines.append(f"Kimdan: {sender_name}")
+    lines.append("")
+    lines.append(f"Asl xabar:\n{text}")
+
+    if deadline_info is None:
+        lines.append("\n⚠️ Muddat aniqlanmagani uchun avtomatik tasdiqlash mumkin emas. "
+                      "Kerak bo'lsa /buyurtma orqali qo'lda kiriting.")
+        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+        return
+
+    day, month, deadline_display = deadline_info
+    deadline = compute_deadline(day, month)
+    if deadline is None:
+        lines.append("\n⚠️ Sana noto'g'ri chiqdi, qo'lda kiriting.")
+        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        """
+        INSERT INTO pending_group_orders
+            (model, item, amount, deadline, deadline_display, customer, raw_text, source_chat_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+        """,
+        (model, item, amount, deadline.isoformat(), deadline_display, sender_name, text, chat_id, now),
+    )
+    pending_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"gord:{pending_id}:yes"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"gord:{pending_id}:no"),
+            ]
+        ]
+    )
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines), reply_markup=keyboard)
+
+
+async def group_order_intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat is None or chat.type not in ("group", "supergroup"):
+        return
+
+    intake_id_raw = get_setting("order_intake_group_id")
+    if intake_id_raw is None or str(chat.id) != intake_id_raw:
+        return
+
+    user = update.effective_user
+    if user and user.is_bot:
+        return
+
+    text = update.message.text or update.message.caption
+    if not text:
+        return
+
+    sender_name = user.full_name if user else (chat.title or "Nomalum")
+
+    await send_group_order_confirmation(context, chat.id, update.message.message_id, text, sender_name)
+
+
+async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, pending_id_str, action = query.data.split(":")
+    pending_id = int(pending_id_str)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, amount, deadline, deadline_display, customer, status FROM pending_group_orders WHERE id = ?", (pending_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await query.edit_message_text("Bu taklif topilmadi (eskirgan bo'lishi mumkin).")
+        return
+
+    model, item, amount, deadline, deadline_display, customer, status = row
+    if status != "kutilmoqda":
+        conn.close()
+        await query.edit_message_text(query.message.text + "\n\n(Bu allaqachon ko'rib chiqilgan)")
+        return
+
+    if action == "no":
+        cur.execute("UPDATE pending_group_orders SET status = 'rad etildi' WHERE id = ?", (pending_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(query.message.text + "\n\n❌ Rad etildi.")
+        return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        """
+        INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+        """,
+        (model, item, amount, deadline, deadline_display, customer, now),
+    )
+    order_id = cur.lastrowid
+    cur.execute("UPDATE orders SET guruh_id = ? WHERE id = ?", (order_id, order_id))
+    cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
+    conn.commit()
+    conn.close()
+
+    what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
+    await query.edit_message_text(
+        query.message.text + f"\n\n✅ Tasdiqlandi! Buyurtma №{order_id} yaratildi: {what}, muddat {deadline_display}."
+    )
+
+
 async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -2371,6 +2662,7 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "yordam", "help"], start))
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("buyurtmaguruhi", buyurtmaguruhi))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['qoldiq']}$"), qoldiq))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
@@ -2379,6 +2671,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND,
+        group_order_intake,
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
     app.add_handler(CommandHandler("kirim", kirim))
     app.add_handler(CommandHandler("chiqim", chiqim))
@@ -2408,6 +2704,7 @@ def main():
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
     app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
+    app.add_handler(CallbackQueryHandler(gord_callback, pattern=r"^gord:"))
 
     if app.job_queue is not None:
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
