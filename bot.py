@@ -284,6 +284,18 @@ def init_db():
     if "entries_json" not in pending_columns:
         cur.execute("ALTER TABLE pending_group_orders ADD COLUMN entries_json TEXT")
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mijoz_tolovlar (
+            guruh_id INTEGER PRIMARY KEY,
+            customer TEXT NOT NULL,
+            expected_value INTEGER NOT NULL,
+            received_amount INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -1077,7 +1089,32 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["pending_order_id"] = None
         if guruh_id is None:
             return
-        result_text = await bajarildi_group_core(guruh_id, update.effective_user, text)
+        prompt = start_payment_prompt(context, guruh_id, text)
+        await update.message.reply_text(prompt)
+        return
+
+    if awaiting == "amount_received_for_order":
+        pending = context.user_data.get("pending_payment")
+        if pending is None:
+            context.user_data["awaiting"] = None
+            return
+        cleaned = text.strip().replace(" ", "")
+        if not cleaned.isdigit():
+            await update.message.reply_text(
+                "Iltimos, faqat son kiriting (masalan 0 yoki 1500000)."
+            )
+            return  # awaiting holati saqlanadi, qayta urinib ko'radi
+        received = int(cleaned)
+        context.user_data["awaiting"] = None
+        context.user_data["pending_payment"] = None
+        result_text = await finalize_payment(
+            update.effective_user,
+            pending["guruh_id"],
+            pending["worker"],
+            pending["customer"],
+            pending["expected_value"],
+            received,
+        )
         await update.message.reply_text(result_text)
         return
 
@@ -1286,13 +1323,14 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     usage = (
-        "Foydalanish: /narx <upakovka|yigish> <detal> <summa>\n"
+        "Foydalanish: /narx <upakovka|yigish|sotish> <detal> <summa>\n"
         "Misol: /narx upakovka shkaf 5000\n"
         "Misol: /narx yigish shkaf 15000\n"
+        "Misol: /narx sotish komplekt 1500000  (mijozga sotish narxi)\n"
         "Komplekt uchun: /narx yigish komplekt 100000\n\n"
-        "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish> <model> <detal> <summa>"
+        "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish") or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1313,7 +1351,7 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish"}[turi]
     await update.message.reply_text(
         f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
     )
@@ -1326,11 +1364,12 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = [a.lower() for a in context.args]
     usage = (
-        "Foydalanish: /modelnarx <upakovka|yigish> <model> <detal> <summa>\n"
-        "Misol: /modelnarx yigish bella spalniy shkaf 20000\n\n"
+        "Foydalanish: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>\n"
+        "Misol: /modelnarx yigish bella spalniy shkaf 20000\n"
+        "Misol: /modelnarx sotish neo komplekt 1800000\n\n"
         "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
     )
-    if len(args) < 4 or args[0] not in ("upakovka", "yigish") or not args[-1].isdigit():
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1369,7 +1408,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish"}[turi]
     await update.message.reply_text(
         f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {rate:,} so'm.".replace(",", " ")
     )
@@ -1390,10 +1429,13 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
+    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️"}
+    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (mijozga)"}
     for turi, model, item, rate in rows:
         if turi != current_turi:
-            label = "Upakovka" if turi == "upakovka" else "Yig'ish"
-            lines.append(f"\n📦 {label}:" if turi == "upakovka" else f"\n🚚 {label}:")
+            icon = turi_icons.get(turi, "•")
+            label = turi_labels.get(turi, turi)
+            lines.append(f"\n{icon} {label}:")
             current_turi = turi
         if model:
             lines.append(f"• {model} {item} (maxsus): {rate:,} so'm".replace(",", " "))
@@ -2362,10 +2404,66 @@ async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=button)
 
 
+def get_order_customer(guruh_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT customer FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_customer_totals(customer: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(expected_value),0), COALESCE(SUM(received_amount),0) "
+        "FROM mijoz_tolovlar WHERE LOWER(customer) = LOWER(?)",
+        (customer,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0], row[1]
+
+
+def start_payment_prompt(context: ContextTypes.DEFAULT_TYPE, guruh_id: int, worker: str) -> str:
+    customer = get_order_customer(guruh_id)
+    expected_value = compute_order_sale_value(guruh_id)
+    context.user_data["awaiting"] = "amount_received_for_order"
+    context.user_data["pending_payment"] = {
+        "guruh_id": guruh_id,
+        "worker": worker,
+        "customer": customer,
+        "expected_value": expected_value,
+    }
+    lines = [f"👷 Ishchi: {worker}"]
+    if expected_value > 0:
+        lines.append(f"💰 Kutilayotgan summa (sotish narxiga ko'ra): {expected_value:,} so'm".replace(",", " "))
+    lines.append("\nMijozdan qancha pul olindi? (hali olinmagan bo'lsa 0 yozing)")
+    return "\n".join(lines)
+
+
+async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_value: int, received: int) -> str:
+    result_text = await bajarildi_group_core(guruh_id, user, worker)
+    record_payment(guruh_id, customer, expected_value, received)
+
+    lines = [result_text, f"\n💵 Mijozdan olindi: {received:,} so'm".replace(",", " ")]
+    if customer:
+        total_expected, total_received = get_customer_totals(customer)
+        qarz = total_expected - total_received
+        if qarz > 0:
+            lines.append(f"🏪 {customer} — umumiy qarzi: {qarz:,} so'm".replace(",", " "))
+        elif qarz < 0:
+            lines.append(f"🏪 {customer} — sizga {abs(qarz):,} so'm ortiqcha to'lagan".replace(",", " "))
+        else:
+            lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
+    return "\n".join(lines)
+
+
 async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_owner(update):
-        await query.answer("Faqat egasi bajara oladi.", show_alert=True)
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
 
@@ -2386,8 +2484,8 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_owner(update):
-        await query.answer("Faqat egasi bajara oladi.", show_alert=True)
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
 
@@ -2400,28 +2498,69 @@ async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("✍️ Yangi ishchining ismini yozing:")
         return
 
-    result_text = await bajarildi_group_core(guruh_id, update.effective_user, worker)
-    await query.edit_message_text(result_text, reply_markup=None)
+    prompt = start_payment_prompt(context, guruh_id, worker)
+    await query.edit_message_text(prompt, reply_markup=None)
 
 
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not can_kirim(update):
         await deny_access(update)
         return
 
     args = context.args
+    usage = (
+        "Foydalanish: /bajarildi <buyurtma raqami> <ishchi ismi> [olingan summa]\n"
+        "Misol: /bajarildi 12 Hojiakbar\n"
+        "Yoki summani bir martada: /bajarildi 12 Hojiakbar 1500000"
+    )
     if not args or not args[0].isdigit() or len(args) < 2:
-        await update.message.reply_text(
-            "Foydalanish: /bajarildi <buyurtma raqami> <ishchi ismi>\n"
-            "Misol: /bajarildi 12 Hojiakbar"
-        )
+        await update.message.reply_text(usage)
         return
 
     guruh_id = int(args[0])
+
+    if len(args) >= 3 and args[-1].isdigit():
+        worker = " ".join(args[1:-1])
+        received = int(args[-1])
+        customer = get_order_customer(guruh_id)
+        expected_value = compute_order_sale_value(guruh_id)
+        text = await finalize_payment(update.effective_user, guruh_id, worker, customer, expected_value, received)
+        await update.message.reply_text(text)
+        return
+
     worker = " ".join(args[1:])
-    user = update.effective_user
-    text = await bajarildi_group_core(guruh_id, user, worker)
-    await update.message.reply_text(text)
+    prompt = start_payment_prompt(context, guruh_id, worker)
+    await update.message.reply_text(prompt)
+
+
+def compute_order_sale_value(guruh_id: int) -> int:
+    """Guruhdagi barcha qatorlar uchun 'sotish' narxlari bo'yicha kutilayotgan
+    umumiy summani hisoblaydi (mijozga qancha sotilishi kerak)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, amount FROM orders WHERE guruh_id = ?", (guruh_id,))
+    rows = cur.fetchall()
+    total = 0
+    for model, item, amount in rows:
+        rate = get_rate(cur, "sotish", model, item if item is not None else "komplekt")
+        total += rate * amount
+    conn.close()
+    return total
+
+
+def record_payment(guruh_id: int, customer: str, expected_value: int, received_amount: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO mijoz_tolovlar (guruh_id, customer, expected_value, received_amount, created_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(guruh_id) DO UPDATE SET expected_value = excluded.expected_value, "
+        "received_amount = excluded.received_amount, created_at = excluded.created_at",
+        (guruh_id, customer or "Nomalum", expected_value, received_amount, now),
+    )
+    conn.commit()
+    conn.close()
 
 
 def fulfill_single_order(cur, order_id, model, item, amount, worker, user_name, user_id, now):
@@ -2528,6 +2667,60 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
         if missing_rates:
             lines.append("\n⚠️ Narx belgilanmagan: " + ", ".join(missing_rates))
     return "\n".join(lines)
+
+
+async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Foydalanish: /mijozhisob <do'kon nomi>\n"
+            "Misol: /mijozhisob Mebel For Home"
+        )
+        return
+
+    customer_query = " ".join(args)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT guruh_id, expected_value, received_amount, created_at FROM mijoz_tolovlar "
+        "WHERE LOWER(customer) = LOWER(?) ORDER BY created_at",
+        (customer_query,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            f"'{customer_query}' bo'yicha hech qanday yozuv topilmadi.\n"
+            "Eslatma: nomi aniq mos kelishi kerak (masalan buyurtmadagi 'Kimdan' nomi bilan bir xil)."
+        )
+        return
+
+    lines = [f"🏪 {customer_query} — hisob:\n"]
+    total_expected = 0
+    total_received = 0
+    for guruh_id, expected, received, created_at in rows:
+        total_expected += expected
+        total_received += received
+        lines.append(
+            f"№{guruh_id}: buyurtma {expected:,} so'm — to'landi {received:,} so'm".replace(",", " ")
+        )
+
+    qarz = total_expected - total_received
+    lines.append(f"\nJami buyurtma qiymati: {total_expected:,} so'm".replace(",", " "))
+    lines.append(f"Jami to'landi: {total_received:,} so'm".replace(",", " "))
+    if qarz > 0:
+        lines.append(f"\n❗ Qarzi: {qarz:,} so'm".replace(",", " "))
+    elif qarz < 0:
+        lines.append(f"\n✅ Ortiqcha to'lagan: {abs(qarz):,} so'm".replace(",", " "))
+    else:
+        lines.append("\n✅ Hisob teng (qarzi yo'q)")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2766,6 +2959,7 @@ def main():
     app.add_handler(CommandHandler("ishchilar", ishchilar))
     app.add_handler(CommandHandler("ishchiulash", ishchiulash))
     app.add_handler(CommandHandler("maosh", maosh))
+    app.add_handler(CommandHandler("mijozhisob", mijozhisob))
     app.add_handler(CommandHandler("tolandi", tolandi))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
