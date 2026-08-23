@@ -1646,6 +1646,52 @@ async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(usage)
 
 
+async def modelochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "Modelni RO'YXATDAN butunlay o'chiradi (faqat hammasi 0 bo'lsa ishlaydi).\n\n"
+            "Foydalanish: /modelochirish <model>\n"
+            "Misol: /modelochirish kafini"
+        )
+        return
+
+    model = args[0].lower()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT item, quantity FROM products WHERE model = ?", (model,))
+    rows = cur.fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"'{model}' nomli model topilmadi.")
+        return
+
+    nonzero = [(item, qty) for item, qty in rows if qty != 0]
+    if nonzero:
+        conn.close()
+        lines = [f"⚠️ '{model}' modelida hali miqdor bor, o'chirib bo'lmaydi:"]
+        lines.extend(f"• {item}: {qty} ta" for item, qty in nonzero)
+        lines.append(
+            "\nAvval bu miqdorlarni boshqa modelga ko'chiring (/chiqim va /kirim orqali), "
+            "keyin qayta urinib ko'ring."
+        )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    cur.execute("DELETE FROM products WHERE model = ?", (model,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🗑 '{model}' modeli ro'yxatdan butunlay o'chirildi ({len(rows)} ta detal, barchasi 0 edi)."
+    )
+
+
 async def modelnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -3306,6 +3352,7 @@ def main():
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
+    app.add_handler(CommandHandler("modelochirish", modelochirish))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("modelnarx", modelnarx))
