@@ -133,6 +133,9 @@ def init_db():
     if "mod_type" not in orders_columns:
         # NULL = oddiy qator, '+' = komplektga qo'shilgan qo'shimcha, '-' = komplektdan ayirilgan (berilmaydi)
         cur.execute("ALTER TABLE orders ADD COLUMN mod_type TEXT")
+    if "bajarildi_at" not in orders_columns:
+        # Buyurtma haqiqatda qachon 'topshirildi' deb belgilanganini saqlaydi (hisobot uchun).
+        cur.execute("ALTER TABLE orders ADD COLUMN bajarildi_at TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -2818,7 +2821,10 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
         if payment_note:
             missing_rates.append(payment_note)
 
-    cur.execute("UPDATE orders SET status = 'bajarildi' WHERE guruh_id = ?", (guruh_id,))
+    cur.execute(
+        "UPDATE orders SET status = 'bajarildi', bajarildi_at = ? WHERE guruh_id = ?",
+        (now, guruh_id),
+    )
     conn.commit()
     conn.close()
 
@@ -2841,26 +2847,65 @@ def build_mijoz_hisob_text(customer_query: str):
         (customer_query,),
     )
     rows = cur.fetchall()
-    conn.close()
 
     if not rows:
+        conn.close()
         return (
             f"'{customer_query}' bo'yicha hech qanday yozuv topilmadi.\n"
             "Eslatma: nomi aniq mos kelishi kerak (masalan buyurtmadagi 'Kimdan' nomi bilan bir xil)."
         )
 
-    lines = [f"🏪 {customer_query} — hisob:\n"]
+    lines = [f"🏪 {customer_query} — hisob:"]
     total_expected = 0
     total_received = 0
-    for guruh_id, expected, received, created_at in rows:
+    for guruh_id, expected, received, payment_created_at in rows:
         total_expected += expected
         total_received += received
+
+        cur.execute(
+            "SELECT id, model, item, amount, mod_type, deadline_display, bajarildi_at "
+            "FROM orders WHERE guruh_id = ?",
+            (guruh_id,),
+        )
+        order_rows = cur.fetchall()
+
+        if order_rows:
+            deadline_display = order_rows[0][5]
+            bajarildi_at = order_rows[0][6]
+            order_ids = [r[0] for r in order_rows]
+
+            what_parts = []
+            for _, m, item, amount, mod_type, _, _ in order_rows:
+                base = f"{m} komplekt" if item is None else f"{m} {item}"
+                mark = "➕" if mod_type == "+" else ("➖" if mod_type == "-" else "")
+                what_parts.append(f"{mark}{base}" if mark else base)
+            what = ", ".join(what_parts)
+
+            placeholders = ",".join("?" for _ in order_ids)
+            cur.execute(
+                f"SELECT DISTINCT worker FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'",
+                order_ids,
+            )
+            workers = [w[0] for w in cur.fetchall()]
+            worker_str = ", ".join(workers) if workers else "noma'lum"
+        else:
+            what = "(buyurtma topilmadi, o'chirilgan bo'lishi mumkin)"
+            deadline_display = "-"
+            bajarildi_at = None
+            worker_str = "noma'lum"
+
+        bajarildi_date = bajarildi_at.split("T")[0] if bajarildi_at else payment_created_at.split("T")[0]
+
+        lines.append(f"\n📦 №{guruh_id} — {what}")
+        lines.append(f"   Muddat: {deadline_display}  |  O'rnatilgan: {bajarildi_date}  |  Ishchi: {worker_str}")
         lines.append(
-            f"№{guruh_id}: buyurtma {format_money(expected, 'usd')} — to'landi {format_money(received, 'usd')}"
+            f"   Buyurtma qiymati: {format_money(expected, 'usd')}  →  To'landi: {format_money(received, 'usd')}"
         )
 
+    conn.close()
+
     qarz = total_expected - total_received
-    lines.append(f"\nJami buyurtma qiymati: {format_money(total_expected, 'usd')}")
+    lines.append(f"\n\nJami buyurtma qiymati: {format_money(total_expected, 'usd')}")
     lines.append(f"Jami to'landi: {format_money(total_received, 'usd')}")
     if qarz > 0:
         lines.append(f"\n❗ Qarzi: {format_money(qarz, 'usd')}")
