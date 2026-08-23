@@ -130,6 +130,9 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN guruh_id INTEGER")
         # Eski buyurtmalar - har biri o'zining alohida guruhi (o'z ID'si bilan).
         cur.execute("UPDATE orders SET guruh_id = id WHERE guruh_id IS NULL")
+    if "mod_type" not in orders_columns:
+        # NULL = oddiy qator, '+' = komplektga qo'shilgan qo'shimcha, '-' = komplektdan ayirilgan (berilmaydi)
+        cur.execute("ALTER TABLE orders ADD COLUMN mod_type TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -1327,10 +1330,11 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Misol: /narx upakovka shkaf 5000\n"
         "Misol: /narx yigish shkaf 15000\n"
         "Misol: /narx sotish komplekt 1500000  (mijozga sotish narxi)\n"
+        "Misol: /narx sotishayirish krovat 800000  (komplektdan ayirilganda kamayadigan summa)\n"
         "Komplekt uchun: /narx yigish komplekt 100000\n\n"
         "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish") or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1351,7 +1355,7 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish"}[turi]
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
     await update.message.reply_text(
         f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
     )
@@ -1369,7 +1373,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Misol: /modelnarx sotish neo komplekt 1800000\n\n"
         "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
     )
-    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish") or not args[-1].isdigit():
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1408,7 +1412,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish"}[turi]
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
     await update.message.reply_text(
         f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {rate:,} so'm.".replace(",", " ")
     )
@@ -1429,8 +1433,8 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
-    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️"}
-    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (mijozga)"}
+    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖"}
+    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)"}
     for turi, model, item, rate in rows:
         if turi != current_turi:
             icon = turi_icons.get(turi, "•")
@@ -1878,8 +1882,10 @@ def parse_model_from_text(text: str, all_models):
 
 def parse_entries_from_text(text: str, model: str):
     """Modeldan keyin komplekt yoki BIR NECHTA aniq detalni (masalan
-    '1 ta shkaf 1 ta parta') aniqlashga harakat qiladi.
-    Qaytaradi: (entries, komplekt_aniq) - entries ro'yxati [(item_or_None, amount), ...]."""
+    '1 ta shkaf 1 ta parta') aniqlashga harakat qiladi. Shuningdek, '+krovat'/'-krovat'
+    yoki 'krovat qo'shiladi' / 'krovat ayiriladi' kabi qo'shimcha/ayirma ko'rsatmalarini ham taniydi.
+    Qaytaradi: (entries, komplekt_aniq) - entries ro'yxati [(item_or_None, amount, mod_type), ...]
+    mod_type: None (oddiy), '+' (qo'shimcha), '-' (ayirilgan, mijozga berilmaydi)."""
     lowered = text.lower()
 
     conn = get_conn()
@@ -1890,49 +1896,106 @@ def parse_entries_from_text(text: str, model: str):
 
     candidate_items = set(model_items or GENERIC_ITEM_WORDS)
 
-    # "N ta <item>" yoki "<item> N ta" ko'rinishidagi barcha uchrashuvlarni yig'amiz.
     entries = []
     seen_items = set()
+    consumed_spans = []
+
+    def is_consumed(pos):
+        return any(s <= pos < e for s, e in consumed_spans)
+
+    # 1) Ochiq "+item" / "-item" belgisi (ixtiyoriy son bilan): "+krovat", "-1 ta krovat"
+    for m in re.finditer(r"([+\-])\s*(\d+)?\s*(?:ta\s+)?([a-zʻʼ']+)", lowered):
+        if is_consumed(m.start()):
+            continue
+        sign, qty_str, item_word = m.groups()
+        for cand in candidate_items:
+            if cand.lower() == item_word and cand not in seen_items:
+                amount = int(qty_str) if qty_str else 1
+                mod_type = "+" if sign == "+" else "-"
+                entries.append((cand, amount, mod_type))
+                seen_items.add(cand)
+                consumed_spans.append(m.span())
+                break
+
+    # 2) So'z bilan ko'rsatilgan qo'shish/ayirish: "krovat qo'shiladi", "krovat ayiriladi/kerak emas"
+    for cand in sorted(candidate_items - seen_items, key=lambda x: -len(x)):
+        cand_l = cand.lower()
+        m_add = re.search(
+            rf"(\d+)?\s*ta?\s*\b{re.escape(cand_l)}\b[^.\n]{{0,15}}?(qo['ʻ]?shiladi|qoshiladi)", lowered
+        )
+        if m_add and not is_consumed(m_add.start()):
+            qty = int(m_add.group(1)) if m_add.group(1) else 1
+            entries.append((cand, qty, "+"))
+            seen_items.add(cand)
+            consumed_spans.append(m_add.span())
+            continue
+        m_sub = re.search(
+            rf"(\d+)?\s*ta?\s*\b{re.escape(cand_l)}\b[^.\n]{{0,20}}?"
+            rf"(ayiriladi|kerak emas|chiqarilsin|olib tashlanadi)",
+            lowered,
+        )
+        if m_sub and not is_consumed(m_sub.start()):
+            qty = int(m_sub.group(1)) if m_sub.group(1) else 1
+            entries.append((cand, qty, "-"))
+            seen_items.add(cand)
+            consumed_spans.append(m_sub.span())
+
+    # 3) "N ta <item>" yoki "<item> N ta" ko'rinishidagi oddiy (mod'siz) uchrashuvlar.
     for m in re.finditer(r"(\d+)\s*ta\s+([a-zʻʼ']+)", lowered):
+        if is_consumed(m.start()):
+            continue
         item_word = m.group(2)
         for cand in candidate_items:
             if cand.lower() == item_word and cand not in seen_items:
-                entries.append((cand, int(m.group(1))))
+                entries.append((cand, int(m.group(1)), None))
                 seen_items.add(cand)
                 break
     for m in re.finditer(r"([a-zʻʼ']+)\s+(\d+)\s*ta\b", lowered):
+        if is_consumed(m.start()):
+            continue
         item_word = m.group(1)
         for cand in candidate_items:
             if cand.lower() == item_word and cand not in seen_items:
-                entries.append((cand, int(m.group(2))))
+                entries.append((cand, int(m.group(2)), None))
                 seen_items.add(cand)
                 break
 
     if entries:
+        has_mod = any(mt in ("+", "-") for _, _, mt in entries)
+        has_komplekt_entry = any(it is None for it, _, _ in entries)
+        if has_mod and "komplekt" in lowered and not has_komplekt_entry:
+            entries.insert(0, (None, 1, None))
         return entries, False
 
     if "komplekt" in lowered:
-        return [(None, 1)], True
+        return [(None, 1, None)], True
 
     # Miqdorsiz, lekin nomi tilga olingan detallarni ham tekshiramiz (masalan faqat "shkaf").
     for item in sorted(candidate_items, key=lambda x: -len(x)):
         if re.search(rf"\b{re.escape(item.lower())}\b", lowered):
-            entries.append((item, 1))
+            entries.append((item, 1, None))
     if entries:
         return entries, False
 
     # Hech narsa aniqlanmadi - komplekt deb taxmin qilamiz, lekin noaniq deb belgilaymiz.
-    return [(None, 1)], False
+    return [(None, 1, None)], False
 
 
 def generate_buyurtma_command(model, entries, deadline_display, customer):
     parts = [model]
-    if len(entries) == 1 and entries[0][0] is None:
+    if len(entries) == 1 and entries[0][0] is None and entries[0][2] is None:
         parts.append("komplekt")
     else:
-        for item, amount in entries:
-            parts.append(item or "komplekt")
-            parts.append(str(amount))
+        for item, amount, mod_type in entries:
+            if item is None:
+                parts.append("komplekt")
+                parts.append(str(amount))
+            elif mod_type in ("+", "-"):
+                parts.append(f"{mod_type}{item}")
+                parts.append(str(amount))
+            else:
+                parts.append(item)
+                parts.append(str(amount))
     parts.append(deadline_display.replace(" ", " "))
     if customer:
         parts.append(customer)
@@ -1961,8 +2024,10 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     if len(entries) == 1 and entries[0][0] is None:
         lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
     else:
-        for item, amount in entries:
-            lines.append(f"Taxminiy detal: {item} ({amount} ta)")
+        for item, amount, mod_type in entries:
+            mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+            label = "komplekt" if item is None else item
+            lines.append(f"Taxminiy detal: {mark}{label} ({amount} ta)")
 
     if deadline_info:
         day, month, deadline_display = deadline_info
@@ -2057,7 +2122,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     model, entries_json, deadline, deadline_display, customer, status = row
-    entries = json.loads(entries_json)
+    entries = [tuple(e) for e in json.loads(entries_json)]
 
     if status != "kutilmoqda":
         conn.close()
@@ -2092,13 +2157,13 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # action == "yes"
     now = datetime.now().isoformat(timespec="seconds")
     created_ids = []
-    for item, amount in entries:
+    for item, amount, mod_type in entries:
         cur.execute(
             """
-            INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
             """,
-            (model, item, amount, deadline, deadline_display, customer, now),
+            (model, item, amount, mod_type, deadline, deadline_display, customer, now),
         )
         created_ids.append(cur.lastrowid)
 
@@ -2111,10 +2176,12 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    what_all = ", ".join(
-        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
-        for item, amount in entries
-    )
+    def describe(item, amount, mod_type):
+        base = f"{model} komplekt" if item is None else f"{model} {item}"
+        mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+        return f"{mark}{base} ({amount} ta)"
+
+    what_all = ", ".join(describe(item, amount, mod_type) for item, amount, mod_type in entries)
     await query.edit_message_text(
         query.message.text + f"\n\n✅ Tasdiqlandi! Buyurtma №{guruh_id} yaratildi: {what_all}, muddat {deadline_display}."
     )
@@ -2144,10 +2211,14 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         "/buyurtma <model> komplekt <kun> <oy> [mijoz]\n"
         "/buyurtma <model> <detal> <miqdor> <kun> <oy> [mijoz]\n"
         "/buyurtma <model> <detal1> <miqdor1> <detal2> <miqdor2> ... <kun> <oy> [mijoz]\n\n"
+        "Komplektga qo'shimcha yoki ayirma uchun '+' yoki '-' belgisini detal oldiga yozing:\n"
+        "/buyurtma <model> komplekt +krovat 1 <kun> <oy> [mijoz]   (qo'shimcha krovat)\n"
+        "/buyurtma <model> komplekt -krovat 1 <kun> <oy> [mijoz]   (krovatsiz, chegirma bilan)\n\n"
         "Misol:\n"
         "/buyurtma vena komplekt 5 avgust\n"
         "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon\n"
-        "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust"
+        "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust\n"
+        "/buyurtma neo komplekt +krovat 1 25 avgust Mebel For Home"
     )
     if len(args) < 3:
         await update.message.reply_text(usage)
@@ -2205,53 +2276,74 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         await update.message.reply_text(usage)
         return
 
-    # Buyurtma turlari: komplekt, bitta detal, yoki bir nechta detal-miqdor jufti.
-    entries = []  # (item_or_None, amount)
+    # Buyurtma turlari: komplekt, bitta detal, bir nechta detal-miqdor jufti,
+    # va ixtiyoriy '+detal'/'​-detal' (komplektga qo'shimcha/ayirma) yozuvlari.
+    entries = []  # (item_or_None, amount, mod_type)
+    idx = 0
 
-    if rest[0] == "komplekt":
+    if rest[idx] == "komplekt":
+        idx += 1
         amount = 1
-        remaining = rest[1:]
-        if remaining and remaining[0].isdigit():
-            amount = int(remaining[0])
-        entries.append((None, amount))
-    elif len(rest) % 2 == 0 and all(rest[i].isdigit() for i in range(1, len(rest), 2)):
-        # juft-juft: detal miqdor detal miqdor ...
-        for i in range(0, len(rest), 2):
-            entries.append((rest[i], int(rest[i + 1])))
-    else:
+        if idx < len(rest) and rest[idx].isdigit():
+            amount = int(rest[idx])
+            idx += 1
+        entries.append((None, amount, None))
+
+    malformed = False
+    while idx < len(rest):
+        tok = rest[idx]
+        if tok[0] in "+-" and len(tok) > 1:
+            mod_type = tok[0]
+            item_word = tok[1:]
+            idx += 1
+            amount = 1
+            if idx < len(rest) and rest[idx].isdigit():
+                amount = int(rest[idx])
+                idx += 1
+            entries.append((item_word, amount, mod_type))
+        elif idx + 1 < len(rest) and rest[idx + 1].isdigit():
+            entries.append((tok, int(rest[idx + 1]), None))
+            idx += 2
+        else:
+            malformed = True
+            break
+
+    if malformed or not entries:
         conn.close()
         await update.message.reply_text(
             "Detal va miqdorni juft-juft yozing (masalan: shkaf 1 tumba 2), "
-            "yoki 'komplekt' deb yozing.\n\n" + usage
+            "'komplekt' deb yozing, yoki '+detal'/'​-detal' bilan qo'shimcha/ayirma qiling.\n\n" + usage
         )
         return
 
     deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
     created = []
     now = datetime.now().isoformat(timespec="seconds")
-    for item, amount in entries:
+    for item, amount, mod_type in entries:
         cur.execute(
             """
-            INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
             """,
-            (model, item, amount, deadline.isoformat(), deadline_display, customer, now),
+            (model, item, amount, mod_type, deadline.isoformat(), deadline_display, customer, now),
         )
-        created.append((cur.lastrowid, item, amount))
+        created.append((cur.lastrowid, item, amount, mod_type))
 
     guruh_id = created[0][0]
     cur.execute(
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
-        [guruh_id] + [oid for oid, _, _ in created],
+        [guruh_id] + [oid for oid, _, _, _ in created],
     )
 
     conn.commit()
     conn.close()
 
-    what_all = ", ".join(
-        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
-        for _, item, amount in created
-    )
+    def describe(item, amount, mod_type):
+        base = f"{model} komplekt" if item is None else f"{model} {item}"
+        prefix = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+        return f"{prefix}{base} ({amount} ta)" if item is not None else base
+
+    what_all = ", ".join(describe(item, amount, mod_type) for _, item, amount, mod_type in created)
     lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
@@ -2354,9 +2446,10 @@ def format_group_text(group):
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
-    for _, model, item, amount in group["items"]:
+    for _, model, item, amount, mod_type in group["items"]:
         what = f"{model} komplekt" if item is None else f"{model} {item}"
-        lines.append(f"• {what}: {amount} ta")
+        mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+        lines.append(f"• {mark}{what}: {amount} ta")
     return "\n".join(lines)
 
 
@@ -2365,7 +2458,7 @@ def fetch_pending_order_groups():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer
+        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type
         FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC, guruh_id ASC, id ASC
         """
     )
@@ -2374,7 +2467,7 @@ def fetch_pending_order_groups():
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -2385,7 +2478,7 @@ def fetch_pending_order_groups():
                 "items": [],
             }
             order_of_groups.append(gid)
-        groups[gid]["items"].append((oid, model, item, amount))
+        groups[gid]["items"].append((oid, model, item, amount, mod_type))
     return [groups[gid] for gid in order_of_groups]
 
 
@@ -2535,15 +2628,23 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def compute_order_sale_value(guruh_id: int) -> int:
     """Guruhdagi barcha qatorlar uchun 'sotish' narxlari bo'yicha kutilayotgan
-    umumiy summani hisoblaydi (mijozga qancha sotilishi kerak)."""
+    umumiy summani hisoblaydi (mijozga qancha sotilishi kerak).
+    mod_type == '+' (qo'shilgan) - 'sotish' narxi qo'shiladi.
+    mod_type == '-' (ayirilgan) - 'sotishayirish' narxi ayiriladi.
+    mod_type == None va item bor - oddiy 'sotish' narxi (mustaqil sotilgan detal)."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT model, item, amount FROM orders WHERE guruh_id = ?", (guruh_id,))
+    cur.execute("SELECT model, item, amount, mod_type FROM orders WHERE guruh_id = ?", (guruh_id,))
     rows = cur.fetchall()
     total = 0
-    for model, item, amount in rows:
-        rate = get_rate(cur, "sotish", model, item if item is not None else "komplekt")
-        total += rate * amount
+    for model, item, amount, mod_type in rows:
+        rate_key = item if item is not None else "komplekt"
+        if mod_type == "-":
+            rate = get_rate(cur, "sotishayirish", model, rate_key)
+            total -= rate * amount
+        else:
+            rate = get_rate(cur, "sotish", model, rate_key)
+            total += rate * amount
     conn.close()
     return total
 
@@ -2563,15 +2664,25 @@ def record_payment(guruh_id: int, customer: str, expected_value: int, received_a
     conn.close()
 
 
-def fulfill_single_order(cur, order_id, model, item, amount, worker, user_name, user_id, now):
+def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, user_name, user_id, now, excluded_items=None):
     """Bitta buyurtma qatorini zaxiradan chiqaradi va (agar worker berilgan bo'lsa)
     to'lovni hisoblab work_log ga yozadi. Natijani (result_lines, payment_total, payment_note) qaytaradi.
+    mod_type == '-' bo'lsa (komplektdan ayirilgan detal) - zaxiradan hech narsa chiqarilmaydi,
+    ishchiga ham pul hisoblanmaydi, chunki bu detal mijozga berilmayapti.
+    excluded_items - komplekt (item=None) yoyilganda o'tkazib yuborilishi kerak bo'lgan detallar
+    to'plami (o'sha guruhda '-' bilan ayirilgan detallar, ular komplekt tarkibidan ham chiqarilmasligi kerak).
     Tranzaksiyani boshqarish (commit/close) chaqiruvchiga qoladi."""
+    excluded_items = excluded_items or set()
+
+    if mod_type == "-":
+        what = f"{model} {item}" if item else model
+        return [f"• {what}: ayirildi (mijozga berilmadi, zaxiraga tegilmadi)"], 0, None
+
     if item is not None:
         targets = [(model, item)]
     else:
         cur.execute("SELECT item FROM products WHERE model = ?", (model,))
-        targets = [(model, row_item) for (row_item,) in cur.fetchall()]
+        targets = [(model, row_item) for (row_item,) in cur.fetchall() if row_item not in excluded_items]
 
     if not targets:
         return [f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."], 0, None
@@ -2604,7 +2715,10 @@ def fulfill_single_order(cur, order_id, model, item, amount, worker, user_name, 
         )
         warn = " ⚠️ yetarli emas edi!" if shortage else ""
         what = f"{model} komplekt" if item is None else f"{model} {item}"
-        result_lines.append(f"• {target_item}: -{deduct}{warn}" if item is None else f"• {what}: -{deduct}{warn}")
+        mod_note = " (➕ qo'shimcha)" if mod_type == "+" else ""
+        result_lines.append(
+            f"• {target_item}: -{deduct}{warn}" if item is None else f"• {what}: -{deduct}{mod_note}{warn}"
+        )
 
     payment_total = 0
     payment_note = None
@@ -2631,7 +2745,7 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, model, item, amount FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'",
+        "SELECT id, model, item, amount, mod_type FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'",
         (guruh_id,),
     )
     rows = cur.fetchall()
@@ -2643,12 +2757,20 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     user_id = user.id if user else None
     now = datetime.now().isoformat(timespec="seconds")
 
+    # Ayirilgan ('-') detallarni model bo'yicha yig'amiz - komplekt (item=None) yoyilganda
+    # bu detallar zaxiradan chiqarilmasligi kerak (mijoz ularni olmayapti).
+    excluded_by_model = {}
+    for _, model, item, _, mod_type in rows:
+        if mod_type == "-" and item is not None:
+            excluded_by_model.setdefault(model, set()).add(item)
+
     all_result_lines = []
     total_payment = 0
     missing_rates = []
-    for order_id, model, item, amount in rows:
+    for order_id, model, item, amount, mod_type in rows:
+        excluded_items = excluded_by_model.get(model, set()) if item is None else None
         result_lines, payment_total, payment_note = fulfill_single_order(
-            cur, order_id, model, item, amount, worker, user_name, user_id, now
+            cur, order_id, model, item, amount, mod_type, worker, user_name, user_id, now, excluded_items
         )
         all_result_lines.extend(result_lines)
         total_payment += payment_total
