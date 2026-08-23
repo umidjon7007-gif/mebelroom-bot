@@ -1429,6 +1429,34 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def narxtozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    # Eski xato: bir xabarda bir nechta /narx qatori yuborilganda, ular bitta uzun
+    # "detal" nomiga yopishib qolgan (ichida '/narx' so'zi bor). Shularni topib tozalaymiz.
+    cur.execute("SELECT turi, model, item, rate FROM narxlar WHERE item LIKE '%/narx%'")
+    rows = cur.fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text("Hech qanday chalkash yozuv topilmadi. Ro'yxat toza.")
+        return
+
+    cur.execute("DELETE FROM narxlar WHERE item LIKE '%/narx%'")
+    conn.commit()
+    conn.close()
+
+    lines = [f"🧹 {len(rows)} ta chalkash yozuv o'chirildi:\n"]
+    for turi, model, item, rate in rows:
+        prefix = f"{model} " if model else ""
+        lines.append(f"• [{turi}] {prefix}{item[:40]}...")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
@@ -3090,6 +3118,7 @@ def main():
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("modelnarx", modelnarx))
     app.add_handler(CommandHandler("narxlar", narxlar))
+    app.add_handler(CommandHandler("narxtozalash", narxtozalash))
     app.add_handler(CommandHandler("ishchilar", ishchilar))
     app.add_handler(CommandHandler("ishchiulash", ishchiulash))
     app.add_handler(CommandHandler("maosh", maosh))
