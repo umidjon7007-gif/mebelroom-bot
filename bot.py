@@ -1145,6 +1145,15 @@ def get_rate(cur, turi: str, model: str, item: str) -> int:
     return row[0] if row else 0
 
 
+def format_money(amount: int, currency: str = "som") -> str:
+    """Summani chiroyli formatlaydi. currency='usd' bo'lsa dollar belgisi bilan,
+    aks holda so'm bilan (ming ajratuvchi bo'shliq)."""
+    formatted = f"{amount:,}".replace(",", " ")
+    if currency == "usd":
+        return f"{formatted}$"
+    return f"{formatted} so'm"
+
+
 def stock_indicator(quantity: int) -> str:
     if quantity <= 0:
         return "🔴"
@@ -1356,8 +1365,9 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
     await update.message.reply_text(
-        f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {rate:,} so'm deb belgilandi.".replace(",", " ")
+        f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {format_money(rate, currency)} deb belgilandi."
     )
 
 
@@ -1413,8 +1423,9 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
     await update.message.reply_text(
-        f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {rate:,} so'm.".replace(",", " ")
+        f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {format_money(rate, currency)}."
     )
 
 
@@ -1441,10 +1452,11 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = turi_labels.get(turi, turi)
             lines.append(f"\n{icon} {label}:")
             current_turi = turi
+        currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
         if model:
-            lines.append(f"• {model} {item} (maxsus): {rate:,} so'm".replace(",", " "))
+            lines.append(f"• {model} {item} (maxsus): {format_money(rate, currency)}")
         else:
-            lines.append(f"• {item}: {rate:,} so'm".replace(",", " "))
+            lines.append(f"• {item}: {format_money(rate, currency)}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -2531,8 +2543,8 @@ def start_payment_prompt(context: ContextTypes.DEFAULT_TYPE, guruh_id: int, work
     }
     lines = [f"👷 Ishchi: {worker}"]
     if expected_value > 0:
-        lines.append(f"💰 Kutilayotgan summa (sotish narxiga ko'ra): {expected_value:,} so'm".replace(",", " "))
-    lines.append("\nMijozdan qancha pul olindi? (hali olinmagan bo'lsa 0 yozing)")
+        lines.append(f"💰 Kutilayotgan summa (sotish narxiga ko'ra): {format_money(expected_value, 'usd')}")
+    lines.append("\nMijozdan qancha pul olindi? ($ da, faqat son yozing — hali olinmagan bo'lsa 0)")
     return "\n".join(lines)
 
 
@@ -2540,14 +2552,14 @@ async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_
     result_text = await bajarildi_group_core(guruh_id, user, worker)
     record_payment(guruh_id, customer, expected_value, received)
 
-    lines = [result_text, f"\n💵 Mijozdan olindi: {received:,} so'm".replace(",", " ")]
+    lines = [result_text, f"\n💵 Mijozdan olindi: {format_money(received, 'usd')}"]
     if customer:
         total_expected, total_received = get_customer_totals(customer)
         qarz = total_expected - total_received
         if qarz > 0:
-            lines.append(f"🏪 {customer} — umumiy qarzi: {qarz:,} so'm".replace(",", " "))
+            lines.append(f"🏪 {customer} — umumiy qarzi: {format_money(qarz, 'usd')}")
         elif qarz < 0:
-            lines.append(f"🏪 {customer} — sizga {abs(qarz):,} so'm ortiqcha to'lagan".replace(",", " "))
+            lines.append(f"🏪 {customer} — sizga {format_money(abs(qarz), 'usd')} ortiqcha to'lagan")
         else:
             lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
     return "\n".join(lines)
@@ -2829,16 +2841,16 @@ async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_expected += expected
         total_received += received
         lines.append(
-            f"№{guruh_id}: buyurtma {expected:,} so'm — to'landi {received:,} so'm".replace(",", " ")
+            f"№{guruh_id}: buyurtma {format_money(expected, 'usd')} — to'landi {format_money(received, 'usd')}"
         )
 
     qarz = total_expected - total_received
-    lines.append(f"\nJami buyurtma qiymati: {total_expected:,} so'm".replace(",", " "))
-    lines.append(f"Jami to'landi: {total_received:,} so'm".replace(",", " "))
+    lines.append(f"\nJami buyurtma qiymati: {format_money(total_expected, 'usd')}")
+    lines.append(f"Jami to'landi: {format_money(total_received, 'usd')}")
     if qarz > 0:
-        lines.append(f"\n❗ Qarzi: {qarz:,} so'm".replace(",", " "))
+        lines.append(f"\n❗ Qarzi: {format_money(qarz, 'usd')}")
     elif qarz < 0:
-        lines.append(f"\n✅ Ortiqcha to'lagan: {abs(qarz):,} so'm".replace(",", " "))
+        lines.append(f"\n✅ Ortiqcha to'lagan: {format_money(abs(qarz), 'usd')}")
     else:
         lines.append("\n✅ Hisob teng (qarzi yo'q)")
 
