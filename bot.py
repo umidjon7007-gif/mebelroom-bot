@@ -2396,6 +2396,101 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     await update.message.reply_text("\n".join(lines))
 
 
+async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Buyurtmani BUTUNLAY o'chiradi (zaxirani, ishchi pulini, mijoz hisobini ham qaytaradi).\n\n"
+            "Foydalanish: /buyurtmaochirish <buyurtma raqami>\n"
+            "Misol: /buyurtmaochirish 42"
+        )
+        return
+
+    guruh_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount, mod_type, status FROM orders WHERE guruh_id = ?",
+        (guruh_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    status = rows[0][5]
+    order_ids = [r[0] for r in rows]
+    placeholders = ",".join("?" for _ in order_ids)
+
+    stock_restored_lines = []
+    if status == "bajarildi":
+        # Qaysi detallar '-' bilan ayirilgan edi (ular hech qachon zaxiradan chiqmagan edi)
+        excluded_by_model = {}
+        for _, model, item, amount, mod_type, _ in rows:
+            if mod_type == "-" and item is not None:
+                excluded_by_model.setdefault(model, set()).add(item)
+
+        for _, model, item, amount, mod_type, _ in rows:
+            if mod_type == "-":
+                continue  # bu qator hech narsa chiqarmagan edi, qaytarish ham shart emas
+
+            if item is not None:
+                targets = [(model, item, amount)]
+            else:
+                cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (model,))
+                per_item_qty = dict(cur.fetchall())
+                cur.execute("SELECT item FROM products WHERE model = ?", (model,))
+                all_items = [r[0] for r in cur.fetchall()]
+                excluded = excluded_by_model.get(model, set())
+                targets = [
+                    (model, it, amount * per_item_qty.get(it, 1))
+                    for it in all_items
+                    if it not in excluded
+                ]
+
+            for m, it, qty in targets:
+                product_key = normalize_product_name(f"{m} {it}")
+                cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
+                prow = cur.fetchone()
+                if prow is None:
+                    continue
+                new_qty = prow[0] + qty
+                cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
+                stock_restored_lines.append(f"• {it}: +{qty}")
+
+    cur.execute(
+        f"SELECT worker, total, paid FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'",
+        order_ids,
+    )
+    work_rows = cur.fetchall()
+    cur.execute(
+        f"DELETE FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'", order_ids
+    )
+
+    cur.execute("DELETE FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    cur.execute(f"DELETE FROM orders WHERE id IN ({placeholders})", order_ids)
+
+    conn.commit()
+    conn.close()
+
+    lines = [f"🗑 №{guruh_id} butunlay o'chirildi."]
+    if stock_restored_lines:
+        lines.append("\nZaxiraga qaytarildi:")
+        lines.extend(stock_restored_lines)
+    if work_rows:
+        lines.append("\n⚠️ Ishchi puli yozuvlari ham o'chirildi:")
+        for worker, total, paid in work_rows:
+            paid_note = " (diqqat: bu to'langan deb belgilangan edi!)" if paid else ""
+            lines.append(f"• {worker}: {format_money(total, 'som')}{paid_note}")
+    lines.append("\nMijoz hisobidagi tegishli yozuv ham tozalandi (agar mavjud bo'lsa).")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def guruhlash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -3228,6 +3323,7 @@ def main():
     app.add_handler(CommandHandler("bajarildi", bajarildi))
     app.add_handler(CommandHandler("bekor", bekor))
     app.add_handler(CommandHandler("guruhlash", guruhlash))
+    app.add_handler(CommandHandler("buyurtmaochirish", buyurtmaochirish))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mijoz_callback, pattern=r"^mij:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
