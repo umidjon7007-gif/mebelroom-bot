@@ -399,6 +399,7 @@ MENU_BUTTONS = {
     "kirim": "📥 Kirim",
     "chiqim": "📤 Chiqim",
     "yangi_buyurtma": "🆕 Buyurtma",
+    "mijozlar": "🏪 Mijozlar",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -406,7 +407,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
         [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
-        [MENU_BUTTONS["yordam"]],
+        [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -2831,20 +2832,7 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     return "\n".join(lines)
 
 
-async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        await deny_access(update)
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Foydalanish: /mijozhisob <do'kon nomi>\n"
-            "Misol: /mijozhisob Mebel For Home"
-        )
-        return
-
-    customer_query = " ".join(args)
+def build_mijoz_hisob_text(customer_query: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -2856,11 +2844,10 @@ async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text(
+        return (
             f"'{customer_query}' bo'yicha hech qanday yozuv topilmadi.\n"
             "Eslatma: nomi aniq mos kelishi kerak (masalan buyurtmadagi 'Kimdan' nomi bilan bir xil)."
         )
-        return
 
     lines = [f"🏪 {customer_query} — hisob:\n"]
     total_expected = 0
@@ -2881,8 +2868,72 @@ async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n✅ Ortiqcha to'lagan: {format_money(abs(qarz), 'usd')}")
     else:
         lines.append("\n✅ Hisob teng (qarzi yo'q)")
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines))
+
+async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Foydalanish: /mijozhisob <do'kon nomi>\n"
+            "Misol: /mijozhisob Mebel For Home"
+        )
+        return
+
+    customer_query = " ".join(args)
+    await update.message.reply_text(build_mijoz_hisob_text(customer_query))
+
+
+async def mijozlar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT customer FROM mijoz_tolovlar ORDER BY customer")
+    customers = [row[0] for row in cur.fetchall()]
+
+    if not customers:
+        conn.close()
+        await update.message.reply_text(
+            "Hozircha hech qanday do'kon bilan hisob-kitob yozuvi yo'q.\n"
+            "Buyurtma 'topshirildi' deb belgilanib, to'lov kiritilgach shu yerda paydo bo'ladi."
+        )
+        return
+
+    buttons = []
+    for customer in customers:
+        cur.execute(
+            "SELECT COALESCE(SUM(expected_value),0), COALESCE(SUM(received_amount),0) "
+            "FROM mijoz_tolovlar WHERE customer = ?",
+            (customer,),
+        )
+        total_expected, total_received = cur.fetchone()
+        qarz = total_expected - total_received
+        if qarz > 0:
+            tag = f"❗ qarzi {format_money(qarz, 'usd')}"
+        elif qarz < 0:
+            tag = f"✅ ortiqcha {format_money(abs(qarz), 'usd')}"
+        else:
+            tag = "✅ teng"
+        buttons.append([InlineKeyboardButton(f"{customer} — {tag}", callback_data=f"mij:{customer}")])
+    conn.close()
+
+    await update.message.reply_text("🏪 Do'konni tanlang:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    customer = query.data.split(":", 1)[1]
+    text = build_mijoz_hisob_text(customer)
+    await query.edit_message_text(text)
 
 
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3097,6 +3148,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yordam']}$"), start))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['mijozlar']}$"), mijozlar_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['kirim']}$"), kirim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
@@ -3132,6 +3184,7 @@ def main():
     app.add_handler(CommandHandler("bekor", bekor))
     app.add_handler(CommandHandler("guruhlash", guruhlash))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(mijoz_callback, pattern=r"^mij:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
