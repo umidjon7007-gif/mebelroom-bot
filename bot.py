@@ -30,6 +30,7 @@ o'zgartira olmaydi. Agar OWNER_ID sozlanmagan bo'lsa, cheklov ishlamaydi
 """
 
 import logging
+import json
 import os
 import re
 import sqlite3
@@ -278,6 +279,10 @@ def init_db():
         )
         """
     )
+    cur.execute("PRAGMA table_info(pending_group_orders)")
+    pending_columns = {row[1] for row in cur.fetchall()}
+    if "entries_json" not in pending_columns:
+        cur.execute("ALTER TABLE pending_group_orders ADD COLUMN entries_json TEXT")
 
     conn.commit()
     conn.close()
@@ -1829,14 +1834,11 @@ def parse_model_from_text(text: str, all_models):
     return None
 
 
-def parse_item_from_text(text: str, model: str):
-    """Modeldan keyin komplekt yoki aniq detalni aniqlashga harakat qiladi.
-    Qaytaradi: (item_or_None, amount, komplekt_aniq_topilganmi)."""
+def parse_entries_from_text(text: str, model: str):
+    """Modeldan keyin komplekt yoki BIR NECHTA aniq detalni (masalan
+    '1 ta shkaf 1 ta parta') aniqlashga harakat qiladi.
+    Qaytaradi: (entries, komplekt_aniq) - entries ro'yxati [(item_or_None, amount), ...]."""
     lowered = text.lower()
-
-    amount = 1
-    if "komplekt" in lowered:
-        return None, amount, True
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1844,19 +1846,55 @@ def parse_item_from_text(text: str, model: str):
     model_items = [row[0] for row in cur.fetchall()]
     conn.close()
 
-    candidate_items = model_items or GENERIC_ITEM_WORDS
-    for item in sorted(candidate_items, key=lambda x: -len(x)):
-        m = re.search(rf"\b{re.escape(item.lower())}\b", lowered)
-        if m:
-            qty_m = re.search(rf"(\d+)\s*ta\b.{{0,20}}\b{re.escape(item.lower())}\b", lowered)
-            if not qty_m:
-                qty_m = re.search(rf"\b{re.escape(item.lower())}\b.{{0,20}}?(\d+)\s*ta\b", lowered)
-            if qty_m:
-                amount = int(qty_m.group(1))
-            return item, amount, False
+    candidate_items = set(model_items or GENERIC_ITEM_WORDS)
 
-    # Aniq detal topilmadi - komplekt deb taxmin qilamiz, lekin noaniq deb belgilaymiz.
-    return None, amount, False
+    # "N ta <item>" yoki "<item> N ta" ko'rinishidagi barcha uchrashuvlarni yig'amiz.
+    entries = []
+    seen_items = set()
+    for m in re.finditer(r"(\d+)\s*ta\s+([a-zʻʼ']+)", lowered):
+        item_word = m.group(2)
+        for cand in candidate_items:
+            if cand.lower() == item_word and cand not in seen_items:
+                entries.append((cand, int(m.group(1))))
+                seen_items.add(cand)
+                break
+    for m in re.finditer(r"([a-zʻʼ']+)\s+(\d+)\s*ta\b", lowered):
+        item_word = m.group(1)
+        for cand in candidate_items:
+            if cand.lower() == item_word and cand not in seen_items:
+                entries.append((cand, int(m.group(2))))
+                seen_items.add(cand)
+                break
+
+    if entries:
+        return entries, False
+
+    if "komplekt" in lowered:
+        return [(None, 1)], True
+
+    # Miqdorsiz, lekin nomi tilga olingan detallarni ham tekshiramiz (masalan faqat "shkaf").
+    for item in sorted(candidate_items, key=lambda x: -len(x)):
+        if re.search(rf"\b{re.escape(item.lower())}\b", lowered):
+            entries.append((item, 1))
+    if entries:
+        return entries, False
+
+    # Hech narsa aniqlanmadi - komplekt deb taxmin qilamiz, lekin noaniq deb belgilaymiz.
+    return [(None, 1)], False
+
+
+def generate_buyurtma_command(model, entries, deadline_display, customer):
+    parts = [model]
+    if len(entries) == 1 and entries[0][0] is None:
+        parts.append("komplekt")
+    else:
+        for item, amount in entries:
+            parts.append(item or "komplekt")
+            parts.append(str(amount))
+    parts.append(deadline_display.replace(" ", " "))
+    if customer:
+        parts.append(customer)
+    return "/buyurtma " + " ".join(parts)
 
 
 async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, sender_name):
@@ -1874,14 +1912,15 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
         return  # Model aniqlanmadi - bu guruh xabari buyurtma emas bo'lishi mumkin, e'tiborsiz qoldiramiz.
 
     deadline_info = parse_deadline_from_text(text)
-    item, amount, komplekt_aniq = parse_item_from_text(text, model)
+    entries, komplekt_aniq = parse_entries_from_text(text, model)
 
     lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
     lines.append(f"Taxminiy model: {model}")
-    if item is None:
+    if len(entries) == 1 and entries[0][0] is None:
         lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
     else:
-        lines.append(f"Taxminiy detal: {item} ({amount} ta)")
+        for item, amount in entries:
+            lines.append(f"Taxminiy detal: {item} ({amount} ta)")
 
     if deadline_info:
         day, month, deadline_display = deadline_info
@@ -1892,6 +1931,7 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     lines.append(f"Kimdan: {sender_name}")
     lines.append("")
     lines.append(f"Asl xabar:\n{text}")
+    lines.append("\n❗ Diqqat bilan tekshiring - bot taxmin qilyapti, xato bo'lishi mumkin.")
 
     if deadline_info is None:
         lines.append("\n⚠️ Muddat aniqlanmagani uchun avtomatik tasdiqlash mumkin emas. "
@@ -1912,10 +1952,10 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     cur.execute(
         """
         INSERT INTO pending_group_orders
-            (model, item, amount, deadline, deadline_display, customer, raw_text, source_chat_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
         """,
-        (model, item, amount, deadline.isoformat(), deadline_display, sender_name, text, chat_id, now),
+        (model, json.dumps(entries), deadline.isoformat(), deadline_display, sender_name, text, chat_id, now),
     )
     pending_id = cur.lastrowid
     conn.commit()
@@ -1925,6 +1965,7 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
         [
             [
                 InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"gord:{pending_id}:yes"),
+                InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"gord:{pending_id}:edit"),
                 InlineKeyboardButton("❌ Bekor qilish", callback_data=f"gord:{pending_id}:no"),
             ]
         ]
@@ -1963,14 +2004,19 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT model, item, amount, deadline, deadline_display, customer, status FROM pending_group_orders WHERE id = ?", (pending_id,))
+    cur.execute(
+        "SELECT model, entries_json, deadline, deadline_display, customer, status FROM pending_group_orders WHERE id = ?",
+        (pending_id,),
+    )
     row = cur.fetchone()
     if row is None:
         conn.close()
         await query.edit_message_text("Bu taklif topilmadi (eskirgan bo'lishi mumkin).")
         return
 
-    model, item, amount, deadline, deadline_display, customer, status = row
+    model, entries_json, deadline, deadline_display, customer, status = row
+    entries = json.loads(entries_json)
+
     if status != "kutilmoqda":
         conn.close()
         await query.edit_message_text(query.message.text + "\n\n(Bu allaqachon ko'rib chiqilgan)")
@@ -1983,23 +2029,52 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text + "\n\n❌ Rad etildi.")
         return
 
+    if action == "edit":
+        cur.execute("UPDATE pending_group_orders SET status = 'tahrirga yuborildi' WHERE id = ?", (pending_id,))
+        conn.commit()
+        conn.close()
+        suggested = generate_buyurtma_command(model, entries, deadline_display, customer)
+        await query.edit_message_text(
+            query.message.text + "\n\n✏️ Tahrirlash uchun yuborilgan (avtomatik yaratilmaydi)."
+        )
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "Quyidagi buyruqni nusxalab, kerakli joyini to'g'rilab, keyin yuboring:\n\n"
+                f"`{suggested}`"
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    # action == "yes"
     now = datetime.now().isoformat(timespec="seconds")
+    created_ids = []
+    for item, amount in entries:
+        cur.execute(
+            """
+            INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            """,
+            (model, item, amount, deadline, deadline_display, customer, now),
+        )
+        created_ids.append(cur.lastrowid)
+
+    guruh_id = created_ids[0]
     cur.execute(
-        """
-        INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
-        """,
-        (model, item, amount, deadline, deadline_display, customer, now),
+        f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created_ids)})",
+        [guruh_id] + created_ids,
     )
-    order_id = cur.lastrowid
-    cur.execute("UPDATE orders SET guruh_id = ? WHERE id = ?", (order_id, order_id))
     cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
     conn.commit()
     conn.close()
 
-    what = f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)"
+    what_all = ", ".join(
+        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
+        for item, amount in entries
+    )
     await query.edit_message_text(
-        query.message.text + f"\n\n✅ Tasdiqlandi! Buyurtma №{order_id} yaratildi: {what}, muddat {deadline_display}."
+        query.message.text + f"\n\n✅ Tasdiqlandi! Buyurtma №{guruh_id} yaratildi: {what_all}, muddat {deadline_display}."
     )
 
 
