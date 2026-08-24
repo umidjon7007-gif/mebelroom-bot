@@ -148,6 +148,15 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS qoshimcha_detallar (
+            model TEXT NOT NULL COLLATE NOCASE,  -- '' = barcha modellarga tegishli
+            item TEXT NOT NULL COLLATE NOCASE,
+            PRIMARY KEY (model, item)
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS narxlar (
             turi TEXT NOT NULL COLLATE NOCASE,     -- 'upakovka' yoki 'yigish'
             model TEXT NOT NULL COLLATE NOCASE DEFAULT '',  -- '' = barcha modellar uchun umumiy
@@ -1665,6 +1674,99 @@ async def ishchiulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def qoshimchadetal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Bu detal oddiy 'komplekt' buyurtma qilinganda AVTOMATIK qo'shilmasin, "
+        "faqat maxsus (+detal) bilan buyurtma qilinganda hisoblansin, deb belgilaydi.\n\n"
+        "Foydalanish: /qoshimchadetal <detal> - barcha modellar uchun\n"
+        "Yoki: /qoshimchadetal <model> <detal> - faqat bitta model uchun\n\n"
+        "Ro'yxatni ko'rish: /qoshimchadetallar\n"
+        "Olib tashlash: /qoshimchadetalochirish <detal> (yoki <model> <detal>)"
+    )
+    if not args or len(args) > 2:
+        await update.message.reply_text(usage)
+        return
+
+    if len(args) == 1:
+        model, item = "", args[0].lower()
+    else:
+        model, item = args[0].lower(), args[1].lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO qoshimcha_detallar (model, item) VALUES (?, ?)", (model, item)
+    )
+    conn.commit()
+    conn.close()
+
+    scope = "barcha modellar uchun" if not model else f"faqat '{model}' uchun"
+    await update.message.reply_text(
+        f"✅ '{item}' endi qo'shimcha detal deb belgilandi ({scope}). "
+        f"Oddiy 'komplekt' buyurtmasida avtomatik hisoblanmaydi, faqat '+{item}' bilan qo'shilganda ishlaydi."
+    )
+
+
+async def qoshimchadetalochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or len(args) > 2:
+        await update.message.reply_text(
+            "Foydalanish: /qoshimchadetalochirish <detal> (yoki <model> <detal>)"
+        )
+        return
+
+    if len(args) == 1:
+        model, item = "", args[0].lower()
+    else:
+        model, item = args[0].lower(), args[1].lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM qoshimcha_detallar WHERE model = ? AND item = ?", (model, item))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        await update.message.reply_text(f"✅ '{item}' qo'shimcha-detal ro'yxatidan olib tashlandi.")
+    else:
+        await update.message.reply_text(f"'{item}' bu ro'yxatda topilmadi.")
+
+
+async def qoshimchadetallar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item FROM qoshimcha_detallar ORDER BY model, item")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "Hozircha hech qanday detal 'qo'shimcha' deb belgilanmagan.\n"
+            "Belgilash: /qoshimchadetal <detal>"
+        )
+        return
+
+    lines = ["🧩 Qo'shimcha detallar (oddiy komplektga avtomatik kirmaydi):\n"]
+    for model, item in rows:
+        scope = "barcha modellar" if not model else model
+        lines.append(f"• {item} ({scope})")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -2620,11 +2722,13 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 per_item_qty = dict(cur.fetchall())
                 cur.execute("SELECT item FROM products WHERE model = ?", (model,))
                 all_items = [r[0] for r in cur.fetchall()]
+                cur.execute("SELECT item FROM qoshimcha_detallar WHERE model IN ('', ?)", (model,))
+                addon_only = {r[0] for r in cur.fetchall()}
                 excluded = excluded_by_model.get(model, set())
                 targets = [
                     (model, it, amount * per_item_qty.get(it, 1))
                     for it in all_items
-                    if it not in excluded
+                    if it not in excluded and it not in addon_only
                 ]
 
             for m, it, qty in targets:
@@ -2995,7 +3099,13 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
         targets = [(model, item)]
     else:
         cur.execute("SELECT item FROM products WHERE model = ?", (model,))
-        targets = [(model, row_item) for (row_item,) in cur.fetchall() if row_item not in excluded_items]
+        all_items = [row_item for (row_item,) in cur.fetchall()]
+        cur.execute("SELECT item FROM qoshimcha_detallar WHERE model IN ('', ?)", (model,))
+        addon_only = {row[0] for row in cur.fetchall()}
+        targets = [
+            (model, row_item) for row_item in all_items
+            if row_item not in excluded_items and row_item not in addon_only
+        ]
 
     if not targets:
         return [f"'{model}' modeli uchun hech qanday detal ro'yxatda topilmadi, chiqim qilinmadi."], 0, None
@@ -3488,6 +3598,9 @@ def main():
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("modelochirish", modelochirish))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
+    app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
+    app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
+    app.add_handler(CommandHandler("qoshimchadetallar", qoshimchadetallar))
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("modelnarx", modelnarx))
     app.add_handler(CommandHandler("narxlar", narxlar))
