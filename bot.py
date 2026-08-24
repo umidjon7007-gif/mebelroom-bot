@@ -770,10 +770,16 @@ async def sb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def ob_item_menu_text(ob):
     lines = [f"🆕 Buyurtma — {ob['model'].capitalize()}\n", "Detallarni tanlang (bir nechtasini tanlashingiz mumkin):"]
+    if ob["komplekt"]:
+        lines.append(f"\n✅ Komplekt: {ob['komplekt_qty']} ta")
     if ob["items"]:
         lines.append("\nTanlanganlar:")
         for it, qty in ob["items"].items():
             lines.append(f"✅ {it}: {qty} ta")
+    if ob.get("extra_items"):
+        lines.append("\nBoshqa modellardan qo'shilganlar:")
+        for (m, it), qty in ob["extra_items"].items():
+            lines.append(f"✅ {m}: {it} — {qty} ta")
     return "\n".join(lines)
 
 
@@ -783,7 +789,8 @@ def ob_item_keyboard(ob):
         label = f"✅ {it} ({ob['items'][it]})" if it in ob["items"] else it
         buttons.append([InlineKeyboardButton(label, callback_data=f"ob:item:{ob['item_list'].index(it)}")])
     buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:komplekt")])
-    if ob["items"]:
+    buttons.append([InlineKeyboardButton("🔁 Boshqa modeldan qo'shish", callback_data="ob:othermodel")])
+    if ob["items"] or ob.get("extra_items") or ob["komplekt"]:
         buttons.append([InlineKeyboardButton("➡️ Davom etish", callback_data="ob:items:done")])
     buttons.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="ob:cancel")])
     return InlineKeyboardMarkup(buttons)
@@ -805,6 +812,8 @@ def ob_qty_keyboard():
 def ob_qty_text(ob):
     if ob["qty_mode"] == "komplekt":
         return f"📦 Komplekt: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
+    if ob["qty_mode"] == "other_item":
+        return f"📐 {ob['qty_other_model']}: {ob['qty_item']}: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
     return f"📐 {ob['qty_item']}: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
 
 
@@ -902,38 +911,40 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = ob["model"]
     customer = ob["customer"]
 
-    entries = []
+    entries = []  # (model, item_or_None, amount)
     if ob["komplekt"]:
-        entries.append((None, ob["komplekt_qty"]))
+        entries.append((model, None, ob["komplekt_qty"]))
     else:
         for item, qty in ob["items"].items():
-            entries.append((item, qty))
+            entries.append((model, item, qty))
+    for (other_model, item), qty in ob.get("extra_items", {}).items():
+        entries.append((other_model, item, qty))
 
     conn = get_conn()
     cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
     created = []
-    for item, amount in entries:
+    for entry_model, item, amount in entries:
         cur.execute(
             """
             INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
             """,
-            (model, item, amount, deadline.isoformat(), deadline_display, customer, now),
+            (entry_model, item, amount, deadline.isoformat(), deadline_display, customer, now),
         )
-        created.append((cur.lastrowid, item, amount))
+        created.append((cur.lastrowid, entry_model, item, amount))
 
     guruh_id = created[0][0]
     cur.execute(
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
-        [guruh_id] + [oid for oid, _, _ in created],
+        [guruh_id] + [oid for oid, _, _, _ in created],
     )
     conn.commit()
     conn.close()
 
     what_all = ", ".join(
-        (f"{model} komplekt" if item is None else f"{model} {item} ({amount} ta)")
-        for _, item, amount in created
+        (f"{entry_model} komplekt" if item is None else f"{entry_model} {item} ({amount} ta)")
+        for _, entry_model, item, amount in created
     )
     lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
     lines.append(f"Muddat: {deadline_display}")
@@ -972,6 +983,7 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "model": model,
             "item_list": item_list,
             "items": {},
+            "extra_items": {},
             "komplekt": False,
             "komplekt_qty": 1,
             "customer": None,
@@ -985,6 +997,56 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ob = context.user_data.get("ob")
     if ob is None:
         await query.edit_message_text("Sessiya tugagan. Qaytadan '🆕 Buyurtma' tugmasini bosing.")
+        return
+
+    if data == "ob:othermodel":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+        other_models = [row[0] for row in cur.fetchall() if row[0] != ob["model"]]
+        conn.close()
+        if not other_models:
+            await query.answer("Boshqa model topilmadi.", show_alert=True)
+            return
+        buttons = [
+            [InlineKeyboardButton(m.capitalize(), callback_data=f"ob:othermodel:pick:{m}")]
+            for m in other_models
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ob:othermodel:back")])
+        await query.edit_message_text("🔁 Qaysi modeldan detal qo'shamiz?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "ob:othermodel:back":
+        await ob_show_item_menu(query, ob)
+        return
+
+    if data.startswith("ob:othermodel:pick:"):
+        other_model = data.split(":", 3)[3]
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT item FROM products WHERE model = ? ORDER BY item", (other_model,))
+        other_item_list = [row[0] for row in cur.fetchall()]
+        conn.close()
+        ob["other_model_pending"] = other_model
+        ob["other_item_list"] = other_item_list
+        buttons = [
+            [InlineKeyboardButton(it, callback_data=f"ob:othermodel:item:{i}")]
+            for i, it in enumerate(other_item_list)
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ob:othermodel")])
+        await query.edit_message_text(
+            f"🔁 {other_model.capitalize()} — qaysi detal?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("ob:othermodel:item:"):
+        idx = int(data.split(":", 3)[3])
+        item = ob["other_item_list"][idx]
+        ob["qty_mode"] = "other_item"
+        ob["qty_other_model"] = ob["other_model_pending"]
+        ob["qty_item"] = item
+        ob["qty_value"] = ob["extra_items"].get((ob["qty_other_model"], item), 1)
+        await query.edit_message_text(ob_qty_text(ob), reply_markup=ob_qty_keyboard())
         return
 
     if data.startswith("ob:item:"):
@@ -1017,7 +1079,11 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ob["komplekt"] = True
             ob["komplekt_qty"] = ob["qty_value"]
             ob["items"] = {}
-            await ob_show_customer_menu(query, context, edit=True)
+            await ob_show_item_menu(query, ob)
+        elif ob["qty_mode"] == "other_item":
+            key = (ob["qty_other_model"], ob["qty_item"])
+            ob["extra_items"][key] = ob["qty_value"]
+            await ob_show_item_menu(query, ob)
         else:
             ob["items"][ob["qty_item"]] = ob["qty_value"]
             ob["komplekt"] = False
@@ -1025,8 +1091,8 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ob:items:done":
-        if not ob["items"] and not ob["komplekt"]:
-            await query.answer("Kamida bitta detal yoki komplekt tanlang.", show_alert=True)
+        if not ob["items"] and not ob["komplekt"] and not ob.get("extra_items"):
+            await query.answer("Kamida bitta detal, komplekt, yoki boshqa modeldan detal tanlang.", show_alert=True)
             return
         await ob_show_customer_menu(query, context, edit=True)
         return
