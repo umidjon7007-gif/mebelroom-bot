@@ -948,6 +948,10 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
         [guruh_id] + [oid for oid, _, _, _ in created],
     )
+
+    entries_4 = [(m, i, a, None) for m, i, a in entries]
+    shortage_text = shortage_warning_for_new_order(cur, entries_4)
+
     conn.commit()
     conn.close()
 
@@ -960,6 +964,8 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if customer:
         lines.append(f"Kimdan: {customer}")
     lines.append("Holati: Kutilmoqda")
+    if shortage_text:
+        lines.append(shortage_text)
 
     context.user_data["ob"] = None
     context.user_data["awaiting"] = None
@@ -2477,6 +2483,10 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [guruh_id] + created_ids,
     )
     cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
+
+    entries_4 = [(model, item, amount, mod_type) for item, amount, mod_type in entries]
+    shortage_text = shortage_warning_for_new_order(cur, entries_4)
+
     conn.commit()
     conn.close()
 
@@ -2486,9 +2496,13 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return f"{mark}{base} ({amount} ta)"
 
     what_all = ", ".join(describe(item, amount, mod_type) for item, amount, mod_type in entries)
-    await query.edit_message_text(
-        query.message.text + f"\n\n✅ Tasdiqlandi! Buyurtma №{guruh_id} yaratildi: {what_all}, muddat {deadline_display}."
+    final_text = (
+        query.message.text
+        + f"\n\n✅ Tasdiqlandi! Buyurtma №{guruh_id} yaratildi: {what_all}, muddat {deadline_display}."
     )
+    if shortage_text:
+        final_text += shortage_text
+    await query.edit_message_text(final_text)
 
 
 async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2653,6 +2667,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         [guruh_id] + [oid for oid, _, _, _, _ in created],
     )
 
+    shortage_text = shortage_warning_for_new_order(cur, entries)
+
     conn.commit()
     conn.close()
 
@@ -2669,6 +2685,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     if customer:
         lines.append(f"Kimdan: {customer}")
     lines.append("Holati: Kutilmoqda")
+    if shortage_text:
+        lines.append(shortage_text)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -3041,6 +3059,89 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = " ".join(args[1:])
     prompt = start_payment_prompt(context, guruh_id, worker)
     await update.message.reply_text(prompt)
+
+
+def explode_entries_to_items(cur, entries):
+    """entries - [(model, item_or_None, amount, mod_type), ...].
+    Har bir qatorni haqiqatda qaysi (model, detal) larga va qancha miqdorga
+    ta'sir qilishini hisoblaydi (komplektni yoyib, ayirilganlarni chetlab).
+    Qaytaradi: {(model, item): miqdor}."""
+    need = {}
+
+    excluded_by_model = {}
+    for entry_model, item, amount, mod_type in entries:
+        if mod_type == "-" and item is not None:
+            excluded_by_model.setdefault(entry_model, set()).add(item)
+
+    for entry_model, item, amount, mod_type in entries:
+        if mod_type == "-":
+            continue
+        if item is not None:
+            need[(entry_model, item)] = need.get((entry_model, item), 0) + amount
+        else:
+            cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (entry_model,))
+            per_item_qty = dict(cur.fetchall())
+            cur.execute("SELECT item FROM products WHERE model = ?", (entry_model,))
+            all_items = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT item FROM qoshimcha_detallar WHERE model IN ('', ?)", (entry_model,))
+            addon_only = {r[0] for r in cur.fetchall()}
+            excluded = excluded_by_model.get(entry_model, set())
+            for it in all_items:
+                if it in excluded or it in addon_only:
+                    continue
+                qty = amount * per_item_qty.get(it, 1)
+                need[(entry_model, it)] = need.get((entry_model, it), 0) + qty
+    return need
+
+
+def compute_all_pending_demand(cur):
+    """Barcha 'kutilmoqda' buyurtmalar bo'yicha har bir (model, detal) uchun
+    zarur bo'lgan JAMI miqdorni hisoblaydi."""
+    cur.execute("SELECT id, guruh_id, model, item, amount, mod_type FROM orders WHERE status = 'kutilmoqda'")
+    rows = cur.fetchall()
+
+    by_guruh = {}
+    for oid, guruh_id, model, item, amount, mod_type in rows:
+        by_guruh.setdefault(guruh_id, []).append((model, item, amount, mod_type))
+
+    total_demand = {}
+    for guruh_id, entries in by_guruh.items():
+        need = explode_entries_to_items(cur, entries)
+        for key, qty in need.items():
+            total_demand[key] = total_demand.get(key, 0) + qty
+    return total_demand
+
+
+def shortage_warning_for_new_order(cur, entries):
+    """Yangi yaratilgan buyurtma tarkibidagi detallar bo'yicha, agar BARCHA
+    kutilayotgan buyurtmalar hisobga olinganda zaxira yetarli bo'lmasa,
+    ogohlantirish matnini qaytaradi (aks holda None)."""
+    my_items = set(explode_entries_to_items(cur, entries).keys())
+    if not my_items:
+        return None
+
+    total_demand = compute_all_pending_demand(cur)
+    lines = []
+    for model, item in sorted(my_items):
+        needed = total_demand.get((model, item), 0)
+        product_key = normalize_product_name(f"{model} {item}")
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
+        row = cur.fetchone()
+        available = row[0] if row else 0
+        if available < needed:
+            lines.append(
+                f"• {model} {item}: kerak {needed} ta, hozir bor {available} ta "
+                f"(yetishmaydi: {needed - available} ta)"
+            )
+
+    if not lines:
+        return None
+
+    return (
+        "\n\n⚠️ ZAXIRA OGOHLANTIRISHI — bu va boshqa kutilayotgan buyurtmalarni "
+        "hisobga olganda quyidagilar yetarli emas (kesim/usluga buyurtma qiling):\n"
+        + "\n".join(lines)
+    )
 
 
 def compute_order_sale_value(guruh_id: int) -> int:
