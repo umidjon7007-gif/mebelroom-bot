@@ -1332,6 +1332,52 @@ async def tozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtmalartozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or args[0].upper() != "TASDIQ":
+        await update.message.reply_text(
+            "Bu buyruq BARCHA buyurtmalar tarixini butunlay o'chiradi:\n"
+            "• Buyurtmalar (kutilayotgan va bajarilgan)\n"
+            "• Ishchi puli yozuvlari (ish haqi tarixi)\n"
+            "• Mijozlar bilan hisob-kitob (kim qancha to'lagan)\n"
+            "• Guruhdan kelgan tasdiqlanmagan takliflar\n\n"
+            "❗ Narxlar, model ro'yxati, ishchi bog'lanishi, sozlamalar TEGILMAYDI - "
+            "faqat buyurtma tarixi tozalanadi.\n\n"
+            "Tasdiqlash uchun aynan shu yozing:\n"
+            "/buyurtmalartozalash TASDIQ"
+        )
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM orders")
+    orders_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM work_log WHERE turi = 'yigish'")
+    work_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM mijoz_tolovlar")
+    tolov_count = cur.fetchone()[0]
+
+    cur.execute("DELETE FROM orders")
+    cur.execute("DELETE FROM work_log WHERE turi = 'yigish'")
+    cur.execute("DELETE FROM mijoz_tolovlar")
+    cur.execute("DELETE FROM pending_group_orders")
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🧹 Tozalandi:\n"
+        f"• {orders_count} ta buyurtma qatori o'chirildi\n"
+        f"• {work_count} ta yig'ish puli yozuvi o'chirildi\n"
+        f"• {tolov_count} ta mijoz to'lov yozuvi o'chirildi\n\n"
+        "Narxlar, modellar va sozlamalar saqlanib qoldi. "
+        "Endi /buyurtma orqali haqiqiy buyurtmalarni qaytadan kiritishingiz mumkin."
+    )
+
+
 async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -3351,6 +3397,7 @@ def main():
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
+    app.add_handler(CommandHandler("buyurtmalartozalash", buyurtmalartozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("modelochirish", modelochirish))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
