@@ -2350,11 +2350,14 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         "Komplektga qo'shimcha yoki ayirma uchun '+' yoki '-' belgisini detal oldiga yozing:\n"
         "/buyurtma <model> komplekt +krovat 1 <kun> <oy> [mijoz]   (qo'shimcha krovat)\n"
         "/buyurtma <model> komplekt -krovat 1 <kun> <oy> [mijoz]   (krovatsiz, chegirma bilan)\n\n"
+        "Boshqa modeldan bitta detal qo'shish uchun 'model:detal miqdor' yozing:\n"
+        "/buyurtma <asosiy model> komplekt <boshqa_model>:<detal> <miqdor> <kun> <oy> [mijoz]\n\n"
         "Misol:\n"
         "/buyurtma vena komplekt 5 avgust\n"
         "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon\n"
         "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust\n"
-        "/buyurtma neo komplekt +krovat 1 25 avgust Mebel For Home"
+        "/buyurtma neo komplekt +krovat 1 25 avgust Mebel For Home\n"
+        "/buyurtma aven komplekt anta:shkaf 1 25 avgust Mebel For Home"
     )
     if len(args) < 3:
         await update.message.reply_text(usage)
@@ -2413,8 +2416,9 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         return
 
     # Buyurtma turlari: komplekt, bitta detal, bir nechta detal-miqdor jufti,
-    # va ixtiyoriy '+detal'/'​-detal' (komplektga qo'shimcha/ayirma) yozuvlari.
-    entries = []  # (item_or_None, amount, mod_type)
+    # ixtiyoriy '+detal'/'​-detal' (komplektga qo'shimcha/ayirma), va boshqa modeldan
+    # bitta detal qo'shish uchun 'model:detal' yozuvi (masalan 'anta:shkaf').
+    entries = []  # (model, item_or_None, amount, mod_type)
     idx = 0
 
     if rest[idx] == "komplekt":
@@ -2423,7 +2427,7 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         if idx < len(rest) and rest[idx].isdigit():
             amount = int(rest[idx])
             idx += 1
-        entries.append((None, amount, None))
+        entries.append((model, None, amount, None))
 
     malformed = False
     while idx < len(rest):
@@ -2436,9 +2440,17 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
             if idx < len(rest) and rest[idx].isdigit():
                 amount = int(rest[idx])
                 idx += 1
-            entries.append((item_word, amount, mod_type))
+            entries.append((model, item_word, amount, mod_type))
+        elif ":" in tok and not tok.startswith(":") and not tok.endswith(":"):
+            other_model, item_word = tok.split(":", 1)
+            idx += 1
+            amount = 1
+            if idx < len(rest) and rest[idx].isdigit():
+                amount = int(rest[idx])
+                idx += 1
+            entries.append((other_model.lower(), item_word.lower(), amount, None))
         elif idx + 1 < len(rest) and rest[idx + 1].isdigit():
-            entries.append((tok, int(rest[idx + 1]), None))
+            entries.append((model, tok, int(rest[idx + 1]), None))
             idx += 2
         else:
             malformed = True
@@ -2448,38 +2460,42 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         conn.close()
         await update.message.reply_text(
             "Detal va miqdorni juft-juft yozing (masalan: shkaf 1 tumba 2), "
-            "'komplekt' deb yozing, yoki '+detal'/'​-detal' bilan qo'shimcha/ayirma qiling.\n\n" + usage
+            "'komplekt' deb yozing, '+detal'/'​-detal' bilan qo'shimcha/ayirma qiling, "
+            "yoki boshqa modeldan detal qo'shish uchun 'model:detal miqdor' yozing "
+            "(masalan: anta:shkaf 1).\n\n" + usage
         )
         return
 
     deadline_display = f"{day} {UZ_MONTH_BY_NUM[month]}"
     created = []
     now = datetime.now().isoformat(timespec="seconds")
-    for item, amount, mod_type in entries:
+    for entry_model, item, amount, mod_type in entries:
         cur.execute(
             """
             INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
             """,
-            (model, item, amount, mod_type, deadline.isoformat(), deadline_display, customer, now),
+            (entry_model, item, amount, mod_type, deadline.isoformat(), deadline_display, customer, now),
         )
-        created.append((cur.lastrowid, item, amount, mod_type))
+        created.append((cur.lastrowid, entry_model, item, amount, mod_type))
 
     guruh_id = created[0][0]
     cur.execute(
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
-        [guruh_id] + [oid for oid, _, _, _ in created],
+        [guruh_id] + [oid for oid, _, _, _, _ in created],
     )
 
     conn.commit()
     conn.close()
 
-    def describe(item, amount, mod_type):
-        base = f"{model} komplekt" if item is None else f"{model} {item}"
+    def describe(entry_model, item, amount, mod_type):
+        base = f"{entry_model} komplekt" if item is None else f"{entry_model} {item}"
         prefix = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
         return f"{prefix}{base} ({amount} ta)" if item is not None else base
 
-    what_all = ", ".join(describe(item, amount, mod_type) for _, item, amount, mod_type in created)
+    what_all = ", ".join(
+        describe(entry_model, item, amount, mod_type) for _, entry_model, item, amount, mod_type in created
+    )
     lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
