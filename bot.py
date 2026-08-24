@@ -3197,9 +3197,14 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"👷 {worker} — to'lanmagan ishlar ({len(rows)} ta):\n"]
         for turi, model, item, amount, rate, total, created_at in rows:
             icon = "📦" if turi == "upakovka" else "🚚"
+            turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
             model_part = f"{model} " if model else ""
-            lines.append(f"{icon} {model_part}{item} x{amount} = {total:,} so'm".replace(",", " "))
-        lines.append(f"\n💰 Jami: {total_sum:,} so'm".replace(",", " "))
+            date_part = created_at.split("T")[0] if created_at else "-"
+            lines.append(
+                f"{icon} {turi_label}: {model_part}{item} — {amount} ta x {format_money(rate, 'som')} "
+                f"= {format_money(total, 'som')}  ({date_part})"
+            )
+        lines.append(f"\n💰 Jami to'lanmagan: {format_money(total_sum, 'som')}")
         lines.append(f"\nTo'langanda: /tolandi {worker}")
         await update.message.reply_text("\n".join(lines))
         return
@@ -3216,7 +3221,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 To'lanmagan maoshlar:\n"]
     for worker, total in rows:
-        lines.append(f"• {worker}: {total:,} so'm".replace(",", " "))
+        lines.append(f"• {worker}: {format_money(total, 'som')}")
     lines.append("\nBatafsil: /maosh <ism>")
     await update.message.reply_text("\n".join(lines))
 
