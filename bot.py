@@ -39,6 +39,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -317,6 +318,8 @@ def init_db():
     pending_columns = {row[1] for row in cur.fetchall()}
     if "entries_json" not in pending_columns:
         cur.execute("ALTER TABLE pending_group_orders ADD COLUMN entries_json TEXT")
+    if "source_message_id" not in pending_columns:
+        cur.execute("ALTER TABLE pending_group_orders ADD COLUMN source_message_id INTEGER")
 
     cur.execute(
         """
@@ -2697,10 +2700,10 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     cur.execute(
         """
         INSERT INTO pending_group_orders
-            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id, source_message_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
         """,
-        (model, json.dumps(entries), deadline.isoformat(), deadline_display, sender_name, text, chat_id, now),
+        (model, json.dumps(entries), deadline.isoformat(), deadline_display, sender_name, text, chat_id, message_id, now),
     )
     pending_id = cur.lastrowid
     conn.commit()
@@ -2750,7 +2753,8 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT model, entries_json, deadline, deadline_display, customer, status FROM pending_group_orders WHERE id = ?",
+        "SELECT model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id "
+        "FROM pending_group_orders WHERE id = ?",
         (pending_id,),
     )
     row = cur.fetchone()
@@ -2759,7 +2763,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Bu taklif topilmadi (eskirgan bo'lishi mumkin).")
         return
 
-    model, entries_json, deadline, deadline_display, customer, status = row
+    model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id = row
     entries = [tuple(e) for e in json.loads(entries_json)]
 
     if status != "kutilmoqda":
@@ -2831,6 +2835,16 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if shortage_text:
         final_text += shortage_text
     await query.edit_message_text(final_text)
+
+    if source_chat_id and source_message_id:
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=source_chat_id,
+                message_id=source_message_id,
+                reaction=[ReactionTypeEmoji("👍")],
+            )
+        except Exception:
+            pass  # Reaksiya qo'yib bo'lmasa ham (masalan xabar juda eski), asosiy oqim davom etadi.
 
 
 async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
