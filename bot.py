@@ -3198,14 +3198,20 @@ def format_group_text(group):
     today = date.today()
     deadline_date = date.fromisoformat(group["deadline"])
     days_left = (deadline_date - today).days
-    if days_left > 0:
+    if days_left > 1:
         days_text = f"{days_left} kun qoldi"
+        urgency = "🟢"
+    elif days_left == 1:
+        days_text = "ertaga"
+        urgency = "🟡"
     elif days_left == 0:
         days_text = "bugun"
+        urgency = "🟡"
     else:
         days_text = f"muddati {abs(days_left)} kun o'tgan"
+        urgency = "🔴"
 
-    lines = [f"📋 Buyurtma №{group['guruh_id']} — {group['deadline_display']} ({days_text})"]
+    lines = [f"{urgency} Buyurtma №{group['guruh_id']} — {group['deadline_display']} ({days_text})"]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
