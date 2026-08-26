@@ -157,6 +157,25 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS xomashyo (
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            quantity INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS xomashyo_tarkibi (
+            model TEXT NOT NULL COLLATE NOCASE,  -- '' = barcha modellarga tegishli
+            item TEXT NOT NULL COLLATE NOCASE,
+            xomashyo TEXT NOT NULL COLLATE NOCASE,
+            miqdor INTEGER NOT NULL,
+            PRIMARY KEY (model, item, xomashyo)
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS narxlar (
             turi TEXT NOT NULL COLLATE NOCASE,     -- 'upakovka' yoki 'yigish'
             model TEXT NOT NULL COLLATE NOCASE DEFAULT '',  -- '' = barcha modellar uchun umumiy
@@ -597,6 +616,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
 
     payment_line = ""
+    xom_line = ""
     if change_type == "kirim":
         # Agar shu foydalanuvchi bog'langan ishchi bo'lsa, kirim = upakovka ishi
         # deb hisoblab, avtomatik to'lovni yozib qo'yamiz.
@@ -619,6 +639,29 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             else:
                 payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
 
+        # Tayyor mahsulot ishlab chiqarilgani uchun, unga ketadigan xomashyolarni
+        # (agar tarkibi belgilangan bo'lsa) avtomatik omborxonadan ayirib boramiz.
+        xom_needs = get_xom_requirements(cur, model, item)
+        if xom_needs:
+            xom_lines = []
+            for xomashyo, per_unit in xom_needs.items():
+                need = per_unit * amount
+                cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+                xrow = cur.fetchone()
+                current_xom = xrow[0] if xrow else 0
+                new_xom = current_xom - need
+                shortage = new_xom < 0
+                if shortage:
+                    new_xom = 0
+                cur.execute(
+                    "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET quantity = excluded.quantity",
+                    (xomashyo, new_xom),
+                )
+                warn = " ⚠️ yetarli emas edi!" if shortage else ""
+                xom_lines.append(f"• {xomashyo}: -{need}{warn}")
+            xom_line = "\n🧵 Xomashyodan ayirildi:\n" + "\n".join(xom_lines)
+
     conn.commit()
     conn.close()
 
@@ -631,6 +674,8 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
     if payment_line:
         text += payment_line
+    if xom_line:
+        text += xom_line
     await update.effective_message.reply_text(text)
 
 
@@ -1771,6 +1816,145 @@ async def qoshimchadetallar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scope = "barcha modellar" if not model else model
         lines.append(f"• {item} ({scope})")
     await update.message.reply_text("\n".join(lines))
+
+
+def get_xom_requirements(cur, model: str, item: str):
+    """Berilgan model+detal uchun kerak bo'ladigan xomashyolar ro'yxatini qaytaradi
+    {xomashyo: miqdor}. Model-maxsus yozuv umumiy (model='') yozuvni ustidan yozadi."""
+    cur.execute("SELECT xomashyo, miqdor FROM xomashyo_tarkibi WHERE model = ''  AND item = ?", (item,))
+    result = dict(cur.fetchall())
+    cur.execute("SELECT xomashyo, miqdor FROM xomashyo_tarkibi WHERE model = ? AND item = ?", (model, item))
+    result.update(dict(cur.fetchall()))
+    return result
+
+
+async def xomkirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2 or not args[-1].isdigit():
+        await update.message.reply_text(
+            "Xomashyo (aksessuar) omboriga qo'shish.\n\n"
+            "Foydalanish: /xomkirim <nom> <miqdor>\n"
+            "Misol: /xomkirim ilgak 500"
+        )
+        return
+
+    name = " ".join(args[:-1]).lower()
+    amount = int(args[-1])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET quantity = quantity + excluded.quantity",
+        (name, amount),
+    )
+    cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (name,))
+    new_qty = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ '{name}': +{amount} ta. Yangi qoldiq: {new_qty} ta.")
+
+
+async def xomqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name, quantity FROM xomashyo ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Xomashyo ombori hozircha bo'sh. Qo'shish: /xomkirim <nom> <miqdor>")
+        return
+
+    lines = ["🧵 Xomashyo qoldig'i:\n"]
+    for name, qty in rows:
+        lines.append(f"{stock_indicator(qty)} {name}: {qty} ta")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Bitta DETAL uchun (masalan shkaf) qancha xomashyo ketishini belgilaydi (BARCHA modellar uchun).\n\n"
+        "Ko'rish: /xomtarkibi <detal>\n"
+        "Belgilash: /xomtarkibi <detal> <xomashyo> <miqdor>\n"
+        "Misol: /xomtarkibi shkaf ilgak 8\n\n"
+        "Faqat bitta modelga maxsus qilish uchun: /xommodeltarkibi <model> <detal> <xomashyo> <miqdor>"
+    )
+    if not args:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if len(args) == 1:
+        item = args[0].lower()
+        cur.execute("SELECT xomashyo, miqdor FROM xomashyo_tarkibi WHERE model = '' AND item = ?", (item,))
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text(f"'{item}' uchun hali xomashyo tarkibi belgilanmagan.\n\n{usage}")
+            return
+        lines = [f"🧩 '{item}' uchun xomashyo tarkibi (barcha modellar):\n"]
+        lines.extend(f"• {x}: {m} ta" for x, m in rows)
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if len(args) != 3 or not args[-1].isdigit():
+        conn.close()
+        await update.message.reply_text(usage)
+        return
+
+    item, xomashyo, miqdor = args[0].lower(), args[1].lower(), int(args[2])
+    cur.execute(
+        "INSERT INTO xomashyo_tarkibi (model, item, xomashyo, miqdor) VALUES ('', ?, ?, ?) "
+        "ON CONFLICT(model, item, xomashyo) DO UPDATE SET miqdor = excluded.miqdor",
+        (item, xomashyo, miqdor),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ '{item}' uchun (barcha modellar): 1 tasiga {miqdor} ta '{xomashyo}' kerak deb belgilandi."
+    )
+
+
+async def xommodeltarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Foydalanish: /xommodeltarkibi <model> <detal> <xomashyo> <miqdor>\n"
+        "Misol: /xommodeltarkibi neo shkaf ilgak 12"
+    )
+    if len(args) != 4 or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    model, item, xomashyo, miqdor = args[0].lower(), args[1].lower(), args[2].lower(), int(args[3])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO xomashyo_tarkibi (model, item, xomashyo, miqdor) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(model, item, xomashyo) DO UPDATE SET miqdor = excluded.miqdor",
+        (model, item, xomashyo, miqdor),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ '{model} {item}' uchun (maxsus): 1 tasiga {miqdor} ta '{xomashyo}' kerak deb belgilandi."
+    )
 
 
 async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3699,6 +3883,10 @@ def main():
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("modelochirish", modelochirish))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
+    app.add_handler(CommandHandler("xomkirim", xomkirim))
+    app.add_handler(CommandHandler("xomqoldiq", xomqoldiq))
+    app.add_handler(CommandHandler("xomtarkibi", xomtarkibi))
+    app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("qoshimchadetallar", qoshimchadetallar))
