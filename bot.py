@@ -3882,6 +3882,31 @@ async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def job_muddat_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+
+    groups = fetch_pending_order_groups()
+    if not groups:
+        return
+
+    today = date.today()
+    urgent = []
+    for g in groups:
+        deadline_date = date.fromisoformat(g["deadline"])
+        days_left = (deadline_date - today).days
+        if days_left <= 1:
+            urgent.append(g)
+
+    if not urgent:
+        return  # dolzarb buyurtma yo'q - bekorga xabar yubormaymiz
+
+    text = "🔔 Bugun/ertaga topshirilishi kerak (yoki muddati o'tgan) buyurtmalar:\n\n" + "\n\n".join(
+        format_group_text(g) for g in urgent
+    )
+    await context.bot.send_message(chat_id=OWNER_ID, text=text)
+
+
 async def job_buyurtma_eslatma(context: ContextTypes.DEFAULT_TYPE):
     if WORKER_CHAT_ID is None:
         return
@@ -4074,6 +4099,11 @@ def main():
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) guruhga to'liq qoldiqni yuboradi.
         app.job_queue.run_daily(
             job_kunlik_qoldiq, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni ertalab soat 9:00 (Toshkent vaqti) egaga bugun/ertaga/o'tgan
+        # muddatli buyurtmalarni alohida eslatib turadi.
+        app.job_queue.run_daily(
+            job_muddat_eslatma, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
         )
         # Har kuni soat 9:00 va 14:00 da ishchiga bajarilmagan buyurtmalarni eslatadi.
         app.job_queue.run_daily(
