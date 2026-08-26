@@ -559,12 +559,10 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.effective_message.reply_text("Miqdor musbat butun son bo'lishi kerak. Misol: 5")
         return
 
-    product_key = normalize_product_name(product_display)
-    model, item = split_model_item(product_display)
-    if not item:
-        await update.effective_message.reply_text(
-            "Mahsulot nomini <model> <detal> ko'rinishida yozing.\nMisol: laura tumba"
-        )
+    try:
+        amount = parse_amount(amount_raw)
+    except ValueError:
+        await update.effective_message.reply_text("Miqdor musbat butun son bo'lishi kerak. Misol: 5")
         return
 
     user = update.effective_user
@@ -573,6 +571,37 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     conn = get_conn()
     cur = conn.cursor()
+
+    # Ko'p so'zli modellarni (masalan 'bella spalniy') to'g'ri aniqlash uchun avval
+    # bazadagi mavjud modellar bilan solishtiramiz (eng uzunidan boshlab).
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+    lowered_parts = [p.lower() for p in name_parts]
+
+    model = None
+    item = None
+    for candidate in all_models:
+        candidate_tokens = candidate.split()
+        if lowered_parts[: len(candidate_tokens)] == candidate_tokens:
+            model = candidate
+            item = " ".join(name_parts[len(candidate_tokens):]).strip().lower()
+            break
+
+    if model is None:
+        # Hech qanday mavjud modelga mos kelmadi - yangi model deb, birinchi so'zni
+        # model deb olamiz (eski, oddiy xatti-harakat).
+        model, item = split_model_item(product_display)
+
+    if not item:
+        conn.close()
+        await update.effective_message.reply_text(
+            "Mahsulot nomini <model> <detal> ko'rinishida yozing.\nMisol: laura tumba"
+        )
+        return
+
+    product_key = normalize_product_name(f"{model} {item}")
+
     cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
     row = cur.fetchone()
 
@@ -1926,6 +1955,121 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ '{item}' uchun (barcha modellar): 1 tasiga {miqdor} ta '{xomashyo}' kerak deb belgilandi."
     )
+
+
+async def kirimtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Xato ko'p kiritilgan /kirim ni to'g'irlaydi - zaxirani, ishchi puli hisobini va "
+        "xomashyo ayirilishini HAMMASINI birdek tuzatadi.\n\n"
+        "Foydalanish: /kirimtuzatish <model> <detal> <ortiqcha miqdor>\n"
+        "Misol: 4 ta kiritilgan, aslida 2 ta bo'lishi kerak edi (ortiqcha 2 ta):\n"
+        "/kirimtuzatish bella spalniy kamod 2"
+    )
+    if len(args) < 3 or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    excess = int(args[-1])
+    middle = args[:-1]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    matched_model = None
+    item = None
+    for candidate in all_models:
+        candidate_tokens = candidate.lower().split()
+        lowered_middle = [t.lower() for t in middle]
+        if lowered_middle[: len(candidate_tokens)] == candidate_tokens:
+            matched_model = candidate.lower()
+            item = " ".join(middle[len(candidate_tokens):]).lower()
+            break
+
+    if matched_model is None or not item:
+        conn.close()
+        await update.message.reply_text(
+            f"Model yoki detal aniqlanmadi.\n\n{usage}\n\nMavjud modellar: {', '.join(sorted(set(all_models)))}"
+        )
+        return
+
+    product_key = normalize_product_name(f"{matched_model} {item}")
+    cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
+    prow = cur.fetchone()
+    if prow is None:
+        conn.close()
+        await update.message.reply_text(f"'{matched_model} {item}' topilmadi.")
+        return
+
+    current_qty = prow[0]
+    new_qty = max(0, current_qty - excess)
+    actual_removed = current_qty - new_qty
+    cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
+
+    user = update.effective_user
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at) "
+        "VALUES (?, 'chiqim', ?, ?, ?, ?)",
+        (product_key, actual_removed, user.full_name if user else "noma'lum", user.id if user else None, now),
+    )
+
+    lines = [
+        f"↩️ Tuzatildi: '{matched_model} {item}' dan {actual_removed} ta ayirildi. "
+        f"Yangi qoldiq: {new_qty} ta."
+    ]
+
+    cur.execute(
+        """
+        SELECT id, worker, amount, rate FROM work_log
+        WHERE turi = 'upakovka' AND model = ? AND item = ? AND paid = 0
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (matched_model, item),
+    )
+    wrow = cur.fetchone()
+    if wrow:
+        wid, worker, wamount, rate = wrow
+        reduce_by = min(excess, wamount)
+        new_wamount = wamount - reduce_by
+        new_wtotal = new_wamount * rate
+        if new_wamount > 0:
+            cur.execute("UPDATE work_log SET amount = ?, total = ? WHERE id = ?", (new_wamount, new_wtotal, wid))
+            lines.append(
+                f"👷 {worker} — upakovka puli tuzatildi: {wamount} ta → {new_wamount} ta "
+                f"({format_money(new_wtotal, 'som')})"
+            )
+        else:
+            cur.execute("DELETE FROM work_log WHERE id = ?", (wid,))
+            lines.append(f"👷 {worker} — bu ishga hisoblangan upakovka puli butunlay bekor qilindi.")
+
+    xom_needs = get_xom_requirements(cur, matched_model, item)
+    if xom_needs:
+        xom_lines = []
+        for xomashyo, per_unit in xom_needs.items():
+            restore = per_unit * excess
+            cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+            xrow = cur.fetchone()
+            current_xom = xrow[0] if xrow else 0
+            new_xom = current_xom + restore
+            cur.execute(
+                "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET quantity = excluded.quantity",
+                (xomashyo, new_xom),
+            )
+            xom_lines.append(f"• {xomashyo}: +{restore}")
+        lines.append("🧵 Xomashyoga qaytarildi:\n" + "\n".join(xom_lines))
+
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("\n".join(lines))
 
 
 async def xommodeltarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3887,6 +4031,7 @@ def main():
     app.add_handler(CommandHandler("xomqoldiq", xomqoldiq))
     app.add_handler(CommandHandler("xomtarkibi", xomtarkibi))
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
+    app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("qoshimchadetallar", qoshimchadetallar))
