@@ -1795,6 +1795,40 @@ async def qoshimchadetal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def narxochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Bitta maxsus (model-specific) narx yozuvini o'chiradi (masalan ishlatilmay qolgan mahsulot narxi).\n\n"
+        "Foydalanish: /narxochirish <upakovka|yigish|sotish|sotishayirish|kesim> <model> <detal>\n"
+        "Misol: /narxochirish sotish neo shkaf"
+    )
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "kesim"):
+        await update.message.reply_text(usage)
+        return
+
+    turi = args[0].lower()
+    model = args[1].lower()
+    item = " ".join(args[2:]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM narxlar WHERE turi = ? AND model = ? AND item = ?", (turi, model, item)
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        await update.message.reply_text(f"✅ '{model} {item}' ({turi}) narxi o'chirildi.")
+    else:
+        await update.message.reply_text(f"'{model} {item}' ({turi}) uchun maxsus narx topilmadi.")
+
+
 async def qoshimchadetalochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4227,6 +4261,7 @@ def main():
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
+    app.add_handler(CommandHandler("narxochirish", narxochirish))
     app.add_handler(CommandHandler("qoshimchadetallar", qoshimchadetallar))
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("modelnarx", modelnarx))
