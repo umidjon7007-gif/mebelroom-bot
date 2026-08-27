@@ -4393,6 +4393,30 @@ async def job_haftalik_hisobot(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
 
 
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Har qanday kutilmagan xato yuz berganda, uni to'g'ridan-to'g'ri egaga
+    Telegram orqali yuboradi - Railway loglariga kirishning hojati bo'lmaydi."""
+    import traceback
+
+    tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    tb_short = tb[-3500:]  # Telegram xabar uzunligi cheklangan
+
+    logging.error("Kutilmagan xato:\n%s", tb)
+
+    if OWNER_ID is not None:
+        try:
+            update_info = ""
+            if isinstance(update, Update) and update.effective_message:
+                update_info = f"Xabar: {update.effective_message.text}\n\n"
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"🐞 Botda kutilmagan xato yuz berdi:\n\n{update_info}```\n{tb_short}\n```",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass  # xato haqida xabar berishning o'zi xato bersa, jim o'tkazamiz
+
+
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -4517,6 +4541,8 @@ def main():
         logger.info("OWNER_ID sozlangan: %s", OWNER_ID)
 
     logger.info("Bot ishga tushdi...")
+    app.add_error_handler(global_error_handler)
+
     app.run_polling()
 
 
