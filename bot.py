@@ -1994,6 +1994,81 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Buyurtma qiymatini HOZIRGI narxlar asosida qayta hisoblab, to'g'irlaydi "
+            "(masalan narx keyinroq to'g'irlangan bo'lsa).\n\n"
+            "Foydalanish: /hisobtuzatish <buyurtma raqami>\n"
+            "Misol: /hisobtuzatish 77"
+        )
+        return
+
+    guruh_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT expected_value, received_amount, customer FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} uchun to'lov yozuvi topilmadi.")
+        return
+
+    old_expected, received, customer = row
+    new_expected = compute_order_sale_value(guruh_id)
+    cur.execute("UPDATE mijoz_tolovlar SET expected_value = ? WHERE guruh_id = ?", (new_expected, guruh_id))
+    conn.commit()
+    conn.close()
+
+    lines = [
+        f"✅ №{guruh_id} qiymati tuzatildi: {format_money(old_expected, 'usd')} → {format_money(new_expected, 'usd')}"
+    ]
+    if customer:
+        total_expected, total_received = get_customer_totals(customer)
+        qarz = total_expected - total_received
+        if qarz > 0:
+            lines.append(f"🏪 {customer} — yangi umumiy qarzi: {format_money(qarz, 'usd')}")
+        elif qarz < 0:
+            lines.append(f"🏪 {customer} — sizga {format_money(abs(qarz), 'usd')} ortiqcha to'lagan")
+        else:
+            lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ishchinomitolash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text(
+            "Xato kiritilgan ishchi ismini to'g'irlaydi (barcha yozuvlarda).\n\n"
+            "Foydalanish: /ishchinomitolash <eski ism> <yangi ism>\n"
+            "Misol: /ishchinomitolash 350 Hojiakbar"
+        )
+        return
+
+    old_name, new_name = args[0], args[1]
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE work_log SET worker = ? WHERE worker = ?", (new_name, old_name))
+    work_log_count = cur.rowcount
+    cur.execute("UPDATE workers SET name = ? WHERE name = ?", (new_name, old_name))
+    cur.execute("INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)", (new_name, datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ '{old_name}' → '{new_name}' deb to'g'irlandi ({work_log_count} ta ish yozuvida)."
+    )
+
+
 async def kirimtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -4259,6 +4334,8 @@ def main():
     app.add_handler(CommandHandler("xomtarkibi", xomtarkibi))
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
+    app.add_handler(CommandHandler("hisobtuzatish", hisobtuzatish))
+    app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
