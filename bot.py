@@ -2197,6 +2197,64 @@ async def komplekttarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(usage)
 
 
+async def detalochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Bitta model ichidan bitta detalni ro'yxatdan o'chiradi (faqat 0 bo'lsa ishlaydi).\n\n"
+        "Foydalanish: /detalochirish <model> <detal>\n"
+        "Misol: /detalochirish neo krovat110"
+    )
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+    lowered = [a.lower() for a in args]
+
+    model = None
+    item = None
+    for candidate in all_models:
+        candidate_tokens = candidate.split()
+        if lowered[: len(candidate_tokens)] == candidate_tokens:
+            model = candidate
+            item = " ".join(args[len(candidate_tokens):]).strip().lower()
+            break
+
+    if model is None or not item:
+        conn.close()
+        await update.message.reply_text(f"Model yoki detal aniqlanmadi.\n\n{usage}")
+        return
+
+    product_key = normalize_product_name(f"{model} {item}")
+    cur.execute("SELECT quantity FROM products WHERE name = ?", (product_key,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"'{model} {item}' topilmadi.")
+        return
+
+    if row[0] != 0:
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ '{model} {item}' da hali {row[0]} ta bor, o'chirib bo'lmaydi.\n"
+            "Avval boshqa modelga ko'chiring yoki 0 ga tushiring."
+        )
+        return
+
+    cur.execute("DELETE FROM products WHERE name = ?", (product_key,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"🗑 '{model} {item}' ro'yxatdan o'chirildi.")
+
+
 async def modelochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4160,6 +4218,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmalartozalash", buyurtmalartozalash))
     app.add_handler(CommandHandler("modelnomi", modelnomi))
     app.add_handler(CommandHandler("modelochirish", modelochirish))
+    app.add_handler(CommandHandler("detalochirish", detalochirish))
     app.add_handler(CommandHandler("komplekttarkibi", komplekttarkibi))
     app.add_handler(CommandHandler("xomkirim", xomkirim))
     app.add_handler(CommandHandler("xomqoldiq", xomqoldiq))
