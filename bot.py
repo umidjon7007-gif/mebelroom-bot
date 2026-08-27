@@ -3941,6 +3941,50 @@ async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def job_oylik_hisobot(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+
+    tomorrow = date.today() + timedelta(days=1)
+    if tomorrow.day != 1:
+        return  # bugun oyning oxirgi kuni emas - hali eslatish vaqti kelmadi
+
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    month_end = today.isoformat()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT model, SUM(amount) as jami
+        FROM orders
+        WHERE status = 'bajarildi' AND (mod_type IS NULL OR mod_type != '-')
+              AND bajarildi_at IS NOT NULL AND date(bajarildi_at) BETWEEN ? AND ?
+        GROUP BY model
+        ORDER BY jami DESC
+        """,
+        (month_start, month_end),
+    )
+    model_rows = cur.fetchall()
+    conn.close()
+
+    if not model_rows:
+        return  # bu oy hech narsa sotilmagan - bekorga xabar yubormaymiz
+
+    oy_nomlari = {
+        1: "Yanvar", 2: "Fevral", 3: "Mart", 4: "Aprel", 5: "May", 6: "Iyun",
+        7: "Iyul", 8: "Avgust", 9: "Sentyabr", 10: "Oktyabr", 11: "Noyabr", 12: "Dekabr",
+    }
+    lines = [f"📅 {oy_nomlari[today.month]} oyi yakuni — eng ko'p sotilgan modellar:\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (model, jami) in enumerate(model_rows[:15]):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} {model}: {jami} ta")
+
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+
+
 async def job_muddat_eslatma(context: ContextTypes.DEFAULT_TYPE):
     if OWNER_ID is None:
         return
@@ -4177,6 +4221,11 @@ def main():
             job_haftalik_hisobot,
             time=time(hour=20, minute=0, tzinfo=TASHKENT_TZ),
             days=(6,),
+        )
+        # Har kuni soat 21:00 da tekshiradi - agar bugun oyning oxirgi kuni bo'lsa,
+        # shu oyning eng ko'p sotilgan modellari haqida hisobot yuboradi.
+        app.job_queue.run_daily(
+            job_oylik_hisobot, time=time(hour=21, minute=0, tzinfo=TASHKENT_TZ)
         )
     else:
         logger.warning(
