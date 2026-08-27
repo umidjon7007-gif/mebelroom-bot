@@ -3809,6 +3809,51 @@ async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text)
 
 
+async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT model, SUM(amount) as jami
+        FROM orders
+        WHERE status = 'bajarildi' AND (mod_type IS NULL OR mod_type != '-')
+        GROUP BY model
+        ORDER BY jami DESC
+        """
+    )
+    model_rows = cur.fetchall()
+
+    cur.execute(
+        """
+        SELECT model, item, SUM(amount) as jami
+        FROM orders
+        WHERE status = 'bajarildi' AND (mod_type IS NULL OR mod_type != '-') AND item IS NOT NULL
+        GROUP BY model, item
+        ORDER BY jami DESC
+        LIMIT 10
+        """
+    )
+    item_rows = cur.fetchall()
+    conn.close()
+
+    if not model_rows:
+        await update.message.reply_text("Hozircha hech qanday buyurtma 'bajarildi' deb belgilanmagan.")
+        return
+
+    lines = ["🏆 Eng ko'p sotilgan modellar (umumiy, barcha vaqt):\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (model, jami) in enumerate(model_rows[:15]):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} {model}: {jami} ta")
+
+    if item_rows:
+        lines.append("\n📦 Eng ko'p sotilgan aniq detallar (top 10):")
+        for model, item, jami in item_rows:
+            lines.append(f"• {model} {item}: {jami} ta")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4087,6 +4132,7 @@ def main():
     app.add_handler(CommandHandler("ishchilar", ishchilar))
     app.add_handler(CommandHandler("ishchiulash", ishchiulash))
     app.add_handler(CommandHandler("maosh", maosh))
+    app.add_handler(CommandHandler("kopsotilgan", kopsotilgan))
     app.add_handler(CommandHandler("mijozhisob", mijozhisob))
     app.add_handler(CommandHandler("tolandi", tolandi))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
