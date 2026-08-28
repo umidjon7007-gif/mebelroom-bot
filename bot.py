@@ -2959,13 +2959,17 @@ async def group_order_intake(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user and user.is_bot:
         return
 
-    text = update.message.text or update.message.caption
+    message = update.message
+    if message is None:
+        return  # bu yangilanish oddiy yangi xabar emas (masalan tahrirlangan xabar) - e'tiborsiz qoldiramiz
+
+    text = message.text or message.caption
     if not text:
         return
 
     sender_name = user.full_name if user else (chat.title or "Nomalum")
 
-    await send_group_order_confirmation(context, chat.id, update.message.message_id, text, sender_name)
+    await send_group_order_confirmation(context, chat.id, message.message_id, text, sender_name)
 
 
 async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4524,7 +4528,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND,
+        (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
         group_order_intake,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
