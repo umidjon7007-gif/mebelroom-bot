@@ -3641,7 +3641,7 @@ def start_payment_prompt(context: ContextTypes.DEFAULT_TYPE, guruh_id: int, work
         "customer": customer,
         "expected_value": expected_value,
     }
-    lines = [f"👷 Ishchi: {worker}"]
+    lines = [f"👷 Ishchi: {worker}"] if worker else ["🚚 Dastavka (o'rnatishsiz jo'natish)"]
     if expected_value > 0:
         lines.append(f"💰 Kutilayotgan summa (sotish narxiga ko'ra): {format_money(expected_value, 'usd')}")
     lines.append("\nMijozdan qancha pul olindi? ($ da, faqat son yozing — hali olinmagan bo'lsa 0)")
@@ -3676,6 +3676,16 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("SELECT dastavka FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    is_dastavka = bool(row and row[0])
+
+    if is_dastavka:
+        conn.close()
+        prompt = start_payment_prompt(context, guruh_id, None)
+        await query.edit_message_text(prompt, reply_markup=None)
+        return
+
     cur.execute("SELECT name FROM workers ORDER BY name")
     workers = [row[0] for row in cur.fetchall()]
     conn.close()
