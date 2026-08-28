@@ -137,6 +137,10 @@ def init_db():
     if "bajarildi_at" not in orders_columns:
         # Buyurtma haqiqatda qachon 'topshirildi' deb belgilanganini saqlaydi (hisobot uchun).
         cur.execute("ALTER TABLE orders ADD COLUMN bajarildi_at TEXT")
+    if "dastavka" not in orders_columns:
+        # 1 = mijoz uyiga o'rnatib berish yo'q, faqat jo'natib yuboriladi (masalan viloyatga).
+        # Bunday holda o'rnatish xizmati narxi ayiriladi, ishchiga yig'ish puli yozilmaydi.
+        cur.execute("ALTER TABLE orders ADD COLUMN dastavka INTEGER NOT NULL DEFAULT 0")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -1551,7 +1555,7 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Komplekt uchun: /narx yigish komplekt 100000\n\n"
         "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish") or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "ornatish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1572,8 +1576,8 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
-    currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "ornatish": "O'rnatish xizmati"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish", "ornatish") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {format_money(rate, currency)} deb belgilandi."
     )
@@ -1591,7 +1595,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Misol: /modelnarx sotish neo komplekt 1800000\n\n"
         "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
     )
-    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish") or not args[-1].isdigit():
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish", "ornatish") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1630,8 +1634,8 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)"}[turi]
-    currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "ornatish": "O'rnatish xizmati"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish", "ornatish") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {format_money(rate, currency)}."
     )
@@ -1680,15 +1684,15 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
-    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖"}
-    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)"}
+    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖", "ornatish": "🔧"}
+    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)", "ornatish": "O'rnatish xizmati"}
     for turi, model, item, rate in rows:
         if turi != current_turi:
             icon = turi_icons.get(turi, "•")
             label = turi_labels.get(turi, turi)
             lines.append(f"\n{icon} {label}:")
             current_turi = turi
-        currency = "usd" if turi in ("sotish", "sotishayirish") else "som"
+        currency = "usd" if turi in ("sotish", "sotishayirish", "ornatish") else "som"
         if model:
             lines.append(f"• {model} {item} (maxsus): {format_money(rate, currency)}")
         else:
@@ -1806,7 +1810,7 @@ async def narxochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Foydalanish: /narxochirish <upakovka|yigish|sotish|sotishayirish|kesim> <model> <detal>\n"
         "Misol: /narxochirish sotish neo shkaf"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "kesim"):
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "ornatish", "kesim"):
         await update.message.reply_text(usage)
         return
 
@@ -1992,6 +1996,46 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ '{item}' uchun (barcha modellar): 1 tasiga {miqdor} ta '{xomashyo}' kerak deb belgilandi."
     )
+
+
+async def dastavka_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Buyurtmani 'faqat jo'natiladi, o'rnatilmaydi' (masalan viloyatga) deb "
+            "belgilaydi/bekor qiladi. Bunday holda sotish narxidan o'rnatish xizmati "
+            "ayiriladi, ishchiga yig'ish puli yozilmaydi.\n\n"
+            "Foydalanish: /dastavka <buyurtma raqami>\n"
+            "Misol: /dastavka 80"
+        )
+        return
+
+    guruh_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT dastavka, status FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    current, status = row
+    new_value = 0 if current else 1
+    cur.execute("UPDATE orders SET dastavka = ? WHERE guruh_id = ?", (new_value, guruh_id))
+    conn.commit()
+    conn.close()
+
+    if new_value:
+        await update.message.reply_text(
+            f"🚚 №{guruh_id} endi 'dastavka' (faqat jo'natiladi, o'rnatilmaydi) deb belgilandi."
+        )
+    else:
+        await update.message.reply_text(f"↩️ №{guruh_id} uchun 'dastavka' belgisi olib tashlandi.")
 
 
 async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2827,6 +2871,11 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     deadline_info = parse_deadline_from_text(text)
     entries, komplekt_aniq = parse_entries_from_text(text, model)
 
+    lowered_text = text.lower()
+    dastavka_detected = any(
+        kw in lowered_text for kw in ("viloyat", "dastavka", "pochta", "jo'natiladi", "jonatiladi")
+    )
+
     lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
     lines.append(f"Taxminiy model: {model}")
     if len(entries) == 1 and entries[0][0] is None:
@@ -2836,6 +2885,12 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
             mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
             label = "komplekt" if item is None else item
             lines.append(f"Taxminiy detal: {mark}{label} ({amount} ta)")
+
+    if dastavka_detected:
+        lines.append(
+            "🚚 Ehtimol DASTAVKA (viloyatga/jo'natish) - agar shunday bo'lsa, tasdiqlagach "
+            "/dastavka buyrug'i bilan belgilashni unutmang."
+        )
 
     if deadline_info:
         day, month, deadline_display = deadline_info
@@ -3768,13 +3823,15 @@ def compute_order_sale_value(guruh_id: int) -> int:
     umumiy summani hisoblaydi (mijozga qancha sotilishi kerak).
     mod_type == '+' (qo'shilgan) - 'sotish' narxi qo'shiladi.
     mod_type == '-' (ayirilgan) - 'sotishayirish' narxi ayiriladi.
-    mod_type == None va item bor - oddiy 'sotish' narxi (mustaqil sotilgan detal)."""
+    mod_type == None va item bor - oddiy 'sotish' narxi (mustaqil sotilgan detal).
+    dastavka == 1 bo'lsa - har bir qatordan (mod_type != '-') 'ornatish' xizmati
+    narxi qo'shimcha ayiriladi (mijoz uyiga o'rnatib berish yo'q, faqat jo'natiladi)."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT model, item, amount, mod_type FROM orders WHERE guruh_id = ?", (guruh_id,))
+    cur.execute("SELECT model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ?", (guruh_id,))
     rows = cur.fetchall()
     total = 0
-    for model, item, amount, mod_type in rows:
+    for model, item, amount, mod_type, dastavka in rows:
         rate_key = item if item is not None else "komplekt"
         if mod_type == "-":
             rate = get_rate(cur, "sotishayirish", model, rate_key)
@@ -3782,6 +3839,9 @@ def compute_order_sale_value(guruh_id: int) -> int:
         else:
             rate = get_rate(cur, "sotish", model, rate_key)
             total += rate * amount
+            if dastavka:
+                ornatish_rate = get_rate(cur, "ornatish", model, rate_key)
+                total -= ornatish_rate * amount
     conn.close()
     return total
 
@@ -3888,7 +3948,7 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, model, item, amount, mod_type FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'",
+        "SELECT id, model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda'",
         (guruh_id,),
     )
     rows = cur.fetchall()
@@ -3899,21 +3959,23 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     user_name = user.full_name if user else "noma'lum"
     user_id = user.id if user else None
     now = datetime.now().isoformat(timespec="seconds")
+    is_dastavka = any(d for _, _, _, _, _, d in rows)
 
     # Ayirilgan ('-') detallarni model bo'yicha yig'amiz - komplekt (item=None) yoyilganda
     # bu detallar zaxiradan chiqarilmasligi kerak (mijoz ularni olmayapti).
     excluded_by_model = {}
-    for _, model, item, _, mod_type in rows:
+    for _, model, item, _, mod_type, _ in rows:
         if mod_type == "-" and item is not None:
             excluded_by_model.setdefault(model, set()).add(item)
 
     all_result_lines = []
     total_payment = 0
     missing_rates = []
-    for order_id, model, item, amount, mod_type in rows:
+    for order_id, model, item, amount, mod_type, dastavka in rows:
         excluded_items = excluded_by_model.get(model, set()) if item is None else None
+        effective_worker = None if dastavka else worker
         result_lines, payment_total, payment_note = fulfill_single_order(
-            cur, order_id, model, item, amount, mod_type, worker, user_name, user_id, now, excluded_items
+            cur, order_id, model, item, amount, mod_type, effective_worker, user_name, user_id, now, excluded_items
         )
         all_result_lines.extend(result_lines)
         total_payment += payment_total
@@ -3929,7 +3991,12 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
 
     lines = [f"✅ №{guruh_id} buyurtma bajarildi deb belgilandi.", "Zaxiradan chiqarildi:"]
     lines.extend(all_result_lines)
-    if worker:
+    if is_dastavka:
+        lines.append(
+            "\n🚚 Dastavka (o'rnatishsiz jo'natish) - ishchiga yig'ish puli yozilmadi, "
+            "sotish narxidan o'rnatish xizmati ayirildi."
+        )
+    elif worker:
         if total_payment > 0:
             lines.append(f"\n👷 {worker} — yig'ish: {total_payment:,} so'm hisoblandi.".replace(",", " "))
         if missing_rates:
@@ -4466,6 +4533,7 @@ def main():
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("hisobtuzatish", hisobtuzatish))
+    app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
