@@ -365,6 +365,23 @@ def set_setting(key: str, value: str):
 DEFAULT_EXCHANGE_RATE = 12700  # 1 dollar necha so'm (agar /kurs bilan sozlanmagan bo'lsa)
 
 
+def fetch_cbu_usd_rate():
+    """O'zbekiston Markaziy Bankining rasmiy saytidan joriy USD/UZS kursini oladi.
+    Xato bo'lsa (internet yo'q, sayt javob bermasa) None qaytaradi."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://cbu.uz/ru/arkhiv-kursov-valyut/json/USD/",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rate = float(data[0]["Rate"])
+        return round(rate)
+    except Exception:
+        return None
+
+
 def get_exchange_rate() -> int:
     raw = get_setting("kurs")
     if raw and raw.isdigit():
@@ -2082,10 +2099,27 @@ async def kurs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
+
+    if args and args[0].lower() in ("online", "cbu", "yangila"):
+        rate = fetch_cbu_usd_rate()
+        if rate is None:
+            await update.message.reply_text(
+                "Markaziy Bank saytidan kursni olib bo'lmadi (internet yoki sayt muammosi). "
+                "Birozdan keyin qayta urinib ko'ring, yoki qo'lda kiriting: /kurs <raqam>"
+            )
+            return
+        set_setting("kurs", str(rate))
+        await update.message.reply_text(
+            f"✅ Markaziy Bank kursi olindi: {rate:,} so'm / 1$".replace(",", " ")
+        )
+        return
+
     if not args:
         await update.message.reply_text(
             f"Joriy dollar kursi: {get_exchange_rate():,} so'm / 1$\n\n".replace(",", " ") +
-            "O'zgartirish: /kurs <raqam>\nMisol: /kurs 12800"
+            "Qo'lda o'zgartirish: /kurs <raqam>\n"
+            "Markaziy Bankdan olish: /kurs online\n\n"
+            "Eslatma: kurs har kuni ertalab avtomatik Markaziy Bankdan yangilanib turadi."
         )
         return
 
@@ -4455,6 +4489,13 @@ async def job_oylik_hisobot(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
 
 
+async def job_kurs_yangilash(context: ContextTypes.DEFAULT_TYPE):
+    """Har kuni ertalab Markaziy Bankdan joriy dollar kursini avtomatik olib, saqlaydi."""
+    rate = fetch_cbu_usd_rate()
+    if rate is not None:
+        set_setting("kurs", str(rate))
+
+
 async def job_muddat_eslatma(context: ContextTypes.DEFAULT_TYPE):
     if OWNER_ID is None:
         return
@@ -4706,6 +4747,10 @@ def main():
             job_kam_qoldi, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
         )
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) guruhga to'liq qoldiqni yuboradi.
+        # Har kuni ertalab soat 8:00 da Markaziy Bank kursini avtomatik yangilaydi.
+        app.job_queue.run_daily(
+            job_kurs_yangilash, time=time(hour=8, minute=0, tzinfo=TASHKENT_TZ)
+        )
         app.job_queue.run_daily(
             job_kunlik_qoldiq, time=time(hour=9, minute=0, tzinfo=TASHKENT_TZ)
         )
