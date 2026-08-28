@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 # Railway'da /data volume ulangan bo'lsa, baza o'sha doimiy papkada saqlanadi
 # (shunda deploy/qayta ishga tushganda ma'lumot o'chib qolmaydi). Aks holda
 # botning o'z papkasida saqlanadi (mahalliy sinov uchun yetarli).
-DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__)).strip()
 DB_PATH = os.path.join(DATA_DIR, "zaxira.db")
 
 _owner_id_raw = os.environ.get("OWNER_ID", "").strip()
@@ -4419,6 +4419,9 @@ async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     token = os.environ.get("BOT_TOKEN")
+    if token:
+        token = token.strip()  # Railway'ga joylashtirilganda tasodifan qo'shilib qoladigan
+                                 # bo'sh qator/probel tokenni buzib qo'yishining oldini oladi.
     if not token:
         raise SystemExit(
             "BOT_TOKEN muhit o'zgaruvchisi topilmadi. "
