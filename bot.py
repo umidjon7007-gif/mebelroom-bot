@@ -362,6 +362,36 @@ def set_setting(key: str, value: str):
     conn.close()
 
 
+DEFAULT_EXCHANGE_RATE = 12700  # 1 dollar necha so'm (agar /kurs bilan sozlanmagan bo'lsa)
+
+
+def get_exchange_rate() -> int:
+    raw = get_setting("kurs")
+    if raw and raw.isdigit():
+        return int(raw)
+    return DEFAULT_EXCHANGE_RATE
+
+
+def parse_money_amount(text: str):
+    """Foydalanuvchi kiritgan summani ($ deb yoki so'm deb) tahlil qilib, doim
+    DOLLARGA aylantirib qaytaradi. Masalan '4000000 som' yoki '4000000so\'m' ->
+    kursga bo'linib $ ga aylantiriladi. Oddiy raqam (masalan '350') -> $ deb olinadi.
+    Qaytaradi: (usd_amount, was_som: bool) yoki None (agar tushunarsiz bo'lsa)."""
+    cleaned = text.strip().lower().replace(" ", "")
+    som_markers = ["som", "so'm", "sum", "so\u2018m"]
+    for marker in som_markers:
+        if cleaned.endswith(marker):
+            number_part = cleaned[: -len(marker)]
+            if number_part.isdigit():
+                som_amount = int(number_part)
+                usd_amount = round(som_amount / get_exchange_rate())
+                return usd_amount, True
+            return None
+    if cleaned.isdigit():
+        return int(cleaned), False
+    return None
+
+
 def normalize_product_name(name: str) -> str:
     return name.strip().lower()
 
@@ -1267,13 +1297,18 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         if pending is None:
             context.user_data["awaiting"] = None
             return
-        cleaned = text.strip().replace(" ", "")
-        if not cleaned.isdigit():
+        parsed = parse_money_amount(text)
+        if parsed is None:
             await update.message.reply_text(
-                "Iltimos, faqat son kiriting (masalan 0 yoki 1500000)."
+                "Iltimos, faqat son kiriting (masalan 0 yoki 1500000 - dollarda), "
+                "yoki so'mda bo'lsa oxiriga 'som' qo'shing (masalan 4000000som)."
             )
             return  # awaiting holati saqlanadi, qayta urinib ko'radi
-        received = int(cleaned)
+        received, was_som = parsed
+        if was_som:
+            await update.message.reply_text(
+                f"💱 So'm deb tanildi, kursga ko'ra (~{get_exchange_rate():,} so'm/$) ${received} deb hisoblanadi.".replace(",", " ")
+            )
         context.user_data["awaiting"] = None
         context.user_data["pending_payment"] = None
         result_text = await finalize_payment(
@@ -2039,6 +2074,83 @@ async def dastavka_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(f"↩️ №{guruh_id} uchun 'dastavka' belgisi olib tashlandi.")
+
+
+async def kurs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            f"Joriy dollar kursi: {get_exchange_rate():,} so'm / 1$\n\n".replace(",", " ") +
+            "O'zgartirish: /kurs <raqam>\nMisol: /kurs 12800"
+        )
+        return
+
+    if not args[0].isdigit():
+        await update.message.reply_text("Faqat butun son kiriting. Misol: /kurs 12800")
+        return
+
+    set_setting("kurs", args[0])
+    await update.message.reply_text(f"✅ Dollar kursi {int(args[0]):,} so'm / 1$ deb belgilandi.".replace(",", " "))
+
+
+async def tolovtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Xato kiritilgan 'mijozdan olingan summa'ni to'g'irlaydi.\n\n"
+        "Foydalanish: /tolovtuzatish <buyurtma raqami> <to'g'ri summa>\n"
+        "Misol (dollarda): /tolovtuzatish 55 315\n"
+        "Misol (so'mda): /tolovtuzatish 55 4000000som"
+    )
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    if not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+    guruh_id = int(args[0])
+
+    parsed = parse_money_amount(args[1])
+    if parsed is None:
+        await update.message.reply_text(usage)
+        return
+    new_received, was_som = parsed
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT expected_value, received_amount, customer FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} uchun to'lov yozuvi topilmadi.")
+        return
+
+    expected_value, old_received, customer = row
+    cur.execute("UPDATE mijoz_tolovlar SET received_amount = ? WHERE guruh_id = ?", (new_received, guruh_id))
+    conn.commit()
+    conn.close()
+
+    lines = [f"✅ №{guruh_id} to'lovi tuzatildi: {format_money(old_received, 'usd')} → {format_money(new_received, 'usd')}"]
+    if was_som:
+        lines.append(f"(kursga ko'ra {args[1]} dan hisoblandi)")
+    if customer:
+        total_expected, total_received = get_customer_totals(customer)
+        qarz = total_expected - total_received
+        if qarz > 0:
+            lines.append(f"🏪 {customer} — yangi umumiy qarzi: {format_money(qarz, 'usd')}")
+        elif qarz < 0:
+            lines.append(f"🏪 {customer} — sizga {format_money(abs(qarz), 'usd')} ortiqcha to'lagan")
+        else:
+            lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3648,7 +3760,10 @@ def start_payment_prompt(context: ContextTypes.DEFAULT_TYPE, guruh_id: int, work
     lines = [f"👷 Ishchi: {worker}"] if worker else ["🚚 Dastavka (o'rnatishsiz jo'natish)"]
     if expected_value > 0:
         lines.append(f"💰 Kutilayotgan summa (sotish narxiga ko'ra): {format_money(expected_value, 'usd')}")
-    lines.append("\nMijozdan qancha pul olindi? ($ da, faqat son yozing — hali olinmagan bo'lsa 0)")
+    lines.append(
+        "\nMijozdan qancha pul olindi? ($ da yozing, masalan 350 — "
+        "yoki so'mda bo'lsa oxiriga 'som' qo'shing, masalan 4000000som)"
+    )
     return "\n".join(lines)
 
 
@@ -4550,6 +4665,8 @@ def main():
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("hisobtuzatish", hisobtuzatish))
+    app.add_handler(CommandHandler("kurs", kurs_command))
+    app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
