@@ -4465,7 +4465,7 @@ def build_worker_maosh_lines(cur, worker):
         return [], 0
 
     yigish_by_guruh = {}
-    upakovka_lines = []
+    upakovka_by_model = {}
     worker_total = 0
 
     for turi, model, item, amount, rate, total, created_at, guruh_id in rows:
@@ -4474,12 +4474,10 @@ def build_worker_maosh_lines(cur, worker):
         if turi == "yigish" and guruh_id is not None:
             entry = yigish_by_guruh.setdefault(guruh_id, {"total": 0, "date": date_part})
             entry["total"] += total
-        elif turi == "yigish":
-            model_part = f"{model} " if model else ""
-            upakovka_lines.append(f"  🚚 {model_part}{item}: {format_money(total, 'som')}  ({date_part})")
         else:
-            model_part = f"{model} " if model else ""
-            upakovka_lines.append(f"  📦 {model_part}{item}: {format_money(total, 'som')}  ({date_part})")
+            key = model or "(model nomsiz)"
+            model_group = upakovka_by_model.setdefault(key, [])
+            model_group.append((item, amount, rate, total, date_part))
 
     lines = []
     for guruh_id, info in sorted(yigish_by_guruh.items()):
@@ -4494,7 +4492,14 @@ def build_worker_maosh_lines(cur, worker):
         else:
             label = "buyurtma o'chirilgan"
         lines.append(f"  🚚 №{guruh_id} ({label}): {format_money(info['total'], 'som')}  ({info['date']})")
-    lines.extend(upakovka_lines)
+
+    for model_key, items in upakovka_by_model.items():
+        lines.append(f"  📦 {model_key}:")
+        for item, amount, rate, total, date_part in items:
+            lines.append(
+                f"      {item}: {format_money(rate, 'som')} x{amount} = "
+                f"{format_money(total, 'som')}  ({date_part})"
+            )
 
     return lines, worker_total
 
