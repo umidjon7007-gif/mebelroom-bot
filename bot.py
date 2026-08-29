@@ -4376,7 +4376,9 @@ async def mijozlar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT DISTINCT customer FROM mijoz_tolovlar ORDER BY customer")
+    cur.execute(
+        "SELECT MAX(customer) FROM mijoz_tolovlar GROUP BY LOWER(customer) ORDER BY LOWER(customer)"
+    )
     customers = [row[0] for row in cur.fetchall()]
 
     if not customers:
@@ -4389,12 +4391,7 @@ async def mijozlar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     for customer in customers:
-        cur.execute(
-            "SELECT COALESCE(SUM(expected_value),0), COALESCE(SUM(received_amount),0) "
-            "FROM mijoz_tolovlar WHERE customer = ?",
-            (customer,),
-        )
-        total_expected, total_received = cur.fetchone()
+        total_expected, total_received = get_customer_totals(customer)
         qarz = total_expected - total_received
         if qarz > 0:
             tag = f"❗ qarzi {format_money(qarz, 'usd')}"
