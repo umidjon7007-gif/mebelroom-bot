@@ -4358,6 +4358,50 @@ async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+def build_worker_maosh_lines(cur, worker):
+    """Bitta ishchining to'lanmagan ishlarini ixcham qatorlarga yig'adi:
+    yig'ish ishlari BUYURTMA RAQAMI bo'yicha guruhlanadi (bitta buyurtma = bitta qator),
+    upakovka ishlari esa detal bo'yicha ko'rsatiladi. Qaytaradi: (lines, worker_total)."""
+    cur.execute(
+        """
+        SELECT wl.turi, wl.model, wl.item, wl.amount, wl.rate, wl.total, wl.created_at, o.guruh_id
+        FROM work_log wl
+        LEFT JOIN orders o ON wl.order_id = o.id
+        WHERE wl.worker = ? AND wl.paid = 0
+        ORDER BY wl.created_at
+        """,
+        (worker,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return [], 0
+
+    yigish_by_guruh = {}
+    upakovka_lines = []
+    worker_total = 0
+
+    for turi, model, item, amount, rate, total, created_at, guruh_id in rows:
+        worker_total += total
+        date_part = created_at.split("T")[0] if created_at else "-"
+        if turi == "yigish" and guruh_id is not None:
+            entry = yigish_by_guruh.setdefault(guruh_id, {"total": 0, "date": date_part})
+            entry["total"] += total
+        elif turi == "yigish":
+            # guruh_id topilmadi (masalan buyurtma o'chirilgan) - alohida qator
+            model_part = f"{model} " if model else ""
+            upakovka_lines.append(f"  🚚 {model_part}{item}: {format_money(total, 'som')}  ({date_part})")
+        else:
+            model_part = f"{model} " if model else ""
+            upakovka_lines.append(f"  📦 {model_part}{item}: {format_money(total, 'som')}  ({date_part})")
+
+    lines = []
+    for guruh_id, info in sorted(yigish_by_guruh.items()):
+        lines.append(f"  🚚 №{guruh_id}: {format_money(info['total'], 'som')}  ({info['date']})")
+    lines.extend(upakovka_lines)
+
+    return lines, worker_total
+
+
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4369,34 +4413,18 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args:
         worker = " ".join(args)
-        cur.execute(
-            """
-            SELECT turi, model, item, amount, rate, total, created_at
-            FROM work_log WHERE worker = ? AND paid = 0 ORDER BY created_at
-            """,
-            (worker,),
-        )
-        rows = cur.fetchall()
+        lines, worker_total = build_worker_maosh_lines(cur, worker)
         conn.close()
 
-        if not rows:
+        if not lines:
             await update.message.reply_text(f"👷 {worker} — to'lanmagan ish topilmadi.")
             return
 
-        total_sum = sum(r[5] for r in rows)
-        lines = [f"👷 {worker} — to'lanmagan ishlar ({len(rows)} ta):\n"]
-        for turi, model, item, amount, rate, total, created_at in rows:
-            icon = "📦" if turi == "upakovka" else "🚚"
-            turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
-            model_part = f"{model} " if model else ""
-            date_part = created_at.split("T")[0] if created_at else "-"
-            lines.append(
-                f"{icon} {turi_label}: {model_part}{item} — {amount} ta x {format_money(rate, 'som')} "
-                f"= {format_money(total, 'som')}  ({date_part})"
-            )
-        lines.append(f"\n💰 Jami to'lanmagan: {format_money(total_sum, 'som')}")
-        lines.append(f"\nTo'langanda: /tolandi {worker}")
-        await update.message.reply_text("\n".join(lines))
+        text_lines = [f"👷 {worker} — to'lanmagan ishlar:\n"]
+        text_lines.extend(lines)
+        text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
+        text_lines.append(f"\nTo'langanda: /tolandi {worker}")
+        await update.message.reply_text("\n".join(text_lines))
         return
 
     cur.execute(
@@ -4409,36 +4437,19 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Hozircha hech kimga to'lanmagan ish yo'q.")
         return
 
-    all_lines = ["💰 To'lanmagan maoshlar — to'liq tafsilot:"]
     grand_total = 0
     chunks = []
-    current_chunk = ["💰 To'lanmagan maoshlar — to'liq tafsilot:"]
+    current_chunk = ["💰 To'lanmagan maoshlar:"]
 
     def chunk_len(lines_list):
         return sum(len(l) + 1 for l in lines_list)
 
     for worker in workers:
-        cur.execute(
-            """
-            SELECT turi, model, item, amount, rate, total, created_at
-            FROM work_log WHERE worker = ? AND paid = 0 ORDER BY created_at
-            """,
-            (worker,),
-        )
-        rows = cur.fetchall()
-        worker_total = sum(r[5] for r in rows)
+        lines, worker_total = build_worker_maosh_lines(cur, worker)
         grand_total += worker_total
 
-        worker_block = [f"\n👷 {worker} — {len(rows)} ta ish:"]
-        for turi, model, item, amount, rate, total, created_at in rows:
-            icon = "📦" if turi == "upakovka" else "🚚"
-            turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
-            model_part = f"{model} " if model else ""
-            date_part = created_at.split("T")[0] if created_at else "-"
-            worker_block.append(
-                f"  {icon} {turi_label}: {model_part}{item} — {amount} ta x {format_money(rate, 'som')} "
-                f"= {format_money(total, 'som')}  ({date_part})"
-            )
+        worker_block = [f"\n👷 {worker}:"]
+        worker_block.extend(lines)
         worker_block.append(f"  Jami: {format_money(worker_total, 'som')}")
 
         if chunk_len(current_chunk) + chunk_len(worker_block) > 3500:
@@ -4450,7 +4461,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     chunks[-1].append(f"\n\n💰 UMUMIY JAMI: {format_money(grand_total, 'som')}")
-    chunks[-1].append("\nTo'langanda: /tolandi <ism>")
+    chunks[-1].append("\nTo'langanda: /tolandi <ism>  |  Batafsil: /maosh <ism>")
 
     for chunk in chunks:
         await update.message.reply_text("\n".join(chunk))
