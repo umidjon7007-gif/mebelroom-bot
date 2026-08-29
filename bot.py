@@ -2233,6 +2233,89 @@ async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def nolniytuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Eski xato tufayli (ko'p so'zli model noto'g'ri bo'lingan, masalan "
+            "model='bella', detal='spalniy kamod') 0 so'm bo'lib qolgan ish "
+            "yozuvlarini avtomatik tuzatadi.\n\n"
+            "Foydalanish: /nolniytuzatish <ishchi ismi>\n"
+            "Misol: /nolniytuzatish Hojiakbar"
+        )
+        return
+
+    worker = " ".join(args)
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    cur.execute(
+        "SELECT id, turi, model, item, amount FROM work_log WHERE worker = ? AND paid = 0 AND rate = 0",
+        (worker,),
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"👷 {worker} — 0 so'mlik yozuv topilmadi, tuzatishning hojati yo'q.")
+        return
+
+    fixed_lines = []
+    unresolved_lines = []
+    for wid, turi, model, item, amount in rows:
+        combined_tokens = f"{model} {item}".split()
+        lowered_tokens = [t.lower() for t in combined_tokens]
+
+        matched_model = None
+        matched_item = None
+        for candidate in all_models:
+            candidate_tokens = candidate.lower().split()
+            if lowered_tokens[: len(candidate_tokens)] == candidate_tokens:
+                matched_model = candidate.lower()
+                matched_item = " ".join(combined_tokens[len(candidate_tokens):]).strip().lower()
+                break
+
+        if matched_model is None or not matched_item:
+            unresolved_lines.append(f"• [{turi}] {model} {item} (id={wid}) — model aniqlanmadi")
+            continue
+
+        new_rate = get_rate(cur, turi, matched_model, matched_item)
+        if new_rate == 0:
+            unresolved_lines.append(
+                f"• [{turi}] {matched_model} {matched_item} — hali ham narx belgilanmagan"
+            )
+            continue
+
+        new_total = amount * new_rate
+        cur.execute(
+            "UPDATE work_log SET model = ?, item = ?, rate = ?, total = ? WHERE id = ?",
+            (matched_model, matched_item, new_rate, new_total, wid),
+        )
+        fixed_lines.append(
+            f"• {model} {item} → {matched_model} {matched_item}: 0 → {format_money(new_total, 'som')}"
+        )
+
+    conn.commit()
+    conn.close()
+
+    lines = [f"👷 {worker} — natija:\n"]
+    if fixed_lines:
+        lines.append(f"✅ Tuzatildi ({len(fixed_lines)} ta):")
+        lines.extend(fixed_lines)
+    if unresolved_lines:
+        lines.append(f"\n⚠️ Tuzatib bo'lmadi ({len(unresolved_lines)} ta):")
+        lines.extend(unresolved_lines)
+    await update.message.reply_text("\n".join(lines))
+
+
 async def ishchinomitolash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4771,6 +4854,7 @@ def main():
     app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
+    app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
