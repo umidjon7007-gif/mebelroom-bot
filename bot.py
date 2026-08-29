@@ -517,12 +517,25 @@ async def buyurtmaguruhi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text(
             "Bu buyruqni buyurtma qabul qilinadigan GURUH ichida yuboring "
-            "(masalan 'ZAKAZ MIRANDA MAYA' guruhida)."
+            "(masalan 'ZAKAZ MIRANDA MAYA' guruhida).\n\n"
+            "Agar bu guruhdan kelgan BARCHA buyurtmalar bitta do'konga tegishli bo'lsa "
+            "(kim yozishidan qat'iy nazar), do'kon nomini ham qo'shib yozing:\n"
+            "/buyurtmaguruhi Mebel For Home"
         )
         return
     set_setting("order_intake_group_id", str(chat.id))
+
+    fixed_customer = " ".join(context.args).strip()
+    if fixed_customer:
+        set_setting("order_intake_customer", fixed_customer)
+        customer_note = f"\n\n🏪 Bu guruhdan kelgan BARCHA buyurtmalar '{fixed_customer}' deb belgilanadi (kim yozishidan qat'iy nazar)."
+    else:
+        set_setting("order_intake_customer", "")
+        customer_note = "\n\nMijoz nomi har safar xabar yozgan kishining ismidan olinadi."
+
     await update.message.reply_text(
-        f"✅ Bu guruh ({chat.title}) endi buyurtma qabul qiluvchi guruh sifatida belgilandi.\n\n"
+        f"✅ Bu guruh ({chat.title}) endi buyurtma qabul qiluvchi guruh sifatida belgilandi."
+        f"{customer_note}\n\n"
         "Endi bu guruhga yozilgan xabarlarni bot o'qib, sizga (shaxsiy xabarda) "
         "\"shunday tushundim\" deb tasdiqlash uchun yuboradi.\n\n"
         "⚠️ MUHIM: bot barcha xabarlarni ko'rishi uchun BotFather'da shu botga "
@@ -3200,7 +3213,11 @@ async def group_order_intake(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text:
         return
 
-    sender_name = user.full_name if user else (chat.title or "Nomalum")
+    fixed_customer = get_setting("order_intake_customer")
+    if fixed_customer:
+        sender_name = fixed_customer
+    else:
+        sender_name = user.full_name if user else (chat.title or "Nomalum")
 
     await send_group_order_confirmation(context, chat.id, message.message_id, text, sender_name)
 
