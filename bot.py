@@ -1858,16 +1858,19 @@ async def narxochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     usage = (
-        "Bitta maxsus (model-specific) narx yozuvini o'chiradi (masalan ishlatilmay qolgan mahsulot narxi).\n\n"
+        "Bitta narx yozuvini o'chiradi.\n\n"
         "Foydalanish: /narxochirish <upakovka|yigish|sotish|sotishayirish|kesim> <model> <detal>\n"
-        "Misol: /narxochirish sotish neo shkaf"
+        "Misol (maxsus, model bilan): /narxochirish sotish neo shkaf\n"
+        "Misol (umumiy, model'siz): /narxochirish upakovka umumiy \"bella spalniy trimo\"\n"
+        "(model o'rniga 'umumiy' deb yozing, agar bu barcha modellar uchun umumiy narx bo'lsa)"
     )
     if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "kesim"):
         await update.message.reply_text(usage)
         return
 
     turi = args[0].lower()
-    model = args[1].lower()
+    model_arg = args[1].lower()
+    model = "" if model_arg in ("umumiy", "-", "hammasi") else model_arg
     item = " ".join(args[2:]).lower()
 
     conn = get_conn()
@@ -1879,8 +1882,9 @@ async def narxochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
+    scope = "umumiy" if not model else model
     if deleted:
-        await update.message.reply_text(f"✅ '{model} {item}' ({turi}) narxi o'chirildi.")
+        await update.message.reply_text(f"✅ '{scope} {item}' ({turi}) narxi o'chirildi.")
     else:
         await update.message.reply_text(f"'{model} {item}' ({turi}) uchun maxsus narx topilmadi.")
 
