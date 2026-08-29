@@ -4360,8 +4360,9 @@ async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_worker_maosh_lines(cur, worker):
     """Bitta ishchining to'lanmagan ishlarini ixcham qatorlarga yig'adi:
-    yig'ish ishlari BUYURTMA RAQAMI bo'yicha guruhlanadi (bitta buyurtma = bitta qator),
-    upakovka ishlari esa detal bo'yicha ko'rsatiladi. Qaytaradi: (lines, worker_total)."""
+    yig'ish ishlari BUYURTMA RAQAMI va TARKIBI (masalan 'Vena komplekt' yoki
+    'Kafino: krovat, parta') bo'yicha guruhlanadi, upakovka ishlari esa
+    detal bo'yicha ko'rsatiladi. Qaytaradi: (lines, worker_total)."""
     cur.execute(
         """
         SELECT wl.turi, wl.model, wl.item, wl.amount, wl.rate, wl.total, wl.created_at, o.guruh_id
@@ -4387,7 +4388,6 @@ def build_worker_maosh_lines(cur, worker):
             entry = yigish_by_guruh.setdefault(guruh_id, {"total": 0, "date": date_part})
             entry["total"] += total
         elif turi == "yigish":
-            # guruh_id topilmadi (masalan buyurtma o'chirilgan) - alohida qator
             model_part = f"{model} " if model else ""
             upakovka_lines.append(f"  🚚 {model_part}{item}: {format_money(total, 'som')}  ({date_part})")
         else:
@@ -4396,7 +4396,17 @@ def build_worker_maosh_lines(cur, worker):
 
     lines = []
     for guruh_id, info in sorted(yigish_by_guruh.items()):
-        lines.append(f"  🚚 №{guruh_id}: {format_money(info['total'], 'som')}  ({info['date']})")
+        cur.execute("SELECT model, item FROM orders WHERE guruh_id = ?", (guruh_id,))
+        order_rows = cur.fetchall()
+        if len(order_rows) == 1 and order_rows[0][1] is None:
+            label = f"{order_rows[0][0]} komplekt"
+        elif order_rows:
+            model_name = order_rows[0][0]
+            item_names = [r[1] for r in order_rows if r[1] is not None]
+            label = f"{model_name}: " + ", ".join(item_names) if item_names else model_name
+        else:
+            label = "buyurtma o'chirilgan"
+        lines.append(f"  🚚 №{guruh_id} ({label}): {format_money(info['total'], 'som')}  ({info['date']})")
     lines.extend(upakovka_lines)
 
     return lines, worker_total
