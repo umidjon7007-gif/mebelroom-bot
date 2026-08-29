@@ -4400,20 +4400,60 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur.execute(
-        "SELECT worker, SUM(total) FROM work_log WHERE paid = 0 GROUP BY worker ORDER BY worker"
+        "SELECT DISTINCT worker FROM work_log WHERE paid = 0 ORDER BY worker"
     )
-    rows = cur.fetchall()
-    conn.close()
+    workers = [row[0] for row in cur.fetchall()]
 
-    if not rows:
+    if not workers:
+        conn.close()
         await update.message.reply_text("Hozircha hech kimga to'lanmagan ish yo'q.")
         return
 
-    lines = ["💰 To'lanmagan maoshlar:\n"]
-    for worker, total in rows:
-        lines.append(f"• {worker}: {format_money(total, 'som')}")
-    lines.append("\nBatafsil: /maosh <ism>")
-    await update.message.reply_text("\n".join(lines))
+    all_lines = ["💰 To'lanmagan maoshlar — to'liq tafsilot:"]
+    grand_total = 0
+    chunks = []
+    current_chunk = ["💰 To'lanmagan maoshlar — to'liq tafsilot:"]
+
+    def chunk_len(lines_list):
+        return sum(len(l) + 1 for l in lines_list)
+
+    for worker in workers:
+        cur.execute(
+            """
+            SELECT turi, model, item, amount, rate, total, created_at
+            FROM work_log WHERE worker = ? AND paid = 0 ORDER BY created_at
+            """,
+            (worker,),
+        )
+        rows = cur.fetchall()
+        worker_total = sum(r[5] for r in rows)
+        grand_total += worker_total
+
+        worker_block = [f"\n👷 {worker} — {len(rows)} ta ish:"]
+        for turi, model, item, amount, rate, total, created_at in rows:
+            icon = "📦" if turi == "upakovka" else "🚚"
+            turi_label = "Upakovka" if turi == "upakovka" else "Yig'ish"
+            model_part = f"{model} " if model else ""
+            date_part = created_at.split("T")[0] if created_at else "-"
+            worker_block.append(
+                f"  {icon} {turi_label}: {model_part}{item} — {amount} ta x {format_money(rate, 'som')} "
+                f"= {format_money(total, 'som')}  ({date_part})"
+            )
+        worker_block.append(f"  Jami: {format_money(worker_total, 'som')}")
+
+        if chunk_len(current_chunk) + chunk_len(worker_block) > 3500:
+            chunks.append(current_chunk)
+            current_chunk = []
+        current_chunk.extend(worker_block)
+
+    chunks.append(current_chunk)
+    conn.close()
+
+    chunks[-1].append(f"\n\n💰 UMUMIY JAMI: {format_money(grand_total, 'som')}")
+    chunks[-1].append("\nTo'langanda: /tolandi <ism>")
+
+    for chunk in chunks:
+        await update.message.reply_text("\n".join(chunk))
 
 
 async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
