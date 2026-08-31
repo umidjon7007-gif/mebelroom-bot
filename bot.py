@@ -37,12 +37,14 @@ import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 
 from telegram import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,6 +59,24 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Tugmalar tez-tez bosilganda (masalan '+'/'-' hisoblagichda chegaraga yetganda),
+# Telegram "xabar o'zgarmadi" degan zararsiz xatoni beradi. Buni butun bot bo'ylab
+# jim o'tkazib yuboramiz, shunda foydalanuvchiga ham, egaga ham keraksiz xato
+# xabarlari kelmaydi.
+_original_edit_message_text = CallbackQuery.edit_message_text
+
+
+async def _safe_edit_message_text(self, *args, **kwargs):
+    try:
+        return await _original_edit_message_text(self, *args, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            return None
+        raise
+
+
+CallbackQuery.edit_message_text = _safe_edit_message_text
 
 # Railway'da /data volume ulangan bo'lsa, baza o'sha doimiy papkada saqlanadi
 # (shunda deploy/qayta ishga tushganda ma'lumot o'chib qolmaydi). Aks holda
