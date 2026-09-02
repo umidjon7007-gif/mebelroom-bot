@@ -2087,6 +2087,91 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtmatuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Hali 'kutilmoqda' holatidagi buyurtmaning bitta detali miqdorini o'zgartiradi "
+        "(mijoz qisman bekor qilganda ishlatiladi). Agar 0 qilsangiz, o'sha detal butunlay "
+        "buyurtmadan olib tashlanadi.\n\n"
+        "Foydalanish: /buyurtmatuzatish <buyurtma raqami> <detal> <yangi miqdor>\n"
+        "Misol: /buyurtmatuzatish 72 krovat 1\n"
+        "Misol (butunlay olib tashlash): /buyurtmatuzatish 72 krovat 0"
+    )
+    if len(args) < 3 or not args[0].isdigit() or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    new_amount = int(args[-1])
+    item_query = " ".join(args[1:-1]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount, status FROM orders WHERE guruh_id = ?",
+        (guruh_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    if rows[0][4] != "kutilmoqda":
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} hozir 'kutilmoqda' holatida emas — bu buyruq faqat hali topshirilmagan "
+            "buyurtmalar uchun ishlaydi. Agar u allaqachon 'bajarildi' bo'lsa, avval "
+            "/topshirilganibekor bilan qaytaring."
+        )
+        return
+
+    target = None
+    for oid, model, item, amount, status in rows:
+        item_display = item if item is not None else "komplekt"
+        if item_display.lower() == item_query:
+            target = (oid, model, item_display, amount)
+            break
+
+    if target is None:
+        conn.close()
+        available = ", ".join(
+            (r[2] if r[2] is not None else "komplekt") for r in rows
+        )
+        await update.message.reply_text(
+            f"'{item_query}' bu buyurtmada topilmadi.\nBu buyurtmadagi detallar: {available}"
+        )
+        return
+
+    oid, model, item_display, old_amount = target
+
+    if new_amount == 0:
+        cur.execute("DELETE FROM orders WHERE id = ?", (oid,))
+        cur.execute("SELECT COUNT(*) FROM orders WHERE guruh_id = ?", (guruh_id,))
+        remaining = cur.fetchone()[0]
+        conn.commit()
+        conn.close()
+        note = ""
+        if remaining == 0:
+            note = "\n⚠️ Bu buyurtmada endi hech qanday detal qolmadi (butunlay bo'shab qoldi)."
+        await update.message.reply_text(
+            f"✅ №{guruh_id}dan '{model} {item_display}' butunlay olib tashlandi "
+            f"(avval {old_amount} ta edi).{note}"
+        )
+        return
+
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (new_amount, oid))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ №{guruh_id} — '{model} {item_display}': {old_amount} ta → {new_amount} ta deb tuzatildi."
+    )
+
+
 async def dastavka_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4896,6 +4981,7 @@ def main():
     app.add_handler(CommandHandler("kurs", kurs_command))
     app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
+    app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
