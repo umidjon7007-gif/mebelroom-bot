@@ -182,6 +182,16 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS upakovka_tartibi (
+            model TEXT NOT NULL COLLATE NOCASE,  -- '' = barcha modellarga tegishli (umumiy tartib)
+            item TEXT NOT NULL COLLATE NOCASE,
+            tartib_raqami INTEGER NOT NULL,
+            PRIMARY KEY (model, item)
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS xomashyo (
             name TEXT PRIMARY KEY COLLATE NOCASE,
             quantity INTEGER NOT NULL DEFAULT 0
@@ -1950,6 +1960,107 @@ async def qoshimchadetalochirish(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"✅ '{item}' qo'shimcha-detal ro'yxatidan olib tashlandi.")
     else:
         await update.message.reply_text(f"'{item}' bu ro'yxatda topilmadi.")
+
+
+async def tartibbelgila(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Detallarni QADOQLASH tartibini (barcha modellar uchun umumiy) belgilaydi — "
+            "birinchi yozilgan detal birinchi qadoqlanadi.\n\n"
+            "Foydalanish: /tartibbelgila <detal1> <detal2> <detal3> ...\n"
+            "Misol: /tartibbelgila shkaf tumba krovat kamod parta\n\n"
+            "Bitta modelga maxsus tartib uchun: /modeltartib <model> <detal1> <detal2> ...\n"
+            "Ko'rish uchun: /tartib <model>"
+        )
+        return
+
+    items = [a.lower() for a in args]
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM upakovka_tartibi WHERE model = ''")
+    for i, item in enumerate(items, start=1):
+        cur.execute(
+            "INSERT INTO upakovka_tartibi (model, item, tartib_raqami) VALUES ('', ?, ?)",
+            (item, i),
+        )
+    conn.commit()
+    conn.close()
+
+    numbered = "\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1))
+    await update.message.reply_text(f"✅ Umumiy qadoqlash tartibi belgilandi:\n\n{numbered}")
+
+
+async def modeltartib(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Foydalanish: /modeltartib <model> <detal1> <detal2> ...\n"
+            "Misol: /modeltartib neo shkaf4eshik shkaf"
+        )
+        return
+
+    model = args[0].lower()
+    items = [a.lower() for a in args[1:]]
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM upakovka_tartibi WHERE model = ?", (model,))
+    for i, item in enumerate(items, start=1):
+        cur.execute(
+            "INSERT INTO upakovka_tartibi (model, item, tartib_raqami) VALUES (?, ?, ?)",
+            (model, item, i),
+        )
+    conn.commit()
+    conn.close()
+
+    numbered = "\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1))
+    await update.message.reply_text(f"✅ '{model}' uchun maxsus qadoqlash tartibi belgilandi:\n\n{numbered}")
+
+
+async def tartib_korish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Qadoqlash tartibini ko'rsatadi (agar modelga maxsus tartib bo'lmasa, umumiy tartib chiqadi).\n\n"
+            "Foydalanish: /tartib <model>\nMisol: /tartib neo"
+        )
+        return
+
+    model = " ".join(args).lower()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT item, tartib_raqami FROM upakovka_tartibi WHERE model = ? ORDER BY tartib_raqami",
+        (model,),
+    )
+    rows = cur.fetchall()
+    scope = model
+    if not rows:
+        cur.execute(
+            "SELECT item, tartib_raqami FROM upakovka_tartibi WHERE model = '' ORDER BY tartib_raqami"
+        )
+        rows = cur.fetchall()
+        scope = "umumiy"
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "Hozircha hech qanday qadoqlash tartibi belgilanmagan.\n"
+            "Belgilash: /tartibbelgila <detal1> <detal2> ..."
+        )
+        return
+
+    lines = [f"📦 Qadoqlash tartibi ({scope}):\n"]
+    lines.extend(f"{i}. {item}" for item, i in rows)
+    await update.message.reply_text("\n".join(lines))
 
 
 async def qoshimchadetallar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5007,6 +5118,9 @@ def main():
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
     app.add_handler(CommandHandler("qoshimchadetallar", qoshimchadetallar))
+    app.add_handler(CommandHandler("tartibbelgila", tartibbelgila))
+    app.add_handler(CommandHandler("modeltartib", modeltartib))
+    app.add_handler(CommandHandler("tartib", tartib_korish))
     app.add_handler(CommandHandler("narx", narx))
     app.add_handler(CommandHandler("modelnarx", modelnarx))
     app.add_handler(CommandHandler("narxlar", narxlar))
