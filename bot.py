@@ -4624,13 +4624,32 @@ def build_worker_maosh_lines(cur, worker):
 
 
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    owner = is_owner(update)
+    linked_worker = get_linked_worker(update)
+
+    if not owner and not linked_worker:
         await deny_access(update)
         return
 
     args = context.args
     conn = get_conn()
     cur = conn.cursor()
+
+    if not owner:
+        # Bog'langan ishchi - faqat O'ZINING maoshini ko'radi, boshqa argument shart emas.
+        worker = linked_worker
+        lines, worker_total = build_worker_maosh_lines(cur, worker)
+        conn.close()
+
+        if not lines:
+            await update.message.reply_text(f"👷 {worker} — hozircha to'lanmagan ish yo'q.")
+            return
+
+        text_lines = [f"👷 {worker} — sizning to'lanmagan ishlaringiz:\n"]
+        text_lines.extend(lines)
+        text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
+        await update.message.reply_text("\n".join(text_lines))
+        return
 
     if args:
         worker = " ".join(args)
