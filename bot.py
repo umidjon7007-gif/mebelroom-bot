@@ -44,7 +44,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -5037,13 +5037,18 @@ async def job_haftalik_hisobot(context: ContextTypes.DEFAULT_TYPE):
 
 async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     """Har qanday kutilmagan xato yuz berganda, uni to'g'ridan-to'g'ri egaga
-    Telegram orqali yuboradi - Railway loglariga kirishning hojati bo'lmaydi."""
+    Telegram orqali yuboradi - Railway loglariga kirishning hojati bo'lmaydi.
+    Vaqtinchalik tarmoq uzilishlari (bot avtomatik qayta ulanadi) - jim o'tkaziladi,
+    faqat logga yoziladi, egaga xabar yuborilmaydi."""
     import traceback
 
     tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
     tb_short = tb[-3500:]  # Telegram xabar uzunligi cheklangan
 
     logging.error("Kutilmagan xato:\n%s", tb)
+
+    if isinstance(context.error, NetworkError):
+        return  # vaqtinchalik tarmoq muammosi - bot o'zi qayta urinadi, egani bezovta qilmaymiz
 
     if OWNER_ID is not None:
         try:
