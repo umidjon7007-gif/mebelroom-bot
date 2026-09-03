@@ -4167,7 +4167,27 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(w, callback_data=f"workerdone:{guruh_id}:{w}")] for w in workers
     ]
     buttons.append([InlineKeyboardButton("➕ Yangi ishchi", callback_data=f"workerdone:{guruh_id}:__new__")])
+    buttons.append([InlineKeyboardButton("🚚 Bez ustanovka (dastavka)", callback_data=f"markdastavka:{guruh_id}")])
     await query.edit_message_text("👷 Buyurtmani kim topshirdi?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def markdastavka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+    await query.answer()
+
+    guruh_id = int(query.data.split(":", 1)[1])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET dastavka = 1 WHERE guruh_id = ?", (guruh_id,))
+    conn.commit()
+    conn.close()
+
+    prompt = start_payment_prompt(context, guruh_id, None)
+    await query.edit_message_text(prompt, reply_markup=None)
 
 
 async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5149,6 +5169,7 @@ def main():
     app.add_handler(CallbackQueryHandler(mijoz_callback, pattern=r"^mij:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
+    app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
     app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
     app.add_handler(CallbackQueryHandler(gord_callback, pattern=r"^gord:"))
