@@ -1431,15 +1431,24 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args:
         product_display = " ".join(args).strip()
         product_key = normalize_product_name(product_display)
-        cur.execute("SELECT name, quantity FROM products WHERE name = ?", (product_key,))
+        cur.execute("SELECT name, model, item, quantity FROM products WHERE name = ?", (product_key,))
         row = cur.fetchone()
-        conn.close()
         if row is None:
+            conn.close()
             await update.message.reply_text(f"'{product_display}' ro'yxatda topilmadi.")
-        else:
-            await update.message.reply_text(
-                f"{stock_indicator(row[1])} {row[0]}: {row[1]} ta qoldi."
-            )
+            return
+
+        name, model, item, quantity = row
+        total_demand = compute_all_pending_demand(cur)
+        conn.close()
+        reserved = total_demand.get((model, item), 0)
+        free = quantity - reserved
+
+        lines = [f"{stock_indicator(quantity)} {name}: {quantity} ta (skladda)"]
+        if reserved:
+            lines.append(f"   📝 Band qilingan (kutilmoqda buyurtmalar): {reserved} ta")
+            lines.append(f"   ✅ Erkin (yangi buyurtmaga bo'sh): {free} ta")
+        await update.message.reply_text("\n".join(lines))
         return
 
     conn.close()
@@ -1482,6 +1491,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (model,),
     )
     rows = cur.fetchall()
+    total_demand = compute_all_pending_demand(cur)
     conn.close()
 
     if not rows:
@@ -1490,8 +1500,19 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = sum(qty for _, qty in rows)
     lines = [f"📦 {model.capitalize()} (jami {total} ta):\n"]
+    any_reserved = False
     for item, quantity in rows:
-        lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+        reserved = total_demand.get((model, item), 0)
+        if reserved:
+            any_reserved = True
+            free = quantity - reserved
+            lines.append(
+                f"{stock_indicator(quantity)} {item}: {quantity} ta (band: {reserved}, erkin: {free})"
+            )
+        else:
+            lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+    if any_reserved:
+        lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
     await query.edit_message_text("\n".join(lines))
 
 
@@ -4964,6 +4985,7 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT model, item, quantity FROM products ORDER BY model, item")
     rows = cur.fetchall()
+    total_demand = compute_all_pending_demand(cur)
     conn.close()
 
     if not rows:
@@ -4971,11 +4993,22 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📦 Kunlik zaxira qoldig'i:"]
     current_model = None
+    any_reserved = False
     for model, item, quantity in rows:
         if model != current_model:
             lines.append(f"\n🔹 {model.capitalize()}")
             current_model = model
-        lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+        reserved = total_demand.get((model, item), 0)
+        if reserved:
+            any_reserved = True
+            free = quantity - reserved
+            lines.append(
+                f"{stock_indicator(quantity)} {item}: {quantity} ta (band: {reserved}, erkin: {free})"
+            )
+        else:
+            lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+    if any_reserved:
+        lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
 
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
 
