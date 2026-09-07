@@ -2219,6 +2219,68 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Hali 'kutilmoqda' holatidagi buyurtmaga yangi detal qo'shadi "
+        "(masalan mijoz keyinroq yana biror narsa qo'shsa, yoki dastlab yozib "
+        "ulgurilmagan bo'lsa).\n\n"
+        "Foydalanish: /buyurtmaqoshish <buyurtma raqami> <model> <detal> <miqdor>\n"
+        "Misol: /buyurtmaqoshish 112 kafino tumba 2\n"
+        "Misol (butun komplekt): /buyurtmaqoshish 112 laura komplekt 1"
+    )
+    if len(args) < 4 or not args[0].isdigit() or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    new_amount = int(args[-1])
+    middle = args[1:-1]
+    model_display = middle[0].lower()
+    item_display = " ".join(middle[1:]).lower() if len(middle) > 1 else "komplekt"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT deadline, deadline_display, customer, status, dastavka FROM orders WHERE guruh_id = ? LIMIT 1",
+        (guruh_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    deadline, deadline_display, customer, status, dastavka = row
+    if status != "kutilmoqda":
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} hozir 'kutilmoqda' holatida emas — bu buyruq faqat hali topshirilmagan "
+            "buyurtmalar uchun ishlaydi. Agar u allaqachon 'bajarildi' bo'lsa, avval "
+            "/topshirilganibekor bilan qaytaring."
+        )
+        return
+
+    item_value = None if item_display == "komplekt" else item_display
+    now = datetime.now(TASHKENT_TZ).isoformat()
+    cur.execute(
+        """INSERT INTO orders (guruh_id, model, item, amount, deadline, deadline_display,
+                                customer, status, created_at, dastavka)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?, ?)""",
+        (guruh_id, model_display, item_value, new_amount, deadline, deadline_display, customer, now, dastavka),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ №{guruh_id} buyurtmasiga qo'shildi: {model_display} {item_display} ({new_amount} ta)"
+    )
+
+
 async def buyurtmatuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5209,6 +5271,7 @@ def main():
     app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
+    app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
