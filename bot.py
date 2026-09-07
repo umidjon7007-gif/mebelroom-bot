@@ -959,7 +959,8 @@ def ob_item_menu_text(ob):
     if ob.get("extra_items"):
         lines.append("\nBoshqa modellardan qo'shilganlar:")
         for (m, it), qty in ob["extra_items"].items():
-            lines.append(f"✅ {m}: {it} — {qty} ta")
+            it_label = "komplekt (barchasi)" if it is None else it
+            lines.append(f"✅ {m}: {it_label} — {qty} ta")
     return "\n".join(lines)
 
 
@@ -993,7 +994,8 @@ def ob_qty_text(ob):
     if ob["qty_mode"] == "komplekt":
         return f"📦 Komplekt: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
     if ob["qty_mode"] == "other_item":
-        return f"📐 {ob['qty_other_model']}: {ob['qty_item']}: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
+        item_label = "komplekt (barchasi)" if ob["qty_item"] is None else ob["qty_item"]
+        return f"📐 {ob['qty_other_model']}: {item_label}: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
     return f"📐 {ob['qty_item']}: nechta?\n\nHozirgi son: {ob['qty_value']} ta"
 
 
@@ -1219,10 +1221,20 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(it, callback_data=f"ob:othermodel:item:{i}")]
             for i, it in enumerate(other_item_list)
         ]
+        buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:othermodel:komplekt")])
         buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ob:othermodel")])
         await query.edit_message_text(
             f"🔁 {other_model.capitalize()} — qaysi detal?", reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    if data == "ob:othermodel:komplekt":
+        other_model = ob["other_model_pending"]
+        ob["qty_mode"] = "other_item"
+        ob["qty_other_model"] = other_model
+        ob["qty_item"] = None
+        ob["qty_value"] = ob["extra_items"].get((other_model, None), 1)
+        await query.edit_message_text(ob_qty_text(ob), reply_markup=ob_qty_keyboard())
         return
 
     if data.startswith("ob:othermodel:item:"):
