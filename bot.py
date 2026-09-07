@@ -2219,6 +2219,110 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def komplektqilish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Buyurtmada bitta modeldan bir nechta alohida detal yozilgan bo'lsa-yu, aslida bu "
+        "TO'LIQ KOMPLEKT (faqat bitta detal yo'q) ekan — shuni to'g'irlaydi: alohida "
+        "detallarni o'chirib, o'rniga 'komplekt narxi minus shu detal' qilib qo'yadi "
+        "(mijozga arzonroq, to'g'ri narx bo'ladi).\n\n"
+        "Foydalanish: /komplektqilish <buyurtma raqami> <model> <yo'q detal>\n"
+        "Misol: /komplektqilish 112 kafino krovat"
+    )
+    if len(args) < 3 or not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    model_query = args[1].lower()
+    missing_item = " ".join(args[2:]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, item, amount, mod_type, status FROM orders WHERE guruh_id = ? AND model = ? COLLATE NOCASE",
+        (guruh_id, model_query),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id}da '{model_query}' modeli topilmadi.")
+        return
+
+    if rows[0][4] != "kutilmoqda":
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} hozir 'kutilmoqda' holatida emas — bu buyruq faqat hali topshirilmagan "
+            "buyurtmalar uchun ishlaydi."
+        )
+        return
+
+    individual_rows = [r for r in rows if r[1] is not None and r[3] is None]
+    if not individual_rows:
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id}dagi '{model_query}' bo'yicha o'zgartiriladigan alohida detallar topilmadi "
+            "(balki allaqachon komplekt shaklida)."
+        )
+        return
+
+    amounts = {a for (_, _, a, _, _) in individual_rows}
+    if len(amounts) != 1:
+        conn.close()
+        await update.message.reply_text(
+            f"'{model_query}' detallarining miqdori bir xil emas — qo'lda tekshirib ko'ring, "
+            "avtomatik to'g'irlab bo'lmadi."
+        )
+        return
+    set_amount = amounts.pop()
+
+    cur.execute(
+        "SELECT deadline, deadline_display, customer FROM orders WHERE guruh_id = ? LIMIT 1",
+        (guruh_id,),
+    )
+    deadline, deadline_display, customer = cur.fetchone()
+
+    ids_to_delete = [r[0] for r in individual_rows]
+    cur.execute(
+        f"DELETE FROM orders WHERE id IN ({','.join('?' for _ in ids_to_delete)})",
+        ids_to_delete,
+    )
+    now = datetime.now(TASHKENT_TZ).isoformat()
+    cur.execute(
+        """INSERT INTO orders (guruh_id, model, item, amount, mod_type, deadline, deadline_display,
+                                customer, status, created_at)
+           VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, 'kutilmoqda', ?)""",
+        (guruh_id, model_query, set_amount, deadline, deadline_display, customer, now),
+    )
+    cur.execute(
+        """INSERT INTO orders (guruh_id, model, item, amount, mod_type, deadline, deadline_display,
+                                customer, status, created_at)
+           VALUES (?, ?, ?, ?, '-', ?, ?, ?, 'kutilmoqda', ?)""",
+        (guruh_id, model_query, missing_item, set_amount, deadline, deadline_display, customer, now),
+    )
+    conn.commit()
+
+    new_value = compute_order_sale_value(guruh_id)
+    cur.execute("SELECT customer FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    mt_row = cur.fetchone()
+    conn.close()
+
+    lines = [
+        f"✅ №{guruh_id} — '{model_query}' to'g'irlandi: endi "
+        f"'{model_query} komplekt ({set_amount} ta) − {missing_item}' sifatida hisoblanadi."
+    ]
+    if mt_row:
+        lines.append(
+            f"💰 Yangi buyurtma qiymati: {format_money(new_value, 'usd')} "
+            f"(agar to'lov yozuvi bo'lsa, /hisobtuzatish {guruh_id} bilan yangilang)"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
 async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5272,6 +5376,7 @@ def main():
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
+    app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
