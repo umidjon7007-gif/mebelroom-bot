@@ -2441,6 +2441,44 @@ async def tolovtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def mijoztuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit() or len(args) < 2:
+        await update.message.reply_text(
+            "Buyurtmaning mijoz nomini to'g'irlaydi (masalan xato ism yoki shaxsning "
+            "ismi yozilib qolgan bo'lsa, to'g'ri do'kon nomiga o'zgartirish uchun).\n\n"
+            "Foydalanish: /mijoztuzatish <buyurtma raqami> <yangi mijoz nomi>\n"
+            "Misol: /mijoztuzatish 80 Mebel For Home"
+        )
+        return
+
+    guruh_id = int(args[0])
+    new_customer = " ".join(args[1:]).strip()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT customer FROM orders WHERE guruh_id = ?", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} raqamli buyurtma topilmadi.")
+        return
+    old_customer = row[0]
+
+    cur.execute("UPDATE orders SET customer = ? WHERE guruh_id = ?", (new_customer, guruh_id))
+    cur.execute("UPDATE mijoz_tolovlar SET customer = ? WHERE guruh_id = ?", (new_customer, guruh_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ №{guruh_id} — mijoz nomi tuzatildi: '{old_customer}' → '{new_customer}'"
+    )
+
+
 async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5166,6 +5204,7 @@ def main():
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("hisobtuzatish", hisobtuzatish))
+    app.add_handler(CommandHandler("mijoztuzatish", mijoztuzatish))
     app.add_handler(CommandHandler("kurs", kurs_command))
     app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
