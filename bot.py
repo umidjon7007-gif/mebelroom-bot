@@ -2231,6 +2231,77 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def modelstatistika(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Model bo'yicha bot ishlay boshlaganidan buguncha to'liq statistikani ko'rsatadi "
+            "(nechta sotilgan, jami tushum, buyurtmalar soni).\n\n"
+            "Foydalanish: /modelstatistika <model>\n"
+            "Misol: /modelstatistika aven"
+        )
+        return
+
+    model_query = " ".join(args).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT item, amount, mod_type, dastavka, guruh_id, bajarildi_at "
+        "FROM orders WHERE model = ? COLLATE NOCASE AND status = 'bajarildi'",
+        (model_query,),
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"'{model_query}' modeli bo'yicha bajarilgan buyurtmalar topilmadi.")
+        return
+
+    item_totals = {}
+    total_revenue = 0
+    order_ids = set()
+    dates = []
+    for item, amount, mod_type, dastavka, guruh_id, bajarildi_at in rows:
+        rate_key = item if item is not None else "komplekt"
+        label = "komplekt (barchasi)" if item is None else item
+        order_ids.add(guruh_id)
+        if bajarildi_at:
+            dates.append(bajarildi_at)
+
+        if mod_type == "-":
+            rate = get_rate(cur, "sotishayirish", model_query, rate_key)
+            total_revenue -= rate * amount
+            item_totals.setdefault(f"{label} (ayirilgan)", 0)
+            item_totals[f"{label} (ayirilgan)"] -= amount
+        else:
+            if dastavka:
+                rate = get_rate(cur, "dastavkanarxi", model_query, rate_key)
+            else:
+                rate = get_rate(cur, "sotish", model_query, rate_key)
+            total_revenue += rate * amount
+            item_totals.setdefault(label, 0)
+            item_totals[label] += amount
+
+    conn.close()
+
+    lines = [f"📊 {model_query.capitalize()} — bot ishlay boshlaganidan buguncha statistika:\n"]
+    lines.append("🛒 Sotilgan:")
+    for label, qty in sorted(item_totals.items(), key=lambda x: -x[1]):
+        lines.append(f"• {label}: {qty} ta")
+    lines.append(f"\n💰 Jami tushum (taxminiy): {format_money(total_revenue, 'usd')}")
+    lines.append(f"📦 Jami buyurtmalar soni: {len(order_ids)} ta")
+    if dates:
+        lines.append(f"🕐 Birinchi bajarilgan: {min(dates).split('T')[0]}")
+        lines.append(f"🕐 Oxirgi bajarilgan: {max(dates).split('T')[0]}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def komplektqilish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5389,6 +5460,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
+    app.add_handler(CommandHandler("modelstatistika", modelstatistika))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
