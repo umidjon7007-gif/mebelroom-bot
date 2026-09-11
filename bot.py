@@ -515,6 +515,7 @@ MENU_BUTTONS = {
     "chiqim": "📤 Chiqim",
     "yangi_buyurtma": "🆕 Buyurtma",
     "mijozlar": "🏪 Mijozlar",
+    "spinka": "🔨 Spinka",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -522,7 +523,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
         [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
-        [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["yordam"]],
+        [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["spinka"]],
+        [MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -5781,6 +5783,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['kirim']}$"), kirim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['spinka']}$"), spinka_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
