@@ -1675,15 +1675,16 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     usage = (
-        "Foydalanish: /narx <upakovka|yigish|sotish> <detal> <summa>\n"
+        "Foydalanish: /narx <upakovka|yigish|sotish|spinka> <detal> <summa>\n"
         "Misol: /narx upakovka shkaf 5000\n"
         "Misol: /narx yigish shkaf 15000\n"
         "Misol: /narx sotish komplekt 1500000  (mijozga sotish narxi)\n"
         "Misol: /narx sotishayirish krovat 800000  (komplektdan ayirilganda kamayadigan summa)\n"
+        "Misol: /narx spinka spinka 15000  (barcha modellar uchun spinka qoqish narxi)\n"
         "Komplekt uchun: /narx yigish komplekt 100000\n\n"
-        "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>"
+        "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish|spinka> <model> <detal> <summa>"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi") or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1704,7 +1705,7 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi"}[turi]
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish"}[turi]
     currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {format_money(rate, currency)} deb belgilandi."
@@ -1718,12 +1719,13 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = [a.lower() for a in context.args]
     usage = (
-        "Foydalanish: /modelnarx <upakovka|yigish|sotish> <model> <detal> <summa>\n"
+        "Foydalanish: /modelnarx <upakovka|yigish|sotish|spinka> <model> <detal> <summa>\n"
         "Misol: /modelnarx yigish bella spalniy shkaf 20000\n"
-        "Misol: /modelnarx sotish neo komplekt 1800000\n\n"
+        "Misol: /modelnarx sotish neo komplekt 1800000\n"
+        "Misol: /modelnarx spinka bella krovat 15000\n\n"
         "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
     )
-    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi") or not args[-1].isdigit():
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1762,7 +1764,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi"}[turi]
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish"}[turi]
     currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {format_money(rate, currency)}."
@@ -1812,8 +1814,8 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
-    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖", "dastavkanarxi": "🚚"}
-    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)", "dastavkanarxi": "Dastavka narxi (o'rnatishsiz)"}
+    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖", "dastavkanarxi": "🚚", "spinka": "🔨"}
+    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)", "dastavkanarxi": "Dastavka narxi (o'rnatishsiz)", "spinka": "Spinka qoqish"}
     for turi, model, item, rate in rows:
         if turi != current_turi:
             icon = turi_icons.get(turi, "•")
@@ -2284,6 +2286,85 @@ def format_fulfilled_group_text(group):
         mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
         lines.append(f"• {mark}{what}: {amount} ta")
     return "\n".join(lines)
+
+
+async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Krovat spinkasini qoqish xizmatini qayd etadi (buyurtmadan mustaqil, alohida xizmat).\n\n"
+        "Foydalanish: /spinkaqoqildi <model> <miqdor> [ishchi ismi]\n"
+        "Misol (o'zingiz ishchi bo'lsangiz): /spinkaqoqildi vena 3\n"
+        "Misol (egasi, ishchi nomi bilan): /spinkaqoqildi vena 3 Hojiakbar"
+    )
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    linked_worker = get_linked_worker(update)
+
+    if args[-1].isdigit():
+        amount_raw = args[-1]
+        model_display = " ".join(args[:-1]).lower()
+        worker = linked_worker
+    else:
+        worker = args[-1]
+        if len(args) < 3 or not args[-2].isdigit():
+            await update.message.reply_text(usage)
+            return
+        amount_raw = args[-2]
+        model_display = " ".join(args[:-2]).lower()
+
+    if not worker:
+        await update.message.reply_text(
+            "Ishchi ismini ko'rsating (siz bog'langan ishchi emassiz).\n\n" + usage
+        )
+        return
+
+    try:
+        amount = int(amount_raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Miqdor musbat butun son bo'lishi kerak.")
+        return
+
+    if not model_display:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    rate = get_rate(cur, "spinka", model_display, "spinka")
+    total = amount * rate
+    now = datetime.now(TASHKENT_TZ).isoformat()
+    cur.execute(
+        """
+        INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
+        VALUES (?, 'spinka', NULL, ?, 'spinka', ?, ?, ?, 0, ?)
+        """,
+        (worker, model_display, amount, rate, total, now),
+    )
+    conn.commit()
+    conn.close()
+
+    if rate == 0:
+        await update.message.reply_text(
+            f"⚠️ '{model_display}' uchun spinka qoqish narxi hali belgilanmagan.\n"
+            f"Belgilash: /modelnarx spinka {model_display} spinka <summa>\n"
+            f"(yoki barcha modellar uchun umumiy: /narx spinka spinka <summa>)\n\n"
+            f"Ish {worker} nomiga 0 so'm bilan yozib qo'yildi — narx belgilangach, "
+            f"/maosh orqali tekshirib, kerak bo'lsa tuzating."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔨 {worker} — spinka qoqish: {model_display} ({amount} ta) — "
+        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})."
+    )
 
 
 async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5104,7 +5185,7 @@ def build_worker_maosh_lines(cur, worker):
         return [], 0
 
     yigish_by_guruh = {}
-    upakovka_by_model = {}
+    other_by_turi_model = {}
     worker_total = 0
 
     for turi, model, item, amount, rate, total, created_at, guruh_id in rows:
@@ -5114,9 +5195,9 @@ def build_worker_maosh_lines(cur, worker):
             entry = yigish_by_guruh.setdefault(guruh_id, {"total": 0, "date": date_part})
             entry["total"] += total
         else:
-            key = model or "(model nomsiz)"
-            model_group = upakovka_by_model.setdefault(key, [])
-            model_group.append((item, amount, rate, total, date_part))
+            key = (turi, model or "(model nomsiz)")
+            group = other_by_turi_model.setdefault(key, [])
+            group.append((item, amount, rate, total, date_part))
 
     lines = []
     for guruh_id, info in sorted(yigish_by_guruh.items()):
@@ -5132,8 +5213,10 @@ def build_worker_maosh_lines(cur, worker):
             label = "buyurtma o'chirilgan"
         lines.append(f"  🚚 №{guruh_id} ({label}): {format_money(info['total'], 'som')}  ({info['date']})")
 
-    for model_key, items in upakovka_by_model.items():
-        lines.append(f"  📦 {model_key}:")
+    turi_icon = {"upakovka": "📦", "spinka": "🔨"}
+    for (turi, model_key), items in other_by_turi_model.items():
+        icon = turi_icon.get(turi, "📦")
+        lines.append(f"  {icon} {model_key}:")
         for item, amount, rate, total, date_part in items:
             lines.append(
                 f"      {item}: {format_money(rate, 'som')} x{amount} = "
@@ -5543,6 +5626,7 @@ def main():
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
     app.add_handler(CommandHandler("buyurtmatarix", buyurtmatarix))
+    app.add_handler(CommandHandler("spinkaqoqildi", spinkaqoqildi))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
