@@ -3258,6 +3258,45 @@ async def nolniytuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def ishchiochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "Ishchilar ro'yxatidan bittasini o'chiradi (faqat unga bog'liq to'lanmagan ish "
+            "yozuvi bo'lmasa — masalan xato kiritilib qolgan nomni tozalash uchun).\n\n"
+            "Foydalanish: /ishchiochirish <ism>\n"
+            "Misol: /ishchiochirish 350"
+        )
+        return
+
+    name = args[0]
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM work_log WHERE worker = ? COLLATE NOCASE AND paid = 0", (name,))
+    unpaid_count = cur.fetchone()[0]
+    if unpaid_count > 0:
+        conn.close()
+        await update.message.reply_text(
+            f"'{name}' nomiga {unpaid_count} ta to'lanmagan ish yozuvi bor — avval ularni "
+            f"/ishchinomitolash {name} <to'g'ri ism> bilan boshqa ismga ko'chiring, keyin o'chiring."
+        )
+        return
+
+    cur.execute("DELETE FROM workers WHERE name = ? COLLATE NOCASE", (name,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        await update.message.reply_text(f"✅ '{name}' ishchilar ro'yxatidan o'chirildi.")
+    else:
+        await update.message.reply_text(f"'{name}' ishchilar ro'yxatida topilmadi.")
+
+
 async def ishchinomitolash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5870,6 +5909,7 @@ def main():
     app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
+    app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
