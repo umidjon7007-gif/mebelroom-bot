@@ -2321,6 +2321,53 @@ def log_spinka_work(worker, model_display, amount):
     )
 
 
+async def spinkaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Xato/sinov uchun yozilgan spinka ishini o'chiradi (faqat hali to'lanmagan bo'lsa, "
+            "eng oxirgi yozuvni o'chiradi).\n\n"
+            "Foydalanish: /spinkaochirish <ishchi> <model>\n"
+            "Misol: /spinkaochirish Hojiakbar vena"
+        )
+        return
+
+    worker = args[0]
+    model_display = " ".join(args[1:]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, amount, rate, total, created_at FROM work_log
+        WHERE worker = ? COLLATE NOCASE AND model = ? COLLATE NOCASE AND turi = 'spinka' AND paid = 0
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (worker, model_display),
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(
+            f"'{worker}' uchun '{model_display}' bo'yicha to'lanmagan spinka yozuvi topilmadi."
+        )
+        return
+
+    log_id, amount, rate, total, created_at = row
+    cur.execute("DELETE FROM work_log WHERE id = ?", (log_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ O'chirildi: {worker} — {model_display} ({amount} ta, {format_money(total, 'som')}) "
+        f"— {created_at.split('T')[0]}"
+    )
+
+
 async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -5821,6 +5868,7 @@ def main():
     app.add_handler(CommandHandler("spinkanarxlar", spinkanarxlar))
     app.add_handler(CommandHandler("spinka", spinka_button))
     app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
+    app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
