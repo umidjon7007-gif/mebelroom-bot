@@ -2231,6 +2231,89 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def fetch_fulfilled_order_groups(customer_filter=None, limit=20):
+    conn = get_conn()
+    cur = conn.cursor()
+    if customer_filter:
+        cur.execute(
+            """
+            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
+            FROM orders WHERE status = 'bajarildi' AND LOWER(customer) = LOWER(?)
+            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
+            """,
+            (customer_filter,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
+            FROM orders WHERE status = 'bajarildi'
+            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
+            """
+        )
+    rows = cur.fetchall()
+    conn.close()
+
+    groups = {}
+    order_of_groups = []
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, bajarildi_at in rows:
+        gid = guruh_id if guruh_id is not None else oid
+        if gid not in groups:
+            groups[gid] = {
+                "guruh_id": gid,
+                "deadline_display": deadline_display,
+                "customer": customer,
+                "bajarildi_at": bajarildi_at,
+                "items": [],
+            }
+            order_of_groups.append(gid)
+        groups[gid]["items"].append((oid, model, item, amount, mod_type))
+
+    ordered = [groups[gid] for gid in order_of_groups]
+    return ordered[:limit]
+
+
+def format_fulfilled_group_text(group):
+    bajarildi_date = group["bajarildi_at"].split("T")[0] if group["bajarildi_at"] else "?"
+    lines = [f"✅ Buyurtma №{group['guruh_id']} — {group['deadline_display']} (bajarildi: {bajarildi_date})"]
+    if group["customer"]:
+        lines.append(f"Mijoz: {group['customer']}")
+    lines.append("")
+    for _, model, item, amount, mod_type in group["items"]:
+        what = f"{model} komplekt" if item is None else f"{model} {item}"
+        mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+        lines.append(f"• {mark}{what}: {amount} ta")
+    return "\n".join(lines)
+
+
+async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    customer_filter = None
+    limit = 20
+    if args:
+        if args[-1].isdigit():
+            limit = int(args[-1])
+            customer_filter = " ".join(args[:-1]).strip() or None
+        else:
+            customer_filter = " ".join(args).strip()
+
+    groups = fetch_fulfilled_order_groups(customer_filter=customer_filter, limit=limit)
+    if not groups:
+        await update.message.reply_text("Bajarilgan buyurtmalar topilmadi.")
+        return
+
+    header = f"📜 Bajarilgan buyurtmalar tarixi (oxirgi {len(groups)} ta)"
+    if customer_filter:
+        header += f" — mijoz: {customer_filter}"
+    await update.message.reply_text(header)
+    for group in groups:
+        await update.message.reply_text(format_fulfilled_group_text(group))
+
+
 async def modelstatistika(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -5461,6 +5544,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
+    app.add_handler(CommandHandler("buyurtmatarix", buyurtmatarix))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
