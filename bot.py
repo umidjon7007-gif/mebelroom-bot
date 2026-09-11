@@ -2288,6 +2288,75 @@ def format_fulfilled_group_text(group):
     return "\n".join(lines)
 
 
+async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Bir nechta modelga, har biriga BOSHQA-BOSHQA spinka narxini, BITTA buyruqda belgilaydi.\n\n"
+        "Foydalanish: /spinkanarxlar <model1> <narx1> <model2> <narx2> ...\n"
+        "Misol: /spinkanarxlar vena 15000 bella 20000 maya 18000"
+    )
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    lowered_args = [a.lower() for a in args]
+    pairs = []
+    unmatched = []
+    i = 0
+    while i < len(lowered_args):
+        matched_model = None
+        for candidate in all_models:
+            tokens = candidate.split()
+            if lowered_args[i : i + len(tokens)] == tokens:
+                matched_model = candidate
+                i += len(tokens)
+                break
+        if matched_model is None:
+            unmatched.append(args[i])
+            i += 1
+            continue
+        if i >= len(lowered_args) or not lowered_args[i].isdigit():
+            unmatched.append(f"{matched_model} (narxi topilmadi)")
+            continue
+        price = int(lowered_args[i])
+        i += 1
+        pairs.append((matched_model, price))
+
+    if not pairs:
+        conn.close()
+        await update.message.reply_text(
+            f"Hech qanday model-narx juftligi aniqlanmadi.\nMavjud modellar: {', '.join(sorted(set(all_models)))}\n\n"
+            + usage
+        )
+        return
+
+    for model, price in pairs:
+        cur.execute(
+            "INSERT INTO narxlar (turi, model, item, rate) VALUES ('spinka', ?, 'spinka', ?) "
+            "ON CONFLICT(turi, model, item) DO UPDATE SET rate = excluded.rate",
+            (model, price),
+        )
+    conn.commit()
+    conn.close()
+
+    lines = ["✅ Spinka narxlari belgilandi:"]
+    for model, price in pairs:
+        lines.append(f"• {model}: {format_money(price, 'som')}")
+    if unmatched:
+        lines.append(f"\n⚠️ Tushunilmadi: {', '.join(unmatched)}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -5627,6 +5696,7 @@ def main():
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
     app.add_handler(CommandHandler("buyurtmatarix", buyurtmatarix))
     app.add_handler(CommandHandler("spinkaqoqildi", spinkaqoqildi))
+    app.add_handler(CommandHandler("spinkanarxlar", spinkanarxlar))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
