@@ -4802,8 +4802,6 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
         current_qty = prow[0] if prow else 0
         new_qty = current_qty - deduct
         shortage = new_qty < 0
-        if shortage:
-            new_qty = 0
 
         cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
         cur.execute(
