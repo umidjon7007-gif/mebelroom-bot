@@ -2288,6 +2288,152 @@ def format_fulfilled_group_text(group):
     return "\n".join(lines)
 
 
+def log_spinka_work(worker, model_display, amount):
+    """Spinka ishini work_log ga yozadi va tayyor xabar qaytaradi (rate/total bilan)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    rate = get_rate(cur, "spinka", model_display, "spinka")
+    total = amount * rate
+    now = datetime.now(TASHKENT_TZ).isoformat()
+    cur.execute(
+        """
+        INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
+        VALUES (?, 'spinka', NULL, ?, 'spinka', ?, ?, ?, 0, ?)
+        """,
+        (worker, model_display, amount, rate, total, now),
+    )
+    conn.commit()
+    conn.close()
+
+    if rate == 0:
+        return (
+            f"⚠️ '{model_display}' uchun spinka qoqish narxi hali belgilanmagan.\n"
+            f"Belgilash: /modelnarx spinka {model_display} spinka <summa>\n"
+            f"(yoki barcha modellar uchun umumiy: /narx spinka spinka <summa>)\n\n"
+            f"Ish {worker} nomiga 0 so'm bilan yozib qo'yildi — narx belgilangach, "
+            f"/maosh orqali tekshirib, kerak bo'lsa tuzating."
+        )
+    return (
+        f"🔨 {worker} — spinka qoqish: {model_display} ({amount} ta) — "
+        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})."
+    )
+
+
+async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Hozircha hech qanday model ro'yxatga olinmagan.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(model.capitalize(), callback_data=f"sp:model:{model}")]
+        for (model,) in rows
+    ]
+    await update.message.reply_text(
+        "🔨 Spinka qoqish — qaysi model?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+def sp_qty_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➖", callback_data="sp:qty:-1"),
+                InlineKeyboardButton("➕", callback_data="sp:qty:+1"),
+            ],
+            [InlineKeyboardButton("✅ Tasdiqlash", callback_data="sp:qty:confirm")],
+            [InlineKeyboardButton("⬅️ Bekor qilish", callback_data="sp:qty:cancel")],
+        ]
+    )
+
+
+async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await update.callback_query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    sp = context.user_data.setdefault("sp", {})
+
+    if data.startswith("sp:model:"):
+        model = data.split(":", 2)[2]
+        sp["model"] = model
+        sp["qty"] = 1
+        await query.edit_message_text(
+            f"🔨 {model.capitalize()} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
+            reply_markup=sp_qty_keyboard(),
+        )
+        return
+
+    if data.startswith("sp:qty:"):
+        action = data.split(":", 2)[2]
+        if action == "cancel":
+            context.user_data.pop("sp", None)
+            await query.edit_message_text("Bekor qilindi.")
+            return
+        if action == "confirm":
+            model = sp.get("model")
+            amount = sp.get("qty", 1)
+            if not model:
+                await query.edit_message_text("Xatolik: model tanlanmagan. Qaytadan /spinka deb yozing.")
+                return
+            linked_worker = get_linked_worker(update)
+            if linked_worker:
+                text = log_spinka_work(linked_worker, model, amount)
+                context.user_data.pop("sp", None)
+                await query.edit_message_text(text)
+                return
+            # Egasi — ishchini tanlashi kerak
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM workers ORDER BY name")
+            worker_names = [row[0] for row in cur.fetchall()]
+            conn.close()
+            if not worker_names:
+                await query.edit_message_text(
+                    "Hozircha hech qanday ishchi ro'yxatga olinmagan. /ishchiqoshish bilan qo'shing."
+                )
+                return
+            buttons = [
+                [InlineKeyboardButton(w, callback_data=f"sp:worker:{w}")] for w in worker_names
+            ]
+            await query.edit_message_text(
+                f"🔨 {model.capitalize()} ({amount} ta) — kim qoqdi?", reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+        step = 1 if action == "+1" else -1
+        sp["qty"] = max(1, sp.get("qty", 1) + step)
+        model = sp.get("model", "")
+        await query.edit_message_text(
+            f"🔨 {model.capitalize()} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
+            reply_markup=sp_qty_keyboard(),
+        )
+        return
+
+    if data.startswith("sp:worker:"):
+        worker = data.split(":", 2)[2]
+        model = sp.get("model")
+        amount = sp.get("qty", 1)
+        context.user_data.pop("sp", None)
+        if not model:
+            await query.edit_message_text("Xatolik: model tanlanmagan. Qaytadan /spinka deb yozing.")
+            return
+        text = log_spinka_work(worker, model, amount)
+        await query.edit_message_text(text)
+        return
+
+
 async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -2405,35 +2551,8 @@ async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
 
-    conn = get_conn()
-    cur = conn.cursor()
-    rate = get_rate(cur, "spinka", model_display, "spinka")
-    total = amount * rate
-    now = datetime.now(TASHKENT_TZ).isoformat()
-    cur.execute(
-        """
-        INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
-        VALUES (?, 'spinka', NULL, ?, 'spinka', ?, ?, ?, 0, ?)
-        """,
-        (worker, model_display, amount, rate, total, now),
-    )
-    conn.commit()
-    conn.close()
-
-    if rate == 0:
-        await update.message.reply_text(
-            f"⚠️ '{model_display}' uchun spinka qoqish narxi hali belgilanmagan.\n"
-            f"Belgilash: /modelnarx spinka {model_display} spinka <summa>\n"
-            f"(yoki barcha modellar uchun umumiy: /narx spinka spinka <summa>)\n\n"
-            f"Ish {worker} nomiga 0 so'm bilan yozib qo'yildi — narx belgilangach, "
-            f"/maosh orqali tekshirib, kerak bo'lsa tuzating."
-        )
-        return
-
-    await update.message.reply_text(
-        f"🔨 {worker} — spinka qoqish: {model_display} ({amount} ta) — "
-        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})."
-    )
+    text = log_spinka_work(worker, model_display, amount)
+    await update.message.reply_text(text)
 
 
 async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5697,6 +5816,8 @@ def main():
     app.add_handler(CommandHandler("buyurtmatarix", buyurtmatarix))
     app.add_handler(CommandHandler("spinkaqoqildi", spinkaqoqildi))
     app.add_handler(CommandHandler("spinkanarxlar", spinkanarxlar))
+    app.add_handler(CommandHandler("spinka", spinka_button))
+    app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
