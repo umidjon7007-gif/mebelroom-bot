@@ -2143,6 +2143,67 @@ def get_xom_requirements(cur, model: str, item: str):
     return result
 
 
+async def xomkirimlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Bir nechta xomashyoni, BITTA xabarda, har birini ALOHIDA QATORDA yozib, "
+        "bittada omborga qo'shadi.\n\n"
+        "Foydalanish:\n"
+        "/xomkirimlar\n"
+        "<nom> <miqdor>\n"
+        "<nom> <miqdor>\n"
+        "...\n\n"
+        "Misol:\n"
+        "/xomkirimlar\n"
+        "kamod-oyna 40\n"
+        "bella-oyna 25\n"
+        "kafino-oyna 20"
+    )
+    text = update.message.text or ""
+    lines = [ln.strip() for ln in text.split("\n")]
+    lines = lines[1:] if lines else []
+    lines = [ln for ln in lines if ln]
+
+    if not lines:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    ok_lines = []
+    bad_lines = []
+    for ln in lines:
+        tokens = ln.split()
+        if len(tokens) < 2 or not tokens[-1].isdigit():
+            bad_lines.append(ln)
+            continue
+        name = " ".join(tokens[:-1]).lower()
+        amount = int(tokens[-1])
+        cur.execute(
+            "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET quantity = quantity + excluded.quantity",
+            (name, amount),
+        )
+        cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (name,))
+        new_qty = cur.fetchone()[0]
+        ok_lines.append((name, amount, new_qty))
+    conn.commit()
+    conn.close()
+
+    reply = [f"✅ {len(ok_lines)} ta xomashyo qo'shildi:"]
+    for name, amount, new_qty in ok_lines:
+        reply.append(f"• {name}: +{amount} ta (yangi qoldiq: {new_qty} ta)")
+    if bad_lines:
+        reply.append(f"\n⚠️ Tushunilmadi ({len(bad_lines)} qator):")
+        for ln in bad_lines:
+            reply.append(f"  {ln}")
+        reply.append("\nFormat: <nom> <miqdor>")
+    await update.message.reply_text("\n".join(reply))
+
+
 async def xomkirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -3447,6 +3508,65 @@ async def kirimtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text("\n".join(lines))
+
+
+async def xomtarkiblar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Bir nechta model/detal uchun xomashyo tarkibini, BITTA xabarda, har birini "
+        "ALOHIDA QATORDA yozib, bittada belgilaydi.\n\n"
+        "Foydalanish:\n"
+        "/xomtarkiblar\n"
+        "<model> <detal> <xomashyo> <miqdor>\n"
+        "<model> <detal> <xomashyo> <miqdor>\n"
+        "...\n\n"
+        "Misol:\n"
+        "/xomtarkiblar\n"
+        "vena kamod kamod-oyna 1\n"
+        "bella shkaf bella-oyna 1\n"
+        "bella shkaf4eshik bella-oyna 2"
+    )
+    text = update.message.text or ""
+    lines = [ln.strip() for ln in text.split("\n")]
+    # Birinchi qator - buyruqning o'zi (/xomtarkiblar), uni tashlab ketamiz
+    lines = lines[1:] if lines else []
+    lines = [ln for ln in lines if ln]
+
+    if not lines:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    ok_lines = []
+    bad_lines = []
+    for ln in lines:
+        tokens = ln.split()
+        if len(tokens) != 4 or not tokens[3].isdigit():
+            bad_lines.append(ln)
+            continue
+        model, item, xomashyo, miqdor = tokens[0].lower(), tokens[1].lower(), tokens[2].lower(), int(tokens[3])
+        cur.execute(
+            "INSERT INTO xomashyo_tarkibi (model, item, xomashyo, miqdor) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(model, item, xomashyo) DO UPDATE SET miqdor = excluded.miqdor",
+            (model, item, xomashyo, miqdor),
+        )
+        ok_lines.append((model, item, xomashyo, miqdor))
+    conn.commit()
+    conn.close()
+
+    reply = [f"✅ {len(ok_lines)} ta tarkib belgilandi:"]
+    for model, item, xomashyo, miqdor in ok_lines:
+        reply.append(f"• {model} {item}: 1 tasiga {miqdor} ta '{xomashyo}'")
+    if bad_lines:
+        reply.append(f"\n⚠️ Tushunilmadi ({len(bad_lines)} qator):")
+        for ln in bad_lines:
+            reply.append(f"  {ln}")
+        reply.append("\nFormat: <model> <detal> <xomashyo> <miqdor>")
+    await update.message.reply_text("\n".join(reply))
 
 
 async def xommodeltarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5924,6 +6044,8 @@ def main():
     app.add_handler(CommandHandler("xomqoldiq", xomqoldiq))
     app.add_handler(CommandHandler("xomtarkibi", xomtarkibi))
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
+    app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
+    app.add_handler(CommandHandler("xomkirimlar", xomkirimlar))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
     app.add_handler(CommandHandler("hisobtuzatish", hisobtuzatish))
     app.add_handler(CommandHandler("mijoztuzatish", mijoztuzatish))
