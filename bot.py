@@ -1362,8 +1362,16 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["pending_order_id"] = None
         if guruh_id is None:
             return
-        prompt = start_payment_prompt(context, guruh_id, text)
-        await update.message.reply_text(prompt)
+        context.user_data["pending_new_worker"] = {"guruh_id": guruh_id, "name": text}
+        buttons = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Ha, to'g'ri", callback_data="neww:confirm")],
+                [InlineKeyboardButton("❌ Yo'q, qayta yozaman", callback_data="neww:retry")],
+            ]
+        )
+        await update.message.reply_text(
+            f"Yangi ishchi: '{text}' — shu nom to'g'rimi?", reply_markup=buttons
+        )
         return
 
     if awaiting == "amount_received_for_order":
@@ -4919,6 +4927,30 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("👷 Buyurtmani kim topshirdi?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
+async def neww_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+    await query.answer()
+
+    pending = context.user_data.get("pending_new_worker")
+    if pending is None:
+        await query.edit_message_text("Bu so'rov eskirgan, qaytadan urinib ko'ring.")
+        return
+
+    if query.data == "neww:retry":
+        context.user_data["pending_new_worker"] = None
+        context.user_data["awaiting"] = "worker_name_for_order"
+        context.user_data["pending_order_id"] = pending["guruh_id"]
+        await query.edit_message_text("✍️ Yangi ishchining ismini qayta yozing:")
+        return
+
+    context.user_data["pending_new_worker"] = None
+    prompt = start_payment_prompt(context, pending["guruh_id"], pending["name"])
+    await query.edit_message_text(prompt)
+
+
 async def markdastavka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not can_kirim(update):
@@ -5942,6 +5974,7 @@ def main():
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
+    app.add_handler(CallbackQueryHandler(neww_callback, pattern=r"^neww:"))
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
     app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
     app.add_handler(CallbackQueryHandler(gord_callback, pattern=r"^gord:"))
