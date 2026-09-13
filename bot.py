@@ -516,6 +516,7 @@ MENU_BUTTONS = {
     "yangi_buyurtma": "🆕 Buyurtma",
     "mijozlar": "🏪 Mijozlar",
     "spinka": "🔨 Spinka",
+    "oyna": "🪟 Oyna",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -524,7 +525,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
         [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
         [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["spinka"]],
-        [MENU_BUTTONS["yordam"]],
+        [MENU_BUTTONS["oyna"], MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -2477,6 +2478,124 @@ async def spinkaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ O'chirildi: {worker} — {model_display} ({amount} ta, {format_money(total, 'som')}) "
         f"— {created_at.split('T')[0]}"
     )
+
+
+async def oyna_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
+    buttons = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📦 Qoldiqni ko'rish", callback_data="oy:qoldiq")],
+            [InlineKeyboardButton("📥 Kirim qilish", callback_data="oy:kirim")],
+        ]
+    )
+    await update.message.reply_text("🪟 Oyna — nima qilamiz?", reply_markup=buttons)
+
+
+def oy_qty_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➖", callback_data="oy:qty:-1"),
+                InlineKeyboardButton("➕", callback_data="oy:qty:+1"),
+            ],
+            [InlineKeyboardButton("✅ Tasdiqlash", callback_data="oy:qty:confirm")],
+            [InlineKeyboardButton("⬅️ Bekor qilish", callback_data="oy:qty:cancel")],
+        ]
+    )
+
+
+async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await update.callback_query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    oy = context.user_data.setdefault("oy", {})
+
+    if data == "oy:qoldiq":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT name, quantity FROM xomashyo WHERE name LIKE '%oyna%' ORDER BY name")
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("Oyna ombori hozircha bo'sh.")
+            return
+        lines = ["🪟 Oyna qoldig'i:\n"]
+        for name, qty in rows:
+            lines.append(f"{stock_indicator(qty)} {name}: {qty} ta")
+        await query.edit_message_text("\n".join(lines))
+        return
+
+    if data == "oy:kirim":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT name FROM xomashyo WHERE name LIKE '%oyna%' ORDER BY name")
+        names = [row[0] for row in cur.fetchall()]
+        conn.close()
+        if not names:
+            await query.edit_message_text(
+                "Hali hech qanday oyna nomi ro'yxatga olinmagan. Avval /xomkirim <nom> <miqdor> "
+                "bilan birinchi marta qo'lda kiriting."
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(n, callback_data=f"oy:name:{n}")] for n in names
+        ]
+        await query.edit_message_text("🪟 Qaysi oyna?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("oy:name:"):
+        name = data.split(":", 2)[2]
+        oy["name"] = name
+        oy["qty"] = 1
+        await query.edit_message_text(
+            f"🪟 {name} — nechta kirim qilinadi?\n\nHozirgi son: {oy['qty']} ta",
+            reply_markup=oy_qty_keyboard(),
+        )
+        return
+
+    if data.startswith("oy:qty:"):
+        action = data.split(":", 2)[2]
+        if action == "cancel":
+            context.user_data.pop("oy", None)
+            await query.edit_message_text("Bekor qilindi.")
+            return
+        if action == "confirm":
+            name = oy.get("name")
+            amount = oy.get("qty", 1)
+            context.user_data.pop("oy", None)
+            if not name:
+                await query.edit_message_text("Xatolik: oyna tanlanmagan. Qaytadan /oyna deb yozing.")
+                return
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET quantity = quantity + excluded.quantity",
+                (name, amount),
+            )
+            conn.commit()
+            cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (name,))
+            new_qty = cur.fetchone()[0]
+            conn.close()
+            await query.edit_message_text(
+                f"✅ '{name}': +{amount} ta qo'shildi. Yangi qoldiq: {new_qty} ta."
+            )
+            return
+        step = 1 if action == "+1" else -1
+        oy["qty"] = max(1, oy.get("qty", 1) + step)
+        name = oy.get("name", "")
+        await query.edit_message_text(
+            f"🪟 {name} — nechta kirim qilinadi?\n\nHozirgi son: {oy['qty']} ta",
+            reply_markup=oy_qty_keyboard(),
+        )
+        return
 
 
 async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6064,6 +6183,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['chiqim']}$"), chiqim_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['spinka']}$"), spinka_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['oyna']}$"), oyna_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
@@ -6104,6 +6224,8 @@ def main():
     app.add_handler(CommandHandler("spinkanarxlar", spinkanarxlar))
     app.add_handler(CommandHandler("spinka", spinka_button))
     app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
+    app.add_handler(CommandHandler("oyna", oyna_button))
+    app.add_handler(CallbackQueryHandler(oyna_callback, pattern=r"^oy:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
