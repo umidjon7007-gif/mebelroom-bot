@@ -1478,6 +1478,48 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
+KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
+
+
+async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    all_models = [row[0] for row in cur.fetchall()]
+    if not all_models:
+        conn.close()
+        await update.message.reply_text("Hozircha hech qanday model ro'yxatga olinmagan.")
+        return
+
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {(m, i): q for m, i, q in cur.fetchall()}
+    total_demand = compute_all_pending_demand(cur)
+    conn.close()
+
+    results = []
+    for model in all_models:
+        counts = {}
+        for item in KOMPLEKT_ITEMS:
+            qty = stock.get((model, item), 0)
+            reserved = total_demand.get((model, item), 0)
+            counts[item] = qty - reserved
+        min_item = min(counts, key=lambda it: counts[it])
+        min_count = counts[min_item]
+        results.append((model, min_count, min_item, counts))
+
+    results.sort(key=lambda r: -r[1])
+
+    lines = ["📦 Modellar bo'yicha TAYYOR KOMPLEKT soni (erkin, band qilinmagan):\n"]
+    for model, min_count, min_item, counts in results:
+        icon = stock_indicator(min_count)
+        lines.append(f"{icon} {model.capitalize()}: {min_count} ta komplekt (yetishmovchi: {min_item})")
+
+    lines.append(
+        f"\n📝 Komplekt = {' + '.join(KOMPLEKT_ITEMS)}. Eng kam bo'lgan detal soni komplekt sonini belgilaydi."
+    )
+    await update.message.reply_text("\n".join(lines))
+
+
 async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
@@ -6032,6 +6074,7 @@ def main():
     app.add_handler(CommandHandler("chiqim", chiqim))
     app.add_handler(CommandHandler("qoldiq", qoldiq))
     app.add_handler(CommandHandler("modellar", modellar))
+    app.add_handler(CommandHandler("komplektlar", komplektlar))
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("ochir", ochir))
     app.add_handler(CommandHandler("tozalash", tozalash))
