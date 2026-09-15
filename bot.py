@@ -1357,6 +1357,21 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await ob_finalize_order(update, context)
         return
 
+    if awaiting == "new_oyna_name":
+        context.user_data["awaiting"] = None
+        name = text.strip().lower()
+        if not name:
+            await update.message.reply_text("Nom bo'sh bo'lmasligi kerak. Qaytadan /oyna deb yozing.")
+            return
+        oy = context.user_data.setdefault("oy", {})
+        oy["name"] = name
+        oy["qty"] = 1
+        await update.message.reply_text(
+            f"🪟 {name} — nechta kirim qilinadi?\n\nHozirgi son: {oy['qty']} ta",
+            reply_markup=oy_qty_keyboard(),
+        )
+        return
+
     if awaiting == "worker_name_for_order":
         guruh_id = context.user_data.get("pending_order_id")
         context.user_data["awaiting"] = None
@@ -2538,16 +2553,16 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT DISTINCT name FROM xomashyo WHERE name LIKE '%oyna%' ORDER BY name")
         names = [row[0] for row in cur.fetchall()]
         conn.close()
-        if not names:
-            await query.edit_message_text(
-                "Hali hech qanday oyna nomi ro'yxatga olinmagan. Avval /xomkirim <nom> <miqdor> "
-                "bilan birinchi marta qo'lda kiriting."
-            )
-            return
         buttons = [
             [InlineKeyboardButton(n, callback_data=f"oy:name:{n}")] for n in names
         ]
+        buttons.append([InlineKeyboardButton("➕ Yangi oyna turi", callback_data="oy:newname")])
         await query.edit_message_text("🪟 Qaysi oyna?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "oy:newname":
+        context.user_data["awaiting"] = "new_oyna_name"
+        await query.edit_message_text("✍️ Yangi oyna turining nomini yozing (masalan: laura-oyna):")
         return
 
     if data.startswith("oy:name:"):
