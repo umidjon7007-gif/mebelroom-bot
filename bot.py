@@ -2527,15 +2527,17 @@ def oyna_usage_label(cur, xomashyo_name):
         (xomashyo_name,),
     )
     rows = cur.fetchall()
+    if not rows:
+        return ""
     models = sorted({m for m, _ in rows})
     items = sorted({i for _, i in rows})
-    # Faqat bir nechta modelga umumiy bo'lsa, qisqa izoh ko'rsatamiz;
-    # bitta modelga xos bo'lsa, nomning o'zi yetarli (izoh shart emas).
-    if len(models) < 2:
-        return ""
-    if len(items) == 1:
-        return " (" + ", ".join(models) + " — " + items[0] + ")"
-    return " (" + ", ".join(f"{m} {i}" for m, i in rows) + ")"
+    # Bir nechta modelga umumiy bo'lsa — model nomlarini ko'rsatamiz;
+    # bitta modelga xos bo'lsa — faqat detal(lar) nomini ko'rsatamiz (model nomi shart emas).
+    if len(models) >= 2:
+        if len(items) == 1:
+            return " (" + ", ".join(models) + " — " + items[0] + ")"
+        return " (" + ", ".join(f"{m} {i}" for m, i in rows) + ")"
+    return " (" + ", ".join(items) + ")"
 
 
 async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
