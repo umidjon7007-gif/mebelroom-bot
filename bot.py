@@ -2523,14 +2523,19 @@ def oy_qty_keyboard():
 
 def oyna_usage_label(cur, xomashyo_name):
     cur.execute(
-        "SELECT DISTINCT model, item FROM xomashyo_tarkibi WHERE xomashyo = ? ORDER BY model, item",
+        "SELECT DISTINCT model, item FROM xomashyo_tarkibi WHERE xomashyo = ? ORDER BY model",
         (xomashyo_name,),
     )
     rows = cur.fetchall()
-    if not rows:
+    models = sorted({m for m, _ in rows})
+    items = sorted({i for _, i in rows})
+    # Faqat bir nechta modelga umumiy bo'lsa, qisqa izoh ko'rsatamiz;
+    # bitta modelga xos bo'lsa, nomning o'zi yetarli (izoh shart emas).
+    if len(models) < 2:
         return ""
-    parts = [f"{model} {item}" for model, item in rows]
-    return " (" + ", ".join(parts) + ")"
+    if len(items) == 1:
+        return " (" + ", ".join(models) + " — " + items[0] + ")"
+    return " (" + ", ".join(f"{m} {i}" for m, i in rows) + ")"
 
 
 async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
