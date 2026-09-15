@@ -971,7 +971,7 @@ def ob_item_keyboard(ob):
     buttons = []
     for it in ob["item_list"]:
         label = f"✅ {it} ({ob['items'][it]})" if it in ob["items"] else it
-        buttons.append([InlineKeyboardButton(label, callback_data=f"ob:item:{ob['item_list'].index(it)}")])
+        buttons.append([InlineKeyboardButton(label, callback_data=f"ob:item:{it}")])
     buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:komplekt")])
     buttons.append([InlineKeyboardButton("🔁 Boshqa modeldan qo'shish", callback_data="ob:othermodel")])
     if ob["items"] or ob.get("extra_items") or ob["komplekt"]:
@@ -1221,18 +1221,18 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ob["other_model_pending"] = other_model
         ob["other_item_list"] = other_item_list
         buttons = [
-            [InlineKeyboardButton(it, callback_data=f"ob:othermodel:item:{i}")]
-            for i, it in enumerate(other_item_list)
+            [InlineKeyboardButton(it, callback_data=f"ob:othermodel:item:{other_model}|{it}")]
+            for it in other_item_list
         ]
-        buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:othermodel:komplekt")])
+        buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data=f"ob:othermodel:komplekt:{other_model}")])
         buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ob:othermodel")])
         await query.edit_message_text(
             f"🔁 {other_model.capitalize()} — qaysi detal?", reply_markup=InlineKeyboardMarkup(buttons)
         )
         return
 
-    if data == "ob:othermodel:komplekt":
-        other_model = ob["other_model_pending"]
+    if data.startswith("ob:othermodel:komplekt:"):
+        other_model = data.split(":", 3)[3]
         ob["qty_mode"] = "other_item"
         ob["qty_other_model"] = other_model
         ob["qty_item"] = None
@@ -1241,18 +1241,17 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("ob:othermodel:item:"):
-        idx = int(data.split(":", 3)[3])
-        item = ob["other_item_list"][idx]
+        rest = data[len("ob:othermodel:item:"):]
+        other_model, item = rest.split("|", 1)
         ob["qty_mode"] = "other_item"
-        ob["qty_other_model"] = ob["other_model_pending"]
+        ob["qty_other_model"] = other_model
         ob["qty_item"] = item
-        ob["qty_value"] = ob["extra_items"].get((ob["qty_other_model"], item), 1)
+        ob["qty_value"] = ob["extra_items"].get((other_model, item), 1)
         await query.edit_message_text(ob_qty_text(ob), reply_markup=ob_qty_keyboard())
         return
 
     if data.startswith("ob:item:"):
-        idx = int(data.split(":", 2)[2])
-        item = ob["item_list"][idx]
+        item = data[len("ob:item:"):]
         ob["qty_mode"] = "item"
         ob["qty_item"] = item
         ob["qty_value"] = ob["items"].get(item, 1)
