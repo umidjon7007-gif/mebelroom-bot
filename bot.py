@@ -2522,6 +2522,18 @@ def oy_qty_keyboard():
     )
 
 
+def oyna_usage_label(cur, xomashyo_name):
+    cur.execute(
+        "SELECT DISTINCT model, item FROM xomashyo_tarkibi WHERE xomashyo = ? ORDER BY model, item",
+        (xomashyo_name,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return ""
+    parts = [f"{model} {item}" for model, item in rows]
+    return " (" + ", ".join(parts) + ")"
+
+
 async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await update.callback_query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
@@ -2537,13 +2549,15 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = conn.cursor()
         cur.execute("SELECT name, quantity FROM xomashyo WHERE name LIKE '%oyna%' ORDER BY name")
         rows = cur.fetchall()
-        conn.close()
         if not rows:
+            conn.close()
             await query.edit_message_text("Oyna ombori hozircha bo'sh.")
             return
         lines = ["🪟 Oyna qoldig'i:\n"]
         for name, qty in rows:
-            lines.append(f"{stock_indicator(qty)} {name}: {qty} ta")
+            label = oyna_usage_label(cur, name)
+            lines.append(f"{stock_indicator(qty)} {name}{label}: {qty} ta")
+        conn.close()
         await query.edit_message_text("\n".join(lines))
         return
 
@@ -2552,10 +2566,11 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT name FROM xomashyo WHERE name LIKE '%oyna%' ORDER BY name")
         names = [row[0] for row in cur.fetchall()]
+        buttons = []
+        for n in names:
+            label = oyna_usage_label(cur, n)
+            buttons.append([InlineKeyboardButton(f"{n}{label}", callback_data=f"oy:name:{n}")])
         conn.close()
-        buttons = [
-            [InlineKeyboardButton(n, callback_data=f"oy:name:{n}")] for n in names
-        ]
         buttons.append([InlineKeyboardButton("➕ Yangi oyna turi", callback_data="oy:newname")])
         await query.edit_message_text("🪟 Qaysi oyna?", reply_markup=InlineKeyboardMarkup(buttons))
         return
