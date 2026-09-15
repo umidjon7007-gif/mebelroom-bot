@@ -2532,12 +2532,18 @@ def oyna_usage_label(cur, xomashyo_name):
     models = sorted({m for m, _ in rows})
     items = sorted({i for _, i in rows})
     # Bir nechta modelga umumiy bo'lsa — model nomlarini ko'rsatamiz;
-    # bitta modelga xos bo'lsa — faqat detal(lar) nomini ko'rsatamiz (model nomi shart emas).
+    # bitta modelga xos bo'lsa — detal(lar) nomini ko'rsatamiz, lekin faqat
+    # nom ichida u allaqachon yozilmagan bo'lsa (masalan "bella-kamod-oyna"
+    # nomida "kamod" allaqachon bor — qayta yozish shart emas).
     if len(models) >= 2:
         if len(items) == 1:
             return " (" + ", ".join(models) + " — " + items[0] + ")"
         return " (" + ", ".join(f"{m} {i}" for m, i in rows) + ")"
-    return " (" + ", ".join(items) + ")"
+    name_lower = xomashyo_name.lower()
+    missing_items = [i for i in items if i.lower() not in name_lower]
+    if not missing_items:
+        return ""
+    return " (" + ", ".join(missing_items) + ")"
 
 
 async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
