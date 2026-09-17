@@ -2447,6 +2447,122 @@ def log_spinka_work(worker, model_display, amount):
     )
 
 
+async def kirimmodeltuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Xato modelga kirim qilingan bo'lsa (masalan 'vena' o'rniga 'aven' deb yozib yuborilgan), "
+        "zaxirani, xomashyoni va ishchi puli yozuvini TO'G'RI modelga ko'chiradi.\n\n"
+        "Foydalanish:\n"
+        "/kirimmodeltuzatish <eski model> -> <yangi model>\n"
+        "<detal> <miqdor>\n"
+        "<detal> <miqdor>\n"
+        "...\n\n"
+        "Misol:\n"
+        "/kirimmodeltuzatish aven -> vena\n"
+        "krovat 9\n"
+        "kamod 1\n"
+        "parta 1\n"
+        "shkaf 1\n"
+        "tumba 1"
+    )
+    text = update.message.text or ""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 2 or "->" not in lines[0]:
+        await update.message.reply_text(usage)
+        return
+
+    header = lines[0].split("->")
+    # Birinchi qatordagi "/kirimmodeltuzatish " prefiksini olib tashlaymiz
+    old_model = header[0].replace("/kirimmodeltuzatish", "").strip().lower()
+    new_model = header[1].strip().lower()
+    item_lines = lines[1:]
+
+    if not old_model or not new_model:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    results = []
+    bad_lines = []
+    for ln in item_lines:
+        tokens = ln.split()
+        if len(tokens) != 2 or not tokens[1].isdigit():
+            bad_lines.append(ln)
+            continue
+        item, amount = tokens[0].lower(), int(tokens[1])
+
+        # 1) Zaxirani ko'chirish: eski modeldan ayirib, yangi modelga qo'shamiz
+        old_key = normalize_product_name(f"{old_model} {item}")
+        new_key = normalize_product_name(f"{new_model} {item}")
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (old_key,))
+        old_row = cur.fetchone()
+        old_qty = old_row[0] if old_row else 0
+        cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (old_qty - amount, old_key))
+
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (new_key,))
+        new_row = cur.fetchone()
+        if new_row is None:
+            cur.execute(
+                "INSERT INTO products (name, model, item, quantity) VALUES (?, ?, ?, ?)",
+                (new_key, new_model, item, amount),
+            )
+        else:
+            cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_row[0] + amount, new_key))
+
+        # 2) Xomashyoni to'g'irlash: eski model tarkibini qaytarib, yangi model tarkibini ayiramiz
+        old_needs = get_xom_requirements(cur, old_model, item)
+        new_needs = get_xom_requirements(cur, new_model, item)
+        xom_names = set(old_needs) | set(new_needs)
+        for xomashyo in xom_names:
+            delta = (old_needs.get(xomashyo, 0) - new_needs.get(xomashyo, 0)) * amount
+            if delta:
+                cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+                xrow = cur.fetchone()
+                current_xom = xrow[0] if xrow else 0
+                cur.execute(
+                    "UPDATE xomashyo SET quantity = ? WHERE name = ?", (current_xom + delta, xomashyo)
+                )
+
+        # 3) Ishchi puli yozuvini to'g'irlash: eng oxirgi mos, to'lanmagan upakovka yozuvini topib,
+        # modelini yangilaymiz va yangi modelning narxi bo'yicha qayta hisoblaymiz.
+        cur.execute(
+            """
+            SELECT id, worker FROM work_log
+            WHERE turi = 'upakovka' AND model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE
+                  AND amount = ? AND paid = 0
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (old_model, item, amount),
+        )
+        wl_row = cur.fetchone()
+        pay_note = ""
+        if wl_row:
+            log_id, worker = wl_row
+            new_rate = get_rate(cur, "upakovka", new_model, item)
+            new_total = amount * new_rate
+            cur.execute(
+                "UPDATE work_log SET model = ?, rate = ?, total = ? WHERE id = ?",
+                (new_model, new_rate, new_total, log_id),
+            )
+            pay_note = f", {worker} puli qayta hisoblandi: {format_money(new_total, 'som')}"
+
+        results.append(f"• {old_model} {item} ({amount} ta) → {new_model} {item}{pay_note}")
+
+    conn.commit()
+    conn.close()
+
+    reply = [f"✅ {len(results)} ta ko'chirildi:"]
+    reply.extend(results)
+    if bad_lines:
+        reply.append(f"\n⚠️ Tushunilmadi ({len(bad_lines)} qator):")
+        reply.extend(f"  {ln}" for ln in bad_lines)
+    await update.message.reply_text("\n".join(reply))
+
+
 async def spinkaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -6269,6 +6385,7 @@ def main():
     app.add_handler(CommandHandler("oyna", oyna_button))
     app.add_handler(CallbackQueryHandler(oyna_callback, pattern=r"^oy:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
+    app.add_handler(CommandHandler("kirimmodeltuzatish", kirimmodeltuzatish))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
