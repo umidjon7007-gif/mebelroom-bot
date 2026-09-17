@@ -2447,6 +2447,98 @@ def log_spinka_work(worker, model_display, amount):
     )
 
 
+async def kirimbekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Butunlay xato/ortiqcha kiritilgan kirimni to'liq bekor qiladi (zaxiradan ayiradi, "
+        "xomashyoni qaytaradi, ishchi puli yozuvini o'chiradi) — masalan boshqa modelga "
+        "(masalan 'vena') alohida to'g'ri kiritilgan bo'lsa-yu, xatolik bilan yana bir marta "
+        "boshqa nom bilan (masalan 'aven') ham kiritib yuborilgan bo'lsa.\n\n"
+        "Foydalanish:\n"
+        "/kirimbekor <model>\n"
+        "<detal> <miqdor>\n"
+        "<detal> <miqdor>\n"
+        "...\n\n"
+        "Misol:\n"
+        "/kirimbekor aven\n"
+        "krovat 9\n"
+        "kamod 1\n"
+        "parta 1\n"
+        "shkaf 1\n"
+        "tumba 1"
+    )
+    text = update.message.text or ""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    model = lines[0].replace("/kirimbekor", "").strip().lower()
+    item_lines = lines[1:]
+    if not model:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    results = []
+    bad_lines = []
+    for ln in item_lines:
+        tokens = ln.split()
+        if len(tokens) != 2 or not tokens[1].isdigit():
+            bad_lines.append(ln)
+            continue
+        item, amount = tokens[0].lower(), int(tokens[1])
+
+        # 1) Zaxiradan ayiramiz
+        key = normalize_product_name(f"{model} {item}")
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (key,))
+        row = cur.fetchone()
+        current_qty = row[0] if row else 0
+        cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (current_qty - amount, key))
+
+        # 2) Xomashyoni qaytaramiz (agar tarkib belgilangan bo'lsa)
+        xom_needs = get_xom_requirements(cur, model, item)
+        for xomashyo, per_unit in xom_needs.items():
+            need = per_unit * amount
+            cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+            xrow = cur.fetchone()
+            current_xom = xrow[0] if xrow else 0
+            cur.execute("UPDATE xomashyo SET quantity = ? WHERE name = ?", (current_xom + need, xomashyo))
+
+        # 3) Bog'liq to'lanmagan upakovka ishchi puli yozuvini o'chiramiz
+        cur.execute(
+            """
+            SELECT id, worker, total FROM work_log
+            WHERE turi = 'upakovka' AND model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE
+                  AND amount = ? AND paid = 0
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (model, item, amount),
+        )
+        wl_row = cur.fetchone()
+        pay_note = ""
+        if wl_row:
+            log_id, worker, total = wl_row
+            cur.execute("DELETE FROM work_log WHERE id = ?", (log_id,))
+            pay_note = f", {worker}ning {format_money(total, 'som')} puli ham bekor qilindi"
+
+        results.append(f"• {model} {item}: -{amount} ta bekor qilindi (yangi qoldiq: {current_qty - amount}){pay_note}")
+
+    conn.commit()
+    conn.close()
+
+    reply = [f"✅ {len(results)} ta bekor qilindi:"]
+    reply.extend(results)
+    if bad_lines:
+        reply.append(f"\n⚠️ Tushunilmadi ({len(bad_lines)} qator):")
+        reply.extend(f"  {ln}" for ln in bad_lines)
+    await update.message.reply_text("\n".join(reply))
+
+
 async def kirimmodeltuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -6386,6 +6478,7 @@ def main():
     app.add_handler(CallbackQueryHandler(oyna_callback, pattern=r"^oy:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("kirimmodeltuzatish", kirimmodeltuzatish))
+    app.add_handler(CommandHandler("kirimbekor", kirimbekor))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
