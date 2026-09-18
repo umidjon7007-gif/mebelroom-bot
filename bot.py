@@ -3308,11 +3308,31 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     guruh_id = int(args[0])
     new_amount = int(args[-1])
     middle = args[1:-1]
-    model_display = middle[0].lower()
-    item_display = " ".join(middle[1:]).lower() if len(middle) > 1 else "komplekt"
+    if not middle:
+        await update.message.reply_text(usage)
+        return
 
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    lowered = [a.lower() for a in middle]
+    model_display = None
+    remaining_tokens = lowered
+    for candidate in all_models:
+        tokens = candidate.split()
+        if lowered[: len(tokens)] == tokens:
+            model_display = candidate
+            remaining_tokens = lowered[len(tokens):]
+            break
+    if model_display is None:
+        # Mos model topilmadi - eski xatti-harakat bilan orqaga qaytamiz (birinchi so'z model)
+        model_display = lowered[0]
+        remaining_tokens = lowered[1:]
+
+    item_display = " ".join(remaining_tokens) if remaining_tokens else "komplekt"
     cur.execute(
         "SELECT deadline, deadline_display, customer, status, dastavka FROM orders WHERE guruh_id = ? LIMIT 1",
         (guruh_id,),
@@ -5735,7 +5755,7 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
         what = f"{model} komplekt" if item is None else f"{model} {item}"
         mod_note = " (➕ qo'shimcha)" if mod_type == "+" else ""
         result_lines.append(
-            f"• {target_item}: -{deduct}{warn}" if item is None else f"• {what}: -{deduct}{mod_note}{warn}"
+            f"• {model} {target_item}: -{deduct}{warn}" if item is None else f"• {what}: -{deduct}{mod_note}{warn}"
         )
 
     payment_total = 0
