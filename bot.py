@@ -6207,34 +6207,23 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     grand_total = 0
-    chunks = []
-    current_chunk = ["💰 To'lanmagan maoshlar:"]
-
-    def chunk_len(lines_list):
-        return sum(len(l) + 1 for l in lines_list)
+    all_lines = ["💰 To'lanmagan maoshlar:"]
 
     for worker in workers:
         lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
         grand_total += worker_total
 
-        worker_block = [f"\n👷 {worker}:"]
-        worker_block.extend(lines)
-        worker_block.extend(f"  {t}" for t in format_turi_totals(turi_totals))
-        worker_block.append(f"  Jami: {format_money(worker_total, 'som')}")
+        all_lines.append(f"\n👷 {worker}:")
+        all_lines.extend(lines)
+        all_lines.extend(f"  {t}" for t in format_turi_totals(turi_totals))
+        all_lines.append(f"  Jami: {format_money(worker_total, 'som')}")
 
-        if chunk_len(current_chunk) + chunk_len(worker_block) > 3500:
-            chunks.append(current_chunk)
-            current_chunk = []
-        current_chunk.extend(worker_block)
-
-    chunks.append(current_chunk)
     conn.close()
 
-    chunks[-1].append(f"\n\n💰 UMUMIY JAMI: {format_money(grand_total, 'som')}")
-    chunks[-1].append("\nTo'langanda: /tolandi <ism>  |  Batafsil: /maosh <ism>")
+    all_lines.append(f"\n\n💰 UMUMIY JAMI: {format_money(grand_total, 'som')}")
+    all_lines.append("\nTo'langanda: /tolandi <ism>  |  Batafsil: /maosh <ism>")
 
-    for chunk in chunks:
-        await update.message.reply_text("\n".join(chunk))
+    await send_chunked(update.message, all_lines)
 
 
 async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
