@@ -6028,7 +6028,8 @@ def build_worker_maosh_lines(cur, worker):
     """Bitta ishchining to'lanmagan ishlarini ixcham qatorlarga yig'adi:
     yig'ish ishlari BUYURTMA RAQAMI va TARKIBI (masalan 'Vena komplekt' yoki
     'Kafino: krovat, parta') bo'yicha guruhlanadi, upakovka ishlari esa
-    detal bo'yicha ko'rsatiladi. Qaytaradi: (lines, worker_total)."""
+    detal bo'yicha ko'rsatiladi. Qaytaradi: (lines, worker_total, turi_totals) -
+    turi_totals {'upakovka': N, 'yigish': N, 'spinka': N} har bir turi bo'yicha jami."""
     cur.execute(
         """
         SELECT wl.turi, wl.model, wl.item, wl.amount, wl.rate, wl.total, wl.created_at, o.guruh_id
@@ -6041,14 +6042,16 @@ def build_worker_maosh_lines(cur, worker):
     )
     rows = cur.fetchall()
     if not rows:
-        return [], 0
+        return [], 0, {}
 
     yigish_by_guruh = {}
     other_by_turi_model = {}
     worker_total = 0
+    turi_totals = {}
 
     for turi, model, item, amount, rate, total, created_at, guruh_id in rows:
         worker_total += total
+        turi_totals[turi] = turi_totals.get(turi, 0) + total
         date_part = created_at.split("T")[0] if created_at else "-"
         if turi == "yigish" and guruh_id is not None:
             entry = yigish_by_guruh.setdefault(guruh_id, {"total": 0, "date": date_part})
@@ -6082,7 +6085,17 @@ def build_worker_maosh_lines(cur, worker):
                 f"{format_money(total, 'som')}  ({date_part})"
             )
 
-    return lines, worker_total
+    return lines, worker_total, turi_totals
+
+
+def format_turi_totals(turi_totals):
+    """turi_totals lug'atini o'qiladigan qatorlarga aylantiradi."""
+    turi_label = {"yigish": "🚚 Yig'ish", "upakovka": "📦 Upakovka", "spinka": "🔨 Spinka"}
+    out = []
+    for turi in ("yigish", "upakovka", "spinka"):
+        if turi in turi_totals:
+            out.append(f"{turi_label[turi]}: {format_money(turi_totals[turi], 'som')}")
+    return out
 
 
 async def send_chunked(message_obj, lines, limit=3500):
@@ -6120,7 +6133,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner:
         # Bog'langan ishchi - faqat O'ZINING maoshini ko'radi, boshqa argument shart emas.
         worker = linked_worker
-        lines, worker_total = build_worker_maosh_lines(cur, worker)
+        lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
         conn.close()
 
         if not lines:
@@ -6129,13 +6142,15 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text_lines = [f"👷 {worker} — sizning to'lanmagan ishlaringiz:\n"]
         text_lines.extend(lines)
+        text_lines.append("")
+        text_lines.extend(format_turi_totals(turi_totals))
         text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
         await send_chunked(update.message, text_lines)
         return
 
     if args:
         worker = " ".join(args)
-        lines, worker_total = build_worker_maosh_lines(cur, worker)
+        lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
         conn.close()
 
         if not lines:
@@ -6144,6 +6159,8 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text_lines = [f"👷 {worker} — to'lanmagan ishlar:\n"]
         text_lines.extend(lines)
+        text_lines.append("")
+        text_lines.extend(format_turi_totals(turi_totals))
         text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
         text_lines.append(f"\nTo'langanda: /tolandi {worker}")
         await send_chunked(update.message, text_lines)
@@ -6167,11 +6184,12 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sum(len(l) + 1 for l in lines_list)
 
     for worker in workers:
-        lines, worker_total = build_worker_maosh_lines(cur, worker)
+        lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
         grand_total += worker_total
 
         worker_block = [f"\n👷 {worker}:"]
         worker_block.extend(lines)
+        worker_block.extend(f"  {t}" for t in format_turi_totals(turi_totals))
         worker_block.append(f"  Jami: {format_money(worker_total, 'som')}")
 
         if chunk_len(current_chunk) + chunk_len(worker_block) > 3500:
