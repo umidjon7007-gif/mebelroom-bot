@@ -6085,6 +6085,26 @@ def build_worker_maosh_lines(cur, worker):
     return lines, worker_total
 
 
+async def send_chunked(message_obj, lines, limit=3500):
+    """Uzun matnni Telegram belgi chegarasidan (4096) oshib ketmasligi uchun,
+    qatorlar ro'yxatini bir nechta xabarga bo'lib yuboradi."""
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > limit:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await message_obj.reply_text("\n".join(chunk))
+
+
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = is_owner(update)
     linked_worker = get_linked_worker(update)
@@ -6110,7 +6130,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_lines = [f"👷 {worker} — sizning to'lanmagan ishlaringiz:\n"]
         text_lines.extend(lines)
         text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
-        await update.message.reply_text("\n".join(text_lines))
+        await send_chunked(update.message, text_lines)
         return
 
     if args:
@@ -6126,7 +6146,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_lines.extend(lines)
         text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
         text_lines.append(f"\nTo'langanda: /tolandi {worker}")
-        await update.message.reply_text("\n".join(text_lines))
+        await send_chunked(update.message, text_lines)
         return
 
     cur.execute(
@@ -6414,17 +6434,26 @@ async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
         return  # vaqtinchalik tarmoq muammosi - bot o'zi qayta urinadi, egani bezovta qilmaymiz
 
     if OWNER_ID is not None:
+        update_info = ""
+        if isinstance(update, Update) and update.effective_message:
+            update_info = f"Xabar: {update.effective_message.text}\n\n"
         try:
-            update_info = ""
-            if isinstance(update, Update) and update.effective_message:
-                update_info = f"Xabar: {update.effective_message.text}\n\n"
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=f"🐞 Botda kutilmagan xato yuz berdi:\n\n{update_info}```\n{tb_short}\n```",
                 parse_mode="Markdown",
             )
         except Exception:
-            pass  # xato haqida xabar berishning o'zi xato bersa, jim o'tkazamiz
+            # Markdown yuborish muvaffaqiyatsiz bo'lsa (masalan tracebackda maxsus
+            # belgilar bo'lsa), oddiy (formatsiz) matn bilan qayta urinamiz -
+            # shunda xato haqida xabar HAR DOIM yetib boradi, jim yo'qolib qolmaydi.
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=f"🐞 Botda kutilmagan xato yuz berdi:\n\n{update_info}{tb_short}",
+                )
+            except Exception:
+                pass  # ikkinchi urinish ham muvaffaqiyatsiz bo'lsa, jim o'tkazamiz
 
 
 def main():
