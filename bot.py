@@ -1898,6 +1898,36 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def maoshdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT worker, COUNT(*), SUM(total) FROM work_log WHERE paid = 0 GROUP BY worker"
+    )
+    grouped_rows = cur.fetchall()
+    cur.execute("SELECT DISTINCT worker FROM work_log WHERE paid = 0 ORDER BY worker")
+    distinct_rows = cur.fetchall()
+    conn.close()
+
+    lines = ["🔍 Tashxis — to'lanmagan ishlar (worker ustuni bo'yicha, GROUP BY):\n"]
+    if not grouped_rows:
+        lines.append("(hech qanday to'lanmagan yozuv yo'q)")
+    for worker, count, total in grouped_rows:
+        lines.append(f"• repr={worker!r} — {count} ta yozuv, jami {format_money(total or 0, 'som')}")
+
+    lines.append("\n🔍 SELECT DISTINCT worker natijasi:\n")
+    if not distinct_rows:
+        lines.append("(bo'sh)")
+    for (worker,) in distinct_rows:
+        lines.append(f"• repr={worker!r}")
+
+    await send_chunked(update.message, lines)
+
+
 async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
@@ -6563,6 +6593,7 @@ def main():
     app.add_handler(CommandHandler("ishchilar", ishchilar))
     app.add_handler(CommandHandler("ishchiulash", ishchiulash))
     app.add_handler(CommandHandler("maosh", maosh))
+    app.add_handler(CommandHandler("maoshdebug", maoshdebug))
     app.add_handler(CommandHandler("kopsotilgan", kopsotilgan))
     app.add_handler(CommandHandler("mijozhisob", mijozhisob))
     app.add_handler(CommandHandler("tolandi", tolandi))
