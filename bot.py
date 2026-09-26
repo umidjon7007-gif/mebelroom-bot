@@ -3399,6 +3399,67 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Hali 'kutilmoqda' holatidagi buyurtmaning MUDDATINI o'zgartiradi "
+        "(mijoz muddatni ko'chirganda ishlatiladi).\n\n"
+        "Foydalanish: /muddattuzatish <buyurtma raqami> <kun> <oy>\n"
+        "Misol: /muddattuzatish 112 20 oktyabr"
+    )
+    if len(args) != 3 or not args[0].isdigit() or not args[1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    day = int(args[1])
+    month_word = args[2].lower()
+    if month_word not in MONTH_NAMES:
+        await update.message.reply_text(
+            f"Oy nomi tushunarsiz: '{month_word}'.\n\n" + usage
+        )
+        return
+    month = MONTH_NAMES[month_word]
+    new_deadline = compute_deadline(day, month)
+    if new_deadline is None:
+        await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status, deadline_display FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    status, old_display = row
+    if status != "kutilmoqda":
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} hozir 'kutilmoqda' holatida emas — bu buyruq faqat hali topshirilmagan "
+            "buyurtmalar uchun ishlaydi."
+        )
+        return
+
+    new_display = f"{day} {month_word}"
+    cur.execute(
+        "UPDATE orders SET deadline = ?, deadline_display = ? WHERE guruh_id = ?",
+        (new_deadline.isoformat(), new_display, guruh_id),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ №{guruh_id} muddati tuzatildi: {old_display} → {new_display}"
+    )
+
+
 async def buyurtmatuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -6552,6 +6613,7 @@ def main():
     app.add_handler(CommandHandler("tolovtuzatish", tolovtuzatish))
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
+    app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
