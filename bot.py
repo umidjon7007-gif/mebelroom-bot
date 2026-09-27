@@ -366,6 +366,17 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS avanslar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker TEXT NOT NULL COLLATE NOCASE,
+            amount INTEGER NOT NULL,
+            settled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -6266,6 +6277,11 @@ async def send_chunked(message_obj, lines, limit=3500):
         await message_obj.reply_text("\n".join(chunk))
 
 
+def get_avans_total(cur, worker):
+    cur.execute("SELECT SUM(amount) FROM avanslar WHERE worker = ? AND settled = 0", (worker,))
+    return cur.fetchone()[0] or 0
+
+
 async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = is_owner(update)
     linked_worker = get_linked_worker(update)
@@ -6282,6 +6298,7 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Bog'langan ishchi - faqat O'ZINING maoshini ko'radi, boshqa argument shart emas.
         worker = linked_worker
         lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
+        avans_total = get_avans_total(cur, worker)
         conn.close()
 
         if not lines:
@@ -6292,13 +6309,17 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_lines.extend(lines)
         text_lines.append("")
         text_lines.extend(format_turi_totals(turi_totals))
-        text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
+        text_lines.append(f"\n💰 Jami ishlagan: {format_money(worker_total, 'som')}")
+        if avans_total:
+            text_lines.append(f"💵 Avans olingan: {format_money(avans_total, 'som')}")
+            text_lines.append(f"❗ Qolgan: {format_money(worker_total - avans_total, 'som')}")
         await send_chunked(update.message, text_lines)
         return
 
     if args:
         worker = " ".join(args)
         lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
+        avans_total = get_avans_total(cur, worker)
         conn.close()
 
         if not lines:
@@ -6309,7 +6330,10 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_lines.extend(lines)
         text_lines.append("")
         text_lines.extend(format_turi_totals(turi_totals))
-        text_lines.append(f"\n💰 Jami to'lanmagan: {format_money(worker_total, 'som')}")
+        text_lines.append(f"\n💰 Jami ishlagan: {format_money(worker_total, 'som')}")
+        if avans_total:
+            text_lines.append(f"💵 Avans olingan: {format_money(avans_total, 'som')}")
+            text_lines.append(f"❗ Qolgan: {format_money(worker_total - avans_total, 'som')}")
         text_lines.append(f"\nTo'langanda: /tolandi {worker}")
         await send_chunked(update.message, text_lines)
         return
@@ -6317,7 +6341,12 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute(
         "SELECT DISTINCT worker FROM work_log WHERE paid = 0 ORDER BY worker"
     )
-    workers = [row[0] for row in cur.fetchall()]
+    workers_with_work = [row[0] for row in cur.fetchall()]
+    cur.execute(
+        "SELECT DISTINCT worker FROM avanslar WHERE settled = 0 ORDER BY worker"
+    )
+    workers_with_avans = [row[0] for row in cur.fetchall()]
+    workers = sorted(set(workers_with_work) | set(workers_with_avans), key=str.lower)
 
     if not workers:
         conn.close()
@@ -6325,23 +6354,78 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     grand_total = 0
+    grand_avans = 0
     all_lines = ["💰 To'lanmagan maoshlar:"]
 
     for worker in workers:
         lines, worker_total, turi_totals = build_worker_maosh_lines(cur, worker)
+        avans_total = get_avans_total(cur, worker)
         grand_total += worker_total
+        grand_avans += avans_total
 
         all_lines.append(f"\n👷 {worker}:")
         all_lines.extend(lines)
         all_lines.extend(f"  {t}" for t in format_turi_totals(turi_totals))
-        all_lines.append(f"  Jami: {format_money(worker_total, 'som')}")
+        all_lines.append(f"  Ishlagan: {format_money(worker_total, 'som')}")
+        if avans_total:
+            all_lines.append(f"  Avans: {format_money(avans_total, 'som')}")
+            all_lines.append(f"  Qolgan: {format_money(worker_total - avans_total, 'som')}")
 
     conn.close()
 
-    all_lines.append(f"\n\n💰 UMUMIY JAMI: {format_money(grand_total, 'som')}")
-    all_lines.append("\nTo'langanda: /tolandi <ism>  |  Batafsil: /maosh <ism>")
+    all_lines.append(f"\n\n💰 UMUMIY ISHLAGAN: {format_money(grand_total, 'som')}")
+    if grand_avans:
+        all_lines.append(f"💵 UMUMIY AVANS: {format_money(grand_avans, 'som')}")
+        all_lines.append(f"❗ UMUMIY QOLGAN: {format_money(grand_total - grand_avans, 'som')}")
+    all_lines.append("\nTo'langanda: /tolandi <ism>  |  Avans: /avans <ism> <summa>  |  Batafsil: /maosh <ism>")
 
     await send_chunked(update.message, all_lines)
+
+
+async def avans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if len(args) < 2 or not args[-1].isdigit():
+        await update.message.reply_text(
+            "Ishchiga hali barcha ishi tugamagan bo'lsa ham, oraliq pul (avans) berilganini "
+            "qayd etadi — umumiy qarzdan avtomatik ayriladi.\n\n"
+            "Foydalanish: /avans <ishchi ismi> <summa>\n"
+            "Misol: /avans Hojiakbar 2000000"
+        )
+        return
+
+    worker = " ".join(args[:-1])
+    amount = int(args[-1])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT SUM(total) FROM work_log WHERE worker = ? AND paid = 0", (worker,))
+    work_total = cur.fetchone()[0] or 0
+    cur.execute("SELECT SUM(amount) FROM avanslar WHERE worker = ? AND settled = 0", (worker,))
+    prev_avans = cur.fetchone()[0] or 0
+
+    now = datetime.now(TASHKENT_TZ).isoformat()
+    cur.execute(
+        "INSERT INTO avanslar (worker, amount, settled, created_at) VALUES (?, ?, 0, ?)",
+        (worker, amount, now),
+    )
+    conn.commit()
+    conn.close()
+
+    qolgan = work_total - prev_avans - amount
+    lines = [f"✅ {worker} — avans: {format_money(amount, 'som')} yozildi."]
+    lines.append(f"\n📊 Ishlagan (jami): {format_money(work_total, 'som')}")
+    lines.append(f"💵 Avans (jami, shu bilan): {format_money(prev_avans + amount, 'som')}")
+    if qolgan > 0:
+        lines.append(f"❗ Qolgan qarz: {format_money(qolgan, 'som')}")
+    elif qolgan < 0:
+        lines.append(f"⚠️ Ishlagan ishidan {format_money(abs(qolgan), 'som')} ko'proq avans olingan.")
+    else:
+        lines.append("✅ Hisob teng.")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6359,18 +6443,26 @@ async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT SUM(total), COUNT(*) FROM work_log WHERE worker = ? AND paid = 0", (worker,))
     total, count = cur.fetchone()
-    if not total:
+    cur.execute("SELECT SUM(amount) FROM avanslar WHERE worker = ? AND settled = 0", (worker,))
+    avans_total = cur.fetchone()[0] or 0
+
+    if not total and not avans_total:
         conn.close()
         await update.message.reply_text(f"👷 {worker} — to'lanmagan ish topilmadi.")
         return
 
+    total = total or 0
     cur.execute("UPDATE work_log SET paid = 1 WHERE worker = ? AND paid = 0", (worker,))
+    cur.execute("UPDATE avanslar SET settled = 1 WHERE worker = ? AND settled = 0", (worker,))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
-        f"✅ {worker} — {total:,} so'm ({count} ta ish) to'landi deb belgilandi.".replace(",", " ")
-    )
+    qoldiq = total - avans_total
+    lines = [f"✅ {worker} — {format_money(total, 'som')} ({count} ta ish) to'landi deb belgilandi."]
+    if avans_total:
+        lines.append(f"💵 Bundan avval berilgan avans ({format_money(avans_total, 'som')}) hisobga olindi.")
+        lines.append(f"➡️ Qo'shimcha to'lash kerak bo'lgan summa: {format_money(qoldiq, 'som')}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def job_oylik_hisobot(context: ContextTypes.DEFAULT_TYPE):
@@ -6705,6 +6797,7 @@ def main():
     app.add_handler(CommandHandler("kopsotilgan", kopsotilgan))
     app.add_handler(CommandHandler("mijozhisob", mijozhisob))
     app.add_handler(CommandHandler("tolandi", tolandi))
+    app.add_handler(CommandHandler("avans", avans))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
