@@ -3407,11 +3407,20 @@ async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     usage = (
         "Hali 'kutilmoqda' holatidagi buyurtmaning MUDDATINI o'zgartiradi "
-        "(mijoz muddatni ko'chirganda ishlatiladi).\n\n"
+        "(mijoz muddatni ko'chirganda, yoki unutilib qolgan buyurtmani to'g'ri sana bilan "
+        "kiritishda ishlatiladi).\n\n"
         "Foydalanish: /muddattuzatish <buyurtma raqami> <kun> <oy>\n"
-        "Misol: /muddattuzatish 112 20 oktyabr"
+        "Misol: /muddattuzatish 112 20 oktyabr\n\n"
+        "Agar sana O'TIB KETGAN bo'lsa-yu (masalan unutilib qolgan eski buyurtma), "
+        "bot uni avtomatik KEYINGI YILGA surib yubormasin desangiz, oxiriga 'otgan' deb qo'shing:\n"
+        "Misol: /muddattuzatish 112 20 sentyabr otgan"
     )
-    if len(args) != 3 or not args[0].isdigit() or not args[1].isdigit():
+    if len(args) not in (3, 4) or not args[0].isdigit() or not args[1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    force_past = len(args) == 4 and args[3].lower() in ("otgan", "o'tgan", "utgan")
+    if len(args) == 4 and not force_past:
         await update.message.reply_text(usage)
         return
 
@@ -3424,10 +3433,18 @@ async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     month = MONTH_NAMES[month_word]
-    new_deadline = compute_deadline(day, month)
-    if new_deadline is None:
-        await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
-        return
+
+    if force_past:
+        try:
+            new_deadline = date(date.today().year, month, day)
+        except ValueError:
+            await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
+            return
+    else:
+        new_deadline = compute_deadline(day, month)
+        if new_deadline is None:
+            await update.message.reply_text("Sana noto'g'ri (masalan 32 kun yoki noto'g'ri oy).")
+            return
 
     conn = get_conn()
     cur = conn.cursor()
