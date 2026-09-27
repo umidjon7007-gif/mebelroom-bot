@@ -2391,10 +2391,28 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def fetch_fulfilled_order_groups(customer_filter=None, limit=20):
+def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=None):
     conn = get_conn()
     cur = conn.cursor()
-    if customer_filter:
+    if date_filter and customer_filter:
+        cur.execute(
+            """
+            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
+            FROM orders WHERE status = 'bajarildi' AND LOWER(customer) = LOWER(?) AND date(bajarildi_at) = ?
+            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
+            """,
+            (customer_filter, date_filter),
+        )
+    elif date_filter:
+        cur.execute(
+            """
+            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
+            FROM orders WHERE status = 'bajarildi' AND date(bajarildi_at) = ?
+            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
+            """,
+            (date_filter,),
+        )
+    elif customer_filter:
         cur.execute(
             """
             SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
@@ -3122,6 +3140,26 @@ async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     customer_filter = None
     limit = 20
+    date_filter = None
+    date_label = None
+
+    lowered = [a.lower() for a in args]
+    if lowered and lowered[0] in ("kecha", "bugun"):
+        target_date = date.today() - timedelta(days=1) if lowered[0] == "kecha" else date.today()
+        date_filter = target_date.isoformat()
+        date_label = "kecha" if lowered[0] == "kecha" else "bugun"
+        args = args[1:]
+    elif len(lowered) >= 2 and lowered[0].isdigit() and lowered[1] in MONTH_NAMES:
+        day = int(lowered[0])
+        month = MONTH_NAMES[lowered[1]]
+        try:
+            target_date = date(date.today().year, month, day)
+            date_filter = target_date.isoformat()
+            date_label = f"{day} {lowered[1]}"
+            args = args[2:]
+        except ValueError:
+            pass
+
     if args:
         if args[-1].isdigit():
             limit = int(args[-1])
@@ -3129,12 +3167,14 @@ async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             customer_filter = " ".join(args).strip()
 
-    groups = fetch_fulfilled_order_groups(customer_filter=customer_filter, limit=limit)
+    groups = fetch_fulfilled_order_groups(customer_filter=customer_filter, limit=limit, date_filter=date_filter)
     if not groups:
         await update.message.reply_text("Bajarilgan buyurtmalar topilmadi.")
         return
 
     header = f"📜 Bajarilgan buyurtmalar tarixi (oxirgi {len(groups)} ta)"
+    if date_label:
+        header += f" — {date_label}"
     if customer_filter:
         header += f" — mijoz: {customer_filter}"
     await update.message.reply_text(header)
