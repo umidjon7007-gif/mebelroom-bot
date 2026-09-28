@@ -2402,44 +2402,30 @@ async def xomtarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=None):
+def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=None, model_filter=None):
     conn = get_conn()
     cur = conn.cursor()
-    if date_filter and customer_filter:
-        cur.execute(
-            """
-            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
-            FROM orders WHERE status = 'bajarildi' AND LOWER(customer) = LOWER(?) AND date(bajarildi_at) = ?
-            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
-            """,
-            (customer_filter, date_filter),
+    conditions = ["status = 'bajarildi'"]
+    params = []
+    if customer_filter:
+        conditions.append("LOWER(customer) = LOWER(?)")
+        params.append(customer_filter)
+    if date_filter:
+        conditions.append("date(bajarildi_at) = ?")
+        params.append(date_filter)
+    if model_filter:
+        # Buyurtma guruhida shu model kamida bitta qatorda bo'lsa, butun guruh ko'rsatiladi.
+        conditions.append(
+            "guruh_id IN (SELECT guruh_id FROM orders WHERE status = 'bajarildi' "
+            "AND model = ? COLLATE NOCASE)"
         )
-    elif date_filter:
-        cur.execute(
-            """
-            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
-            FROM orders WHERE status = 'bajarildi' AND date(bajarildi_at) = ?
-            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
-            """,
-            (date_filter,),
-        )
-    elif customer_filter:
-        cur.execute(
-            """
-            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
-            FROM orders WHERE status = 'bajarildi' AND LOWER(customer) = LOWER(?)
-            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
-            """,
-            (customer_filter,),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at
-            FROM orders WHERE status = 'bajarildi'
-            ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC
-            """
-        )
+        params.append(model_filter)
+    cur.execute(
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at "
+        "FROM orders WHERE " + " AND ".join(conditions) +
+        " ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC",
+        params,
+    )
     rows = cur.fetchall()
     conn.close()
 
@@ -3171,14 +3157,30 @@ async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
+    model_filter = None
     if args:
         if args[-1].isdigit():
             limit = int(args[-1])
-            customer_filter = " ".join(args[:-1]).strip() or None
+            rest_args = args[:-1]
         else:
-            customer_filter = " ".join(args).strip()
+            rest_args = args
+        rest_text = " ".join(rest_args).strip()
+        if rest_text:
+            # Agar matn mavjud modellardan biriga aniq mos kelsa - model bo'yicha filtrlaymiz,
+            # aks holda mijoz nomi deb qabul qilamiz.
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT model FROM products")
+            known_models = {row[0].lower(): row[0] for row in cur.fetchall()}
+            conn.close()
+            if rest_text.lower() in known_models:
+                model_filter = known_models[rest_text.lower()]
+            else:
+                customer_filter = rest_text
 
-    groups = fetch_fulfilled_order_groups(customer_filter=customer_filter, limit=limit, date_filter=date_filter)
+    groups = fetch_fulfilled_order_groups(
+        customer_filter=customer_filter, limit=limit, date_filter=date_filter, model_filter=model_filter
+    )
     if not groups:
         await update.message.reply_text("Bajarilgan buyurtmalar topilmadi.")
         return
@@ -3186,6 +3188,8 @@ async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"📜 Bajarilgan buyurtmalar tarixi (oxirgi {len(groups)} ta)"
     if date_label:
         header += f" — {date_label}"
+    if model_filter:
+        header += f" — model: {model_filter}"
     if customer_filter:
         header += f" — mijoz: {customer_filter}"
     await update.message.reply_text(header)
