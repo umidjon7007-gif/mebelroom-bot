@@ -161,6 +161,10 @@ def init_db():
         # 1 = mijoz uyiga o'rnatib berish yo'q, faqat jo'natib yuboriladi (masalan viloyatga).
         # Bunday holda 'sotish' o'rniga 'dastavkanarxi' ishlatiladi, ishchiga yig'ish puli yozilmaydi.
         cur.execute("ALTER TABLE orders ADD COLUMN dastavka INTEGER NOT NULL DEFAULT 0")
+    if "tashqi_raqam" not in orders_columns:
+        # Mijoz/guruh tomonidan berilgan tashqi (o'z) buyurtma raqami - botning ichki
+        # raqamidan alohida, faqat solishtirish/qidirish uchun.
+        cur.execute("ALTER TABLE orders ADD COLUMN tashqi_raqam TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -2421,7 +2425,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
         )
         params.append(model_filter)
     cur.execute(
-        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at "
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam "
         "FROM orders WHERE " + " AND ".join(conditions) +
         " ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC",
         params,
@@ -2431,7 +2435,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, bajarildi_at in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -2439,6 +2443,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
                 "deadline_display": deadline_display,
                 "customer": customer,
                 "bajarildi_at": bajarildi_at,
+                "tashqi_raqam": tashqi_raqam,
                 "items": [],
             }
             order_of_groups.append(gid)
@@ -2451,6 +2456,8 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
 def format_fulfilled_group_text(group):
     bajarildi_date = group["bajarildi_at"].split("T")[0] if group["bajarildi_at"] else "?"
     lines = [f"✅ Buyurtma №{group['guruh_id']} — {group['deadline_display']} (bajarildi: {bajarildi_date})"]
+    if group.get("tashqi_raqam"):
+        lines.append(f"Tashqi raqam: #{group['tashqi_raqam']}")
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
@@ -3452,6 +3459,40 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ №{guruh_id} buyurtmasiga qo'shildi: {model_display} {item_display} ({new_amount} ta)"
     )
+
+
+async def buyurtmaraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Buyurtmaga mijoz/guruh bergan TASHQI raqamni yozib qo'yadi (botning ichki "
+        "raqamidan alohida, qidirish/solishtirish uchun).\n\n"
+        "Foydalanish: /buyurtmaraqam <ichki raqam> <tashqi raqam>\n"
+        "Misol: /buyurtmaraqam 214 45"
+    )
+    if len(args) != 2 or not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    tashqi_raqam = args[1]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM orders WHERE guruh_id = ?", (guruh_id,))
+    if cur.fetchone()[0] == 0:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ №{guruh_id} — tashqi raqam: #{tashqi_raqam} deb yozildi.")
 
 
 async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5029,6 +5070,18 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
             fixed_args.append(m.group(2))
         else:
             fixed_args.append(tok)
+
+    # "#123" kabi tashqi (mijoz/guruh) buyurtma raqamini, agar bo'lsa, ajratib olamiz
+    # (qolgan qatorlarni tahlil qilishga xalaqit bermasin deb, boshqa argumentlardan chetlatamiz).
+    tashqi_raqam = None
+    without_ref = []
+    for tok in fixed_args:
+        if tok.startswith("#") and len(tok) > 1 and tashqi_raqam is None:
+            tashqi_raqam = tok[1:]
+        else:
+            without_ref.append(tok)
+    fixed_args = without_ref
+
     args = [a.lower() for a in fixed_args]
 
     usage = (
@@ -5046,7 +5099,10 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         "/buyurtma laura shkaf 2 5 avgust Mavaviy dokon\n"
         "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust\n"
         "/buyurtma neo komplekt +krovat 1 25 avgust Mebel For Home\n"
-        "/buyurtma aven komplekt anta:shkaf 1 25 avgust Mebel For Home"
+        "/buyurtma aven komplekt anta:shkaf 1 25 avgust Mebel For Home\n\n"
+        "Mijoz/guruh bergan tashqi raqamni ham yozib qo'yish uchun, istalgan joyga "
+        "'#raqam' qo'shing:\n"
+        "/buyurtma vena komplekt #45 5 avgust"
     )
     if len(args) < 3:
         await update.message.reply_text(usage)
@@ -5173,6 +5229,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
         [guruh_id] + [oid for oid, _, _, _, _ in created],
     )
+    if tashqi_raqam:
+        cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
 
     shortage_text = shortage_warning_for_new_order(cur, entries)
 
@@ -5191,6 +5249,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
+    if tashqi_raqam:
+        lines.append(f"Tashqi raqam: #{tashqi_raqam}")
     lines.append("Holati: Kutilmoqda")
     if shortage_text:
         lines.append(shortage_text)
@@ -5495,6 +5555,8 @@ def format_group_text(group):
         urgency = "🔴"
 
     lines = [f"{urgency} Buyurtma №{group['guruh_id']} — {group['deadline_display']} ({days_text})"]
+    if group.get("tashqi_raqam"):
+        lines.append(f"Tashqi raqam: #{group['tashqi_raqam']}")
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
@@ -5510,7 +5572,7 @@ def fetch_pending_order_groups():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type
+        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam
         FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC, guruh_id ASC, id ASC
         """
     )
@@ -5519,7 +5581,7 @@ def fetch_pending_order_groups():
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, tashqi_raqam in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -5527,6 +5589,7 @@ def fetch_pending_order_groups():
                 "deadline": deadline_iso,
                 "deadline_display": deadline_display,
                 "customer": customer,
+                "tashqi_raqam": tashqi_raqam,
                 "items": [],
             }
             order_of_groups.append(gid)
@@ -6767,6 +6830,7 @@ def main():
     app.add_handler(CommandHandler("dastavka", dastavka_toggle))
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
+    app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
