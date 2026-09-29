@@ -4662,6 +4662,14 @@ UZ_MONTH_BY_NUM = {v: k for k, v in MONTH_NAMES.items()}
 GENERIC_ITEM_WORDS = ["shkaf", "tumba", "krovat", "kamod", "parta"]
 
 
+def parse_external_number_from_text(text: str):
+    """Guruh xabari boshida '14)', '№14', '#14' kabi tashqi raqamni topadi (agar bo'lsa)."""
+    m = re.match(r"^\s*(?:№|#)?(\d{1,5})\s*[)\.\-:]", text)
+    if m:
+        return m.group(1)
+    return None
+
+
 def parse_deadline_from_text(text: str):
     """Matndan 'Muddat: 21-22 avgust', '29-Avgust', '5 avgust' kabi sanalarni topadi.
     Qaytaradi: (day, month_num, deadline_display) yoki None."""
@@ -4809,7 +4817,7 @@ def parse_entries_from_text(text: str, model: str):
     return [(None, 1, None)], False
 
 
-def generate_buyurtma_command(model, entries, deadline_display, customer):
+def generate_buyurtma_command(model, entries, deadline_display, customer, tashqi_raqam=None):
     parts = [model]
     if len(entries) == 1 and entries[0][0] is None and entries[0][2] is None:
         parts.append("komplekt")
@@ -4824,6 +4832,8 @@ def generate_buyurtma_command(model, entries, deadline_display, customer):
             else:
                 parts.append(item)
                 parts.append(str(amount))
+    if tashqi_raqam:
+        parts.append(f"#{tashqi_raqam}")
     parts.append(deadline_display.replace(" ", " "))
     if customer:
         parts.append(customer)
@@ -4846,6 +4856,7 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
 
     deadline_info = parse_deadline_from_text(text)
     entries, komplekt_aniq = parse_entries_from_text(text, model)
+    tashqi_raqam = parse_external_number_from_text(text)
 
     lowered_text = text.lower()
     dastavka_detected = any(
@@ -4853,6 +4864,8 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
     )
 
     lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
+    if tashqi_raqam:
+        lines.append(f"Tashqi raqam: #{tashqi_raqam}")
     lines.append(f"Taxminiy model: {model}")
     if len(entries) == 1 and entries[0][0] is None:
         lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
@@ -4959,7 +4972,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id "
+        "SELECT model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id, raw_text "
         "FROM pending_group_orders WHERE id = ?",
         (pending_id,),
     )
@@ -4969,8 +4982,9 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Bu taklif topilmadi (eskirgan bo'lishi mumkin).")
         return
 
-    model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id = row
+    model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id, raw_text = row
     entries = [tuple(e) for e in json.loads(entries_json)]
+    tashqi_raqam = parse_external_number_from_text(raw_text) if raw_text else None
 
     if status != "kutilmoqda":
         conn.close()
@@ -4988,7 +5002,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("UPDATE pending_group_orders SET status = 'tahrirga yuborildi' WHERE id = ?", (pending_id,))
         conn.commit()
         conn.close()
-        suggested = generate_buyurtma_command(model, entries, deadline_display, customer)
+        suggested = generate_buyurtma_command(model, entries, deadline_display, customer, tashqi_raqam)
         await query.edit_message_text(
             query.message.text + "\n\n✏️ Tahrirlash uchun yuborilgan (avtomatik yaratilmaydi)."
         )
@@ -5020,6 +5034,8 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created_ids)})",
         [guruh_id] + created_ids,
     )
+    if tashqi_raqam:
+        cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
     cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
 
     entries_4 = [(model, item, amount, mod_type) for item, amount, mod_type in entries]
