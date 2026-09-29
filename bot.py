@@ -5583,14 +5583,25 @@ def format_group_text(group):
     return "\n".join(lines)
 
 
-def fetch_pending_order_groups():
+def fetch_pending_order_groups(model_filter=None, customer_filter=None):
     conn = get_conn()
     cur = conn.cursor()
+    conditions = ["status = 'kutilmoqda'"]
+    params = []
+    if model_filter:
+        conditions.append(
+            "guruh_id IN (SELECT guruh_id FROM orders WHERE status = 'kutilmoqda' "
+            "AND model = ? COLLATE NOCASE)"
+        )
+        params.append(model_filter)
+    if customer_filter:
+        conditions.append("LOWER(customer) = LOWER(?)")
+        params.append(customer_filter)
     cur.execute(
-        """
-        SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam
-        FROM orders WHERE status = 'kutilmoqda' ORDER BY deadline ASC, guruh_id ASC, id ASC
-        """
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam "
+        "FROM orders WHERE " + " AND ".join(conditions) +
+        " ORDER BY deadline ASC, guruh_id ASC, id ASC",
+        params,
     )
     rows = cur.fetchall()
     conn.close()
@@ -5614,12 +5625,32 @@ def fetch_pending_order_groups():
 
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = fetch_pending_order_groups()
+    args = context.args or []
+    model_filter = None
+    customer_filter = None
+    if args:
+        rest_text = " ".join(args).strip()
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT model FROM products")
+        known_models = {row[0].lower(): row[0] for row in cur.fetchall()}
+        conn.close()
+        if rest_text.lower() in known_models:
+            model_filter = known_models[rest_text.lower()]
+        else:
+            customer_filter = rest_text
+
+    groups = fetch_pending_order_groups(model_filter=model_filter, customer_filter=customer_filter)
     if not groups:
         await update.message.reply_text("Hozircha bajarilmagan buyurtma yo'q.")
         return
 
-    await update.message.reply_text(f"📋 Bajarilmagan buyurtmalar ({len(groups)} ta):")
+    header = f"📋 Bajarilmagan buyurtmalar ({len(groups)} ta)"
+    if model_filter:
+        header += f" — model: {model_filter}"
+    if customer_filter:
+        header += f" — mijoz: {customer_filter}"
+    await update.message.reply_text(header)
     for group in groups:
         text = format_group_text(group)
         button = InlineKeyboardMarkup(
