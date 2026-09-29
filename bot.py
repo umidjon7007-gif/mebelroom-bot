@@ -6465,6 +6465,67 @@ async def maosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_chunked(update.message, all_lines)
 
 
+async def avanstarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Ishchining barcha avans tarixini (sana, summa, hisoblangan/hisoblanmagan) ko'rsatadi.\n\n"
+            "Foydalanish: /avanstarix <ishchi ismi> [soni]\n"
+            "Misol: /avanstarix Hojiakbar\n"
+            "Misol (oxirgi 5 tasi): /avanstarix Hojiakbar 5"
+        )
+        return
+
+    limit = 20
+    name_parts = args
+    if args[-1].isdigit():
+        limit = int(args[-1])
+        name_parts = args[:-1]
+    worker = " ".join(name_parts).strip()
+    if not worker:
+        await update.message.reply_text("Ishchi ismini kiriting.\nMisol: /avanstarix Hojiakbar")
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT amount, settled, created_at FROM avanslar WHERE worker = ? COLLATE NOCASE "
+        "ORDER BY created_at DESC LIMIT ?",
+        (worker, limit),
+    )
+    rows = cur.fetchall()
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM avanslar WHERE worker = ? COLLATE NOCASE AND settled = 0",
+        (worker,),
+    )
+    active_total = cur.fetchone()[0]
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM avanslar WHERE worker = ? COLLATE NOCASE",
+        (worker,),
+    )
+    all_time_total = cur.fetchone()[0]
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(f"👷 {worker} — hech qanday avans yozuvi topilmadi.")
+        return
+
+    lines = [f"💵 {worker} — avans tarixi (oxirgi {len(rows)} ta):\n"]
+    for amount, settled, created_at in rows:
+        date_part = created_at.split("T")[0] if created_at else "-"
+        holat = "✅ hisoblangan" if settled else "⏳ hali hisoblanmagan"
+        lines.append(f"• {format_money(amount, 'som')} — {date_part} ({holat})")
+
+    lines.append(f"\n📊 Bot ishlay boshlaganidan buguncha jami avans: {format_money(all_time_total, 'som')}")
+    if active_total:
+        lines.append(f"⏳ Hali qarzga hisoblanmagan (qolgan) avans: {format_money(active_total, 'som')}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def avans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -6882,6 +6943,7 @@ def main():
     app.add_handler(CommandHandler("mijozhisob", mijozhisob))
     app.add_handler(CommandHandler("tolandi", tolandi))
     app.add_handler(CommandHandler("avans", avans))
+    app.add_handler(CommandHandler("avanstarix", avanstarix))
     app.add_handler(CommandHandler("detalnomi", detalnomi))
     app.add_handler(CommandHandler("royxatga", royxatga))
     app.add_handler(CommandHandler("buyurtma", buyurtma))
