@@ -3391,7 +3391,8 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ulgurilmagan bo'lsa).\n\n"
         "Foydalanish: /buyurtmaqoshish <buyurtma raqami> <model> <detal> <miqdor>\n"
         "Misol: /buyurtmaqoshish 112 kafino tumba 2\n"
-        "Misol (butun komplekt): /buyurtmaqoshish 112 laura komplekt 1"
+        "Misol (butun komplekt): /buyurtmaqoshish 112 laura komplekt 1\n"
+        "Misol (ayirish/qo'shish): /buyurtmaqoshish 112 bella -parta 1"
     )
     if len(args) < 4 or not args[0].isdigit() or not args[-1].isdigit():
         await update.message.reply_text(usage)
@@ -3425,6 +3426,14 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining_tokens = lowered[1:]
 
     item_display = " ".join(remaining_tokens) if remaining_tokens else "komplekt"
+    mod_type = None
+    if item_display.startswith("+") and len(item_display) > 1:
+        mod_type = "+"
+        item_display = item_display[1:].strip()
+    elif item_display.startswith("-") and len(item_display) > 1:
+        mod_type = "-"
+        item_display = item_display[1:].strip()
+
     cur.execute(
         "SELECT deadline, deadline_display, customer, status, dastavka FROM orders WHERE guruh_id = ? LIMIT 1",
         (guruh_id,),
@@ -3448,16 +3457,17 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item_value = None if item_display == "komplekt" else item_display
     now = datetime.now(TASHKENT_TZ).isoformat()
     cur.execute(
-        """INSERT INTO orders (guruh_id, model, item, amount, deadline, deadline_display,
+        """INSERT INTO orders (guruh_id, model, item, amount, mod_type, deadline, deadline_display,
                                 customer, status, created_at, dastavka)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?, ?)""",
-        (guruh_id, model_display, item_value, new_amount, deadline, deadline_display, customer, now, dastavka),
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?, ?)""",
+        (guruh_id, model_display, item_value, new_amount, mod_type, deadline, deadline_display, customer, now, dastavka),
     )
     conn.commit()
     conn.close()
 
+    mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
     await update.message.reply_text(
-        f"✅ №{guruh_id} buyurtmasiga qo'shildi: {model_display} {item_display} ({new_amount} ta)"
+        f"✅ №{guruh_id} buyurtmasiga qo'shildi: {mark}{model_display} {item_display} ({new_amount} ta)"
     )
 
 
