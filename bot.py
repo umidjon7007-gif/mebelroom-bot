@@ -1766,7 +1766,7 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Komplekt uchun: /narx yigish komplekt 100000\n\n"
         "Bitta modelga maxsus narx uchun: /modelnarx <upakovka|yigish|sotish|spinka> <model> <detal> <summa>"
     )
-    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka") or not args[-1].isdigit():
+    if len(args) < 3 or args[0].lower() not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka", "farqnarxi") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1787,8 +1787,8 @@ async def narx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish"}[turi]
-    currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi") else "som"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish", "farqnarxi": "Farq narxi"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi", "farqnarxi") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{item}' (barcha modellar) narxi: {format_money(rate, currency)} deb belgilandi."
     )
@@ -1807,7 +1807,7 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Misol: /modelnarx spinka bella krovat 15000\n\n"
         "Bu faqat ko'rsatilgan modelga tegishli, boshqa modellar umumiy narxda qoladi."
     )
-    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka") or not args[-1].isdigit():
+    if len(args) < 4 or args[0] not in ("upakovka", "yigish", "sotish", "sotishayirish", "dastavkanarxi", "spinka", "farqnarxi") or not args[-1].isdigit():
         await update.message.reply_text(usage)
         return
 
@@ -1846,8 +1846,8 @@ async def modelnarx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish"}[turi]
-    currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi") else "som"
+    turi_label = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish", "sotishayirish": "Sotish (ayirish)", "dastavkanarxi": "Dastavka narxi", "spinka": "Spinka qoqish", "farqnarxi": "Farq narxi"}[turi]
+    currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi", "farqnarxi") else "som"
     await update.message.reply_text(
         f"✅ {turi_label} — '{model} {item}' uchun maxsus narx: {format_money(rate, currency)}."
     )
@@ -1896,15 +1896,15 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["💰 Narxlar:"]
     current_turi = None
-    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖", "dastavkanarxi": "🚚", "spinka": "🔨"}
-    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)", "dastavkanarxi": "Dastavka narxi (o'rnatishsiz)", "spinka": "Spinka qoqish"}
+    turi_icons = {"upakovka": "📦", "yigish": "🚚", "sotish": "🏷️", "sotishayirish": "➖", "dastavkanarxi": "🚚", "spinka": "🔨", "farqnarxi": "🔀"}
+    turi_labels = {"upakovka": "Upakovka", "yigish": "Yig'ish", "sotish": "Sotish (qo'shilganda)", "sotishayirish": "Sotish (ayirilganda)", "dastavkanarxi": "Dastavka narxi (o'rnatishsiz)", "spinka": "Spinka qoqish", "farqnarxi": "Farq narxi (o'rnatilsin-o'rnatilmasin bir xil)"}
     for turi, model, item, rate in rows:
         if turi != current_turi:
             icon = turi_icons.get(turi, "•")
             label = turi_labels.get(turi, turi)
             lines.append(f"\n{icon} {label}:")
             current_turi = turi
-        currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi") else "som"
+        currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi", "farqnarxi") else "som"
         if model:
             lines.append(f"• {model} {item} (maxsus): {format_money(rate, currency)}")
         else:
@@ -5977,11 +5977,14 @@ def shortage_warning_for_new_order(cur, entries):
 def compute_order_sale_value(guruh_id: int) -> int:
     """Guruhdagi barcha qatorlar uchun kutilayotgan umumiy summani hisoblaydi
     (mijozga qancha sotilishi kerak).
-    mod_type == '+' (qo'shilgan) - 'sotish' narxi qo'shiladi.
+    mod_type == '+' (qo'shilgan) - avval 'farqnarxi' (agar belgilangan bo'lsa, masalan
+    krovat110 kabi komplektga kiritilgan standart detalni almashtirish farqi uchun,
+    dastavka holatidan qat'iy nazar bir xil) tekshiriladi; bo'lmasa dastavka bo'lsa
+    'dastavkanarxi', aks holda 'sotish' narxi qo'shiladi.
     mod_type == '-' (ayirilgan) - 'sotishayirish' narxi ayiriladi.
     mod_type == None va item bor - oddiy 'sotish' narxi (mustaqil sotilgan detal).
-    dastavka == 1 bo'lsa - 'sotish' o'rniga to'g'ridan-to'g'ri 'dastavkanarxi'
-    (alohida, kamroq belgilangan tayyor narx) ishlatiladi."""
+    dastavka == 1 bo'lsa (mod_type yo'q qatorlar uchun) - 'sotish' o'rniga
+    to'g'ridan-to'g'ri 'dastavkanarxi' (alohida, kamroq belgilangan tayyor narx) ishlatiladi."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ?", (guruh_id,))
@@ -5992,6 +5995,15 @@ def compute_order_sale_value(guruh_id: int) -> int:
         if mod_type == "-":
             rate = get_rate(cur, "sotishayirish", model, rate_key)
             total -= rate * amount
+        elif mod_type == "+":
+            farq_rate = get_rate(cur, "farqnarxi", model, rate_key)
+            if farq_rate:
+                rate = farq_rate
+            elif dastavka:
+                rate = get_rate(cur, "dastavkanarxi", model, rate_key)
+            else:
+                rate = get_rate(cur, "sotish", model, rate_key)
+            total += rate * amount
         elif dastavka:
             rate = get_rate(cur, "dastavkanarxi", model, rate_key)
             total += rate * amount
