@@ -6204,7 +6204,8 @@ async def mijozhisob(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     customer_query = " ".join(args)
-    await update.message.reply_text(build_mijoz_hisob_text(customer_query))
+    text = build_mijoz_hisob_text(customer_query)
+    await send_chunked(update.message, text.split("\n"))
 
 
 async def mijozlar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6249,7 +6250,11 @@ async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     customer = query.data.split(":", 1)[1]
     text = build_mijoz_hisob_text(customer)
-    await query.edit_message_text(text)
+    if len(text) <= 3900:
+        await query.edit_message_text(text)
+    else:
+        await query.edit_message_text(f"🏪 {customer} — hisob (quyida, bo'laklab yuborildi):")
+        await send_chunked(query.message, text.split("\n"))
 
 
 async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
