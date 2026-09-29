@@ -3461,6 +3461,42 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtmasana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Buyurtma botga qachon yozilganini (created_at) ko'rsatadi.\n\n"
+            "Foydalanish: /buyurtmasana <buyurtma raqami>\n"
+            "Misol: /buyurtmasana 216"
+        )
+        return
+
+    guruh_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT created_at FROM orders WHERE guruh_id = ? ORDER BY id ASC LIMIT 1",
+        (guruh_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    created_at = row[0]
+    date_part = created_at.split("T")[0] if created_at else "noma'lum"
+    time_part = created_at.split("T")[1] if created_at and "T" in created_at else ""
+    await update.message.reply_text(
+        f"🕐 №{guruh_id} botga yozilgan sana: {date_part}" + (f", soat {time_part}" if time_part else "")
+    )
+
+
 async def buyurtmaraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -6944,6 +6980,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
+    app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
