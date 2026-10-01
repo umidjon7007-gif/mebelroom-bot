@@ -1510,6 +1510,28 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
+# Standart komplekt detalini "yangilangan variant" bilan almashtirish uchun ishlatiladi
+# (masalan krovat110 - krovatning kattaroq varianti, shkaf4eshik - shkafning 4 eshikli varianti).
+# Buyurtmada "+variant" qatori bo'lsa-yu, lekin mos "-standart" qatori yozilmagan bo'lsa ham,
+# standart detal komplekt yoyilganda zaxiradan AVTOMATIK chiqarib tashlanadi (ikki marta
+# ayirilib ketmasligi uchun - variant allaqachon o'zining alohida qatorida ayriladi).
+UPGRADE_BASE_ITEM = {
+    "krovat110": "krovat",
+    "shkaf4eshik": "shkaf",
+}
+
+
+def upgrade_auto_exclusions(entries):
+    """entries - [(model, item_or_None, amount, mod_type), ...]. Shu guruhda '+variant'
+    qatori bo'lgan modellar uchun, mos standart detalni avtomatik chetlatish kerakligini
+    aniqlaydi. Qaytaradi: {model: {excluded_item, ...}}."""
+    extra_excluded = {}
+    for entry_model, item, amount, mod_type in entries:
+        if mod_type == "+" and item in UPGRADE_BASE_ITEM:
+            base_item = UPGRADE_BASE_ITEM[item]
+            extra_excluded.setdefault(entry_model, set()).add(base_item)
+    return extra_excluded
+
 
 async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
@@ -5361,6 +5383,10 @@ async def topshirilganibekor(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for _, model, item, amount, mod_type, _ in rows:
         if mod_type == "-" and item is not None:
             excluded_by_model.setdefault(model, set()).add(item)
+    for extra_model, extra_items in upgrade_auto_exclusions(
+        [(model, item, amount, mod_type) for _, model, item, amount, mod_type, _ in rows]
+    ).items():
+        excluded_by_model.setdefault(extra_model, set()).update(extra_items)
 
     stock_restored_lines = []
     for _, model, item, amount, mod_type, _ in rows:
@@ -5461,6 +5487,10 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for _, model, item, amount, mod_type, _ in rows:
             if mod_type == "-" and item is not None:
                 excluded_by_model.setdefault(model, set()).add(item)
+        for extra_model, extra_items in upgrade_auto_exclusions(
+            [(model, item, amount, mod_type) for _, model, item, amount, mod_type, _ in rows]
+        ).items():
+            excluded_by_model.setdefault(extra_model, set()).update(extra_items)
 
         for _, model, item, amount, mod_type, _ in rows:
             if mod_type == "-":
@@ -5902,6 +5932,8 @@ def explode_entries_to_items(cur, entries):
     for entry_model, item, amount, mod_type in entries:
         if mod_type == "-" and item is not None:
             excluded_by_model.setdefault(entry_model, set()).add(item)
+    for extra_model, extra_items in upgrade_auto_exclusions(entries).items():
+        excluded_by_model.setdefault(extra_model, set()).update(extra_items)
 
     for entry_model, item, amount, mod_type in entries:
         if mod_type == "-":
@@ -6133,6 +6165,10 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     for _, model, item, _, mod_type, _ in rows:
         if mod_type == "-" and item is not None:
             excluded_by_model.setdefault(model, set()).add(item)
+    for extra_model, extra_items in upgrade_auto_exclusions(
+        [(model, item, amount, mod_type) for _, model, item, amount, mod_type, _ in rows]
+    ).items():
+        excluded_by_model.setdefault(extra_model, set()).update(extra_items)
 
     all_result_lines = []
     total_payment = 0
