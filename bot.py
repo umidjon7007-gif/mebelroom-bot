@@ -6125,7 +6125,16 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
     payment_note = None
     if worker:
         rate_key = "komplekt" if item is None else item
-        rate = get_rate(cur, "yigish", model, rate_key)
+        if mod_type == "+" and item in UPGRADE_BASE_ITEM:
+            # Krovat110/shkaf4eshik kabi "yangilangan variant" uchun, ishchiga TO'LIQ yig'ish
+            # narxi emas, balki standart detalga nisbatan FARQ to'lanadi (chunki asosiy
+            # komplekt yig'ish narxi allaqachon standart detalni yig'ishni o'z ichiga oladi).
+            base_item = UPGRADE_BASE_ITEM[item]
+            variant_rate = get_rate(cur, "yigish", model, item)
+            base_rate = get_rate(cur, "yigish", model, base_item)
+            rate = max(0, variant_rate - base_rate)
+        else:
+            rate = get_rate(cur, "yigish", model, rate_key)
         payment_total = amount * rate
 
         cur.execute("INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)", (worker, now))
