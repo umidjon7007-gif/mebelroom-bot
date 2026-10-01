@@ -3947,6 +3947,67 @@ async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def yigishtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Allaqachon 'bajarildi' bo'lgan buyurtmaning bitta detaliga noto'g'ri hisoblangan "
+        "yig'ish pulini to'g'irlaydi (masalan avval noto'g'ri narx bilan hisoblangan bo'lsa).\n\n"
+        "Foydalanish: /yigishtuzatish <buyurtma raqami> <detal> <to'g'ri summa>\n"
+        "Misol: /yigishtuzatish 173 shkaf4eshik 35000"
+    )
+    if len(args) < 3 or not args[0].isdigit() or not args[-1].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    new_total = int(args[-1])
+    item_query = " ".join(args[1:-1]).lower()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM orders WHERE guruh_id = ?",
+        (guruh_id,),
+    )
+    order_ids = [r[0] for r in cur.fetchall()]
+    if not order_ids:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    placeholders = ",".join("?" for _ in order_ids)
+    cur.execute(
+        f"""
+        SELECT id, worker, amount, rate, total FROM work_log
+        WHERE turi = 'yigish' AND item = ? COLLATE NOCASE AND order_id IN ({placeholders})
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        [item_query] + order_ids,
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} uchun '{item_query}' bo'yicha yig'ish puli yozuvi topilmadi."
+        )
+        return
+
+    log_id, worker, amount, old_rate, old_total = row
+    new_rate = round(new_total / amount) if amount else new_total
+    cur.execute("UPDATE work_log SET rate = ?, total = ? WHERE id = ?", (new_rate, new_total, log_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ №{guruh_id} — {worker}ning '{item_query}' uchun yig'ish puli tuzatildi: "
+        f"{format_money(old_total, 'som')} → {format_money(new_total, 'som')}"
+    )
+
+
 async def nolniytuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -7064,6 +7125,7 @@ def main():
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
     app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
+    app.add_handler(CommandHandler("yigishtuzatish", yigishtuzatish))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
