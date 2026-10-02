@@ -3947,6 +3947,78 @@ async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def ishchibuyurtmalari(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Ishchi biror modelni qaysi buyurtmalarda yig'ganini (to'langan yoki yo'q, "
+        "farqi yo'q) qidiradi.\n\n"
+        "Foydalanish: /ishchibuyurtmalari <ishchi ismi> <model>\n"
+        "Misol: /ishchibuyurtmalari \"Olim aka\" aven"
+    )
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    all_models = [row[0] for row in cur.fetchall()]
+    all_models.sort(key=lambda m: -len(m.split()))
+
+    lowered = [a.lower() for a in args]
+    model = None
+    worker_tokens = None
+    for candidate in all_models:
+        tokens = candidate.split()
+        if lowered[-len(tokens):] == tokens:
+            model = candidate
+            worker_tokens = args[: len(args) - len(tokens)]
+            break
+
+    if model is None or not worker_tokens:
+        conn.close()
+        await update.message.reply_text(
+            f"Model aniqlanmadi.\nMavjud modellar: {', '.join(sorted(set(all_models)))}\n\n" + usage
+        )
+        return
+
+    worker = " ".join(worker_tokens)
+
+    cur.execute(
+        """
+        SELECT DISTINCT wl.order_id, o.guruh_id, o.deadline_display, o.bajarildi_at, wl.paid
+        FROM work_log wl
+        JOIN orders o ON wl.order_id = o.id
+        WHERE wl.worker = ? COLLATE NOCASE AND wl.turi = 'yigish' AND o.model = ? COLLATE NOCASE
+        ORDER BY o.bajarildi_at DESC
+        """,
+        (worker, model),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(f"{worker} — '{model}' modeli bo'yicha hech qanday yig'ish topilmadi.")
+        return
+
+    seen_guruh = set()
+    lines = [f"🔍 {worker} — '{model}' yig'gan buyurtmalar:\n"]
+    for order_id, guruh_id, deadline_display, bajarildi_at, paid in rows:
+        gid = guruh_id if guruh_id is not None else order_id
+        if gid in seen_guruh:
+            continue
+        seen_guruh.add(gid)
+        date_part = bajarildi_at.split("T")[0] if bajarildi_at else "?"
+        paid_note = "to'langan" if paid else "to'lanmagan"
+        lines.append(f"• №{gid} — muddat: {deadline_display}, bajarildi: {date_part} ({paid_note})")
+
+    await send_chunked(update.message, lines)
+
+
 async def yigishtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -7126,6 +7198,7 @@ def main():
     app.add_handler(CommandHandler("ishchiochirish", ishchiochirish))
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("yigishtuzatish", yigishtuzatish))
+    app.add_handler(CommandHandler("ishchibuyurtmalari", ishchibuyurtmalari))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
