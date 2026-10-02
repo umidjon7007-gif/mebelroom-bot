@@ -3947,6 +3947,67 @@ async def hisobtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def buyurtmaishchisi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Allaqachon 'bajarildi' bo'lgan buyurtmaning yig'ish puli yozuvlarini BOSHQA "
+        "ishchiga o'tkazadi (masalan noto'g'ri ishchi nomi yozilib qolgan bo'lsa) — faqat "
+        "shu bitta buyurtmaga tegishli, boshqa ishlariga tegmaydi.\n\n"
+        "Foydalanish: /buyurtmaishchisi <buyurtma raqami> <to'g'ri ishchi ismi>\n"
+        "Misol: /buyurtmaishchisi 57 Hojiakbar"
+    )
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    new_worker = " ".join(args[1:])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM orders WHERE guruh_id = ?", (guruh_id,))
+    order_ids = [r[0] for r in cur.fetchall()]
+    if not order_ids:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    placeholders = ",".join("?" for _ in order_ids)
+    cur.execute(
+        f"SELECT id, worker, item, total FROM work_log WHERE turi = 'yigish' AND order_id IN ({placeholders})",
+        order_ids,
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} uchun yig'ish puli yozuvi topilmadi.")
+        return
+
+    old_workers = {r[1] for r in rows}
+    cur.execute(
+        "INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)",
+        (new_worker, datetime.now(TASHKENT_TZ).isoformat()),
+    )
+    log_ids = [r[0] for r in rows]
+    cur.execute(
+        f"UPDATE work_log SET worker = ? WHERE id IN ({','.join('?' for _ in log_ids)})",
+        [new_worker] + log_ids,
+    )
+    conn.commit()
+    conn.close()
+
+    total_moved = sum(r[3] for r in rows)
+    old_label = ", ".join(old_workers)
+    await update.message.reply_text(
+        f"✅ №{guruh_id} — yig'ish puli ({format_money(total_moved, 'som')}, {len(rows)} ta yozuv) "
+        f"'{old_label}' dan '{new_worker}' ga o'tkazildi."
+    )
+
+
 async def ishchibuyurtmalari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -7199,6 +7260,7 @@ def main():
     app.add_handler(CommandHandler("nolniytuzatish", nolniytuzatish))
     app.add_handler(CommandHandler("yigishtuzatish", yigishtuzatish))
     app.add_handler(CommandHandler("ishchibuyurtmalari", ishchibuyurtmalari))
+    app.add_handler(CommandHandler("buyurtmaishchisi", buyurtmaishchisi))
     app.add_handler(CommandHandler("qoshimchadetal", qoshimchadetal))
     app.add_handler(CommandHandler("qoshimchadetalochirish", qoshimchadetalochirish))
     app.add_handler(CommandHandler("narxochirish", narxochirish))
