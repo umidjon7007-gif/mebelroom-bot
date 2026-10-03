@@ -2492,6 +2492,7 @@ async def xomqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT name, quantity FROM xomashyo ORDER BY name")
     rows = cur.fetchall()
+    band = compute_xom_commitments(cur)
     conn.close()
 
     if not rows:
@@ -2500,7 +2501,9 @@ async def xomqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🧵 Xomashyo qoldig'i:\n"]
     for name, qty in rows:
-        lines.append(f"{stock_indicator(qty)} {name}: {qty} ta")
+        lines.append(xom_stock_line(name, qty, band.get(name, 0)))
+    if any(band.get(name, 0) for name, _ in rows):
+        lines.append(XOM_BAND_FOOTER)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -3001,9 +3004,12 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Oyna ombori hozircha bo'sh.")
             return
         lines = ["🪟 Oyna qoldig'i:\n"]
+        band = compute_xom_commitments(cur)
         for name, qty in rows:
             label = oyna_usage_label(cur, name)
-            lines.append(f"{stock_indicator(qty)} {name}{label}: {qty} ta")
+            lines.append(xom_stock_line(name, qty, band.get(name, 0), label))
+        if any(band.get(name, 0) for name, _ in rows):
+            lines.append(XOM_BAND_FOOTER)
         conn.close()
         await query.edit_message_text("\n".join(lines))
         return
@@ -6449,9 +6455,44 @@ def compute_all_pending_demand(cur):
     return total_demand
 
 
+def compute_xom_commitments(cur):
+    """Har bir xomashyo (oyna) uchun BAND miqdorni hisoblaydi: {nom: band}.
+    Oyna mahsulot ishlab chiqarilganda (kirimda) ketadi, shuning uchun band =
+    (1) kutilayotgan buyurtmalarga va qarzlarga hali yetmayotgan mahsulotlarni ishlab
+    chiqarishga kerak bo'ladigan xomashyo + (2) tasdig'i kutilayotgan kirimlarga ketadigan xomashyo."""
+    demand = compute_all_pending_demand(cur)
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {(m, i): q for m, i, q in cur.fetchall()}
+    keys = set(demand) | {k for k, q in stock.items() if q < 0}
+    band = {}
+    for key in keys:
+        shortage = max(0, demand.get(key, 0) - stock.get(key, 0))
+        if shortage:
+            for xomashyo, per in get_xom_requirements(cur, key[0], key[1]).items():
+                band[xomashyo] = band.get(xomashyo, 0) + per * shortage
+    cur.execute("SELECT model, item, amount FROM xom_kutish WHERE status = 'kutilmoqda'")
+    for model, item, amount in cur.fetchall():
+        for xomashyo, per in get_xom_requirements(cur, model, item).items():
+            band[xomashyo] = band.get(xomashyo, 0) + per * amount
+    return band
+
+
+def xom_stock_line(name, qty, band, label=""):
+    if band:
+        free = qty - band
+        return f"{stock_indicator(free)} {name}{label}: {qty} ta (band: {band}, erkin: {free})"
+    return f"{stock_indicator(qty)} {name}{label}: {qty} ta"
+
+
+XOM_BAND_FOOTER = (
+    "\n📝 \"Band\" - kutilayotgan buyurtmalar va tasdig'i kutilayotgan kirimlar uchun "
+    "kerak bo'ladigan miqdor. Erkin manfiy bo'lsa - xomashyo buyurtma qilish kerak."
+)
+
+
 def shortage_warning_for_new_order(cur, entries):
     """Yangi yaratilgan buyurtma tarkibidagi detallar bo'yicha, agar BARCHA
-    kutilayotgan buyurtmalar hisobga olinganda zaxira yetarli bo'lmasa,
+    kutilayotgan buyurtmalar hisobga olinganda zaxira (yoki oyna) yetarli bo'lmasa,
     ogohlantirish matnini qaytaradi (aks holda None)."""
     my_items = set(explode_entries_to_items(cur, entries).keys())
     if not my_items:
@@ -6471,14 +6512,35 @@ def shortage_warning_for_new_order(cur, entries):
                 f"(yetishmaydi: {needed - available} ta)"
             )
 
-    if not lines:
-        return None
+    # Oyna (xomashyo) yetarlimi: band bu buyurtmani ham o'z ichiga oladi (u allaqachon yozilgan).
+    band = compute_xom_commitments(cur)
+    xom_names = set()
+    for model, item in my_items:
+        xom_names |= {x for x, per in get_xom_requirements(cur, model, item).items() if per}
+    xom_lines = []
+    for xomashyo in sorted(xom_names):
+        cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+        xrow = cur.fetchone()
+        have = xrow[0] if xrow else 0
+        need = band.get(xomashyo, 0)
+        if have < need:
+            xom_lines.append(
+                f"• {xomashyo}: kerak {need} ta, hozir bor {have} ta (yetishmaydi: {need - have} ta)"
+            )
 
-    return (
-        "\n\n⚠️ ZAXIRA OGOHLANTIRISHI — bu va boshqa kutilayotgan buyurtmalarni "
-        "hisobga olganda quyidagilar yetarli emas (kesim/usluga buyurtma qiling):\n"
-        + "\n".join(lines)
-    )
+    text = ""
+    if lines:
+        text += (
+            "\n\n⚠️ ZAXIRA OGOHLANTIRISHI — bu va boshqa kutilayotgan buyurtmalarni "
+            "hisobga olganda quyidagilar yetarli emas (kesim/usluga buyurtma qiling):\n"
+            + "\n".join(lines)
+        )
+    if xom_lines:
+        text += (
+            "\n\n🪟 OYNA OGOHLANTIRISHI — ishlab chiqarilishi kerak bo'lgan mahsulotlar uchun "
+            "quyidagi oynalar yetmaydi (oyna buyurtma qiling):\n" + "\n".join(xom_lines)
+        )
+    return text or None
 
 
 def compute_order_sale_value(guruh_id: int) -> int:
@@ -6668,6 +6730,11 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
         if payment_note:
             missing_rates.append(payment_note)
 
+    used_xom = set()
+    info_entries = [(m, i, a, mt) for _, m, i, a, mt, _ in rows]
+    for m, it in explode_entries_to_items(cur, info_entries):
+        used_xom |= {x for x, per in get_xom_requirements(cur, m, it).items() if per}
+
     cur.execute(
         "UPDATE orders SET status = 'bajarildi', bajarildi_at = ? WHERE guruh_id = ?",
         (now, guruh_id),
@@ -6677,6 +6744,11 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
 
     lines = [f"✅ №{guruh_id} buyurtma bajarildi deb belgilandi.", "Zaxiradan chiqarildi:"]
     lines.extend(all_result_lines)
+    if used_xom:
+        lines.append(
+            "\n🧵 Oyna/xomashyo: " + ", ".join(sorted(used_xom))
+            + " - kirim paytida allaqachon ayrilgan, bu yerda ayrilmadi."
+        )
     if is_dastavka:
         lines.append(
             "\n🚚 Dastavka (o'rnatishsiz jo'natish) - ishchiga yig'ish puli yozilmadi, "
