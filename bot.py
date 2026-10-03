@@ -372,6 +372,20 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS xom_kutish (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT NOT NULL COLLATE NOCASE,
+            amount INTEGER NOT NULL,
+            user_name TEXT,
+            user_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'kutilmoqda',  -- kutilmoqda / tasdiqlandi / rad / bekor
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS avanslar (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             worker TEXT NOT NULL COLLATE NOCASE,
@@ -761,6 +775,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     payment_line = ""
     xom_line = ""
+    pending_xom_id = None
     if change_type == "kirim":
         # Agar shu foydalanuvchi bog'langan ishchi bo'lsa, kirim = upakovka ishi
         # deb hisoblab, avtomatik to'lovni yozib qo'yamiz.
@@ -783,28 +798,18 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             else:
                 payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
 
-        # Tayyor mahsulot ishlab chiqarilgani uchun, unga ketadigan xomashyolarni
-        # (agar tarkibi belgilangan bo'lsa) avtomatik omborxonadan ayirib boramiz.
+        # Tayyor mahsulotga xomashyo (masalan oyna) ketadigan bo'lsa, uni DARHOL ayirmaymiz:
+        # avval "o'rnatildimi?" deb so'raymiz, faqat "Ha" bosilganda ayiramiz.
         xom_needs = get_xom_requirements(cur, model, item)
-        if xom_needs:
-            xom_lines = []
-            for xomashyo, per_unit in xom_needs.items():
-                need = per_unit * amount
-                cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
-                xrow = cur.fetchone()
-                current_xom = xrow[0] if xrow else 0
-                new_xom = current_xom - need
-                shortage = new_xom < 0
-                if shortage:
-                    new_xom = 0
-                cur.execute(
-                    "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
-                    "ON CONFLICT(name) DO UPDATE SET quantity = excluded.quantity",
-                    (xomashyo, new_xom),
-                )
-                warn = " ⚠️ yetarli emas edi!" if shortage else ""
-                xom_lines.append(f"• {xomashyo}: -{need}{warn}")
-            xom_line = "\n🧵 Xomashyodan ayirildi:\n" + "\n".join(xom_lines)
+        if any(per_unit * amount for per_unit in xom_needs.values()):
+            cur.execute(
+                "INSERT INTO xom_kutish (model, item, amount, user_name, user_id, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'kutilmoqda', ?)",
+                (model, item, amount, user_name, user_id, datetime.now().isoformat(timespec="seconds")),
+            )
+            pending_xom_id = cur.lastrowid
+            names = ", ".join(f"{x} -{per * amount}" for x, per in xom_needs.items() if per * amount)
+            xom_line = f"\n\n🧵 {names}\n❓ Oyna/xomashyo o'rnatildimi? (Ha bosilganda omborxonadan ayiriladi)"
 
     conn.commit()
     conn.close()
@@ -820,7 +825,15 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         text += payment_line
     if xom_line:
         text += xom_line
-    await update.effective_message.reply_text(text)
+    markup = None
+    if pending_xom_id is not None:
+        markup = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ Ha, o'rnatildi", callback_data=f"xq:{pending_xom_id}:yes"),
+                InlineKeyboardButton("❌ Yo'q", callback_data=f"xq:{pending_xom_id}:no"),
+            ]]
+        )
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 async def sb_start(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
@@ -2267,6 +2280,120 @@ def get_xom_requirements(cur, model: str, item: str):
     return result
 
 
+def apply_xom_deduction(cur, model, item, amount):
+    """Model+detal uchun amount dona tayyor mahsulotga ketadigan xomashyoni ombordan ayiradi
+    (0 dan pastga tushirmaydi). Qaytaradi: matn qatorlari ro'yxati."""
+    lines = []
+    for xomashyo, per_unit in get_xom_requirements(cur, model, item).items():
+        need = per_unit * amount
+        if need == 0:
+            continue
+        cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+        xrow = cur.fetchone()
+        current_xom = xrow[0] if xrow else 0
+        new_xom = current_xom - need
+        shortage = new_xom < 0
+        if shortage:
+            new_xom = 0
+        cur.execute(
+            "INSERT INTO xomashyo (name, quantity) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET quantity = excluded.quantity",
+            (xomashyo, new_xom),
+        )
+        warn = " ⚠️ yetarli emas edi!" if shortage else ""
+        lines.append(f"• {xomashyo}: -{need}{warn}")
+    return lines
+
+
+def latest_xom_record(cur, model, item, amount=None):
+    """Shu model+detal uchun hali bekor qilinmagan eng so'nggi xom_kutish yozuvini qaytaradi
+    (id, amount, status) yoki None. amount berilsa, miqdori mos keladigani oldinroq olinadi."""
+    cur.execute(
+        "SELECT id, amount, status FROM xom_kutish WHERE model = ? AND item = ? AND status != 'bekor' "
+        "ORDER BY (amount = ?) DESC, id DESC LIMIT 1",
+        (model, item, amount if amount is not None else -1),
+    )
+    return cur.fetchone()
+
+
+async def xq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+    await query.answer()
+
+    _, id_str, action = query.data.split(":")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, amount, status FROM xom_kutish WHERE id = ?", (int(id_str),))
+    row = cur.fetchone()
+    base = query.message.text or ""
+    if row is None:
+        conn.close()
+        await query.edit_message_text(base + "\n\n⚠️ Bu so'rov topilmadi.")
+        return
+
+    model, item, amount, status = row
+    if status != "kutilmoqda":
+        conn.close()
+        holat = {"tasdiqlandi": "oyna ayirilgan", "rad": "oyna ayirilmagan", "bekor": "kirim bekor qilingan"}.get(status, status)
+        await query.edit_message_text(base + f"\n\n(Allaqachon ko'rib chiqilgan: {holat})")
+        return
+
+    if action == "yes":
+        lines = apply_xom_deduction(cur, model, item, amount)
+        cur.execute("UPDATE xom_kutish SET status = 'tasdiqlandi' WHERE id = ?", (int(id_str),))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(base + "\n\n✅ O'rnatildi, omborxonadan ayirildi:\n" + "\n".join(lines))
+    else:
+        cur.execute("UPDATE xom_kutish SET status = 'rad' WHERE id = ?", (int(id_str),))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(base + "\n\n❌ O'rnatilmadi - omborxonadan ayirilmadi.")
+
+
+async def oynatasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+    await send_pending_xom(update.message)
+
+
+async def send_pending_xom(message):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount, user_name, created_at FROM xom_kutish "
+        "WHERE status = 'kutilmoqda' ORDER BY id"
+    )
+    rows = cur.fetchall()
+    result = []
+    for rid, model, item, amount, user_name, created_at in rows:
+        needs = get_xom_requirements(cur, model, item)
+        names = ", ".join(f"{x} -{per * amount}" for x, per in needs.items() if per * amount)
+        result.append((rid, model, item, amount, user_name, created_at, names))
+    conn.close()
+
+    if not result:
+        await message.reply_text("✅ Oyna tasdig'ini kutayotgan kirim yo'q.")
+        return
+    await message.reply_text(f"⏳ Oyna tasdig'ini kutayotgan kirimlar ({len(result)} ta):")
+    for rid, model, item, amount, user_name, created_at, names in result:
+        markup = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ Ha, o'rnatildi", callback_data=f"xq:{rid}:yes"),
+                InlineKeyboardButton("❌ Yo'q", callback_data=f"xq:{rid}:no"),
+            ]]
+        )
+        await message.reply_text(
+            f"📥 {model} {item}: {amount} ta ({user_name}, {created_at.split('T')[0]})\n"
+            f"🧵 {names or 'xomashyo tarkibi o`zgargan'}\n❓ Oyna/xomashyo o'rnatildimi?",
+            reply_markup=markup,
+        )
+
+
 async def xomkirimlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -2574,14 +2701,24 @@ async def kirimbekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_qty = row[0] if row else 0
         cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (current_qty - amount, key))
 
-        # 2) Xomashyoni qaytaramiz (agar tarkib belgilangan bo'lsa)
-        xom_needs = get_xom_requirements(cur, model, item)
-        for xomashyo, per_unit in xom_needs.items():
-            need = per_unit * amount
-            cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
-            xrow = cur.fetchone()
-            current_xom = xrow[0] if xrow else 0
-            cur.execute("UPDATE xomashyo SET quantity = ? WHERE name = ?", (current_xom + need, xomashyo))
+        # 2) Xomashyoni qaytaramiz - faqat u haqiqatan ayrilgan bo'lsa ("Ha" bosilgan yoki eski kirim).
+        restore_xom = True
+        rec = latest_xom_record(cur, model, item, amount)
+        if rec is not None:
+            rid, ramount, rstatus = rec
+            restore_xom = rstatus == "tasdiqlandi"
+            if amount >= ramount:
+                cur.execute("UPDATE xom_kutish SET status = 'bekor' WHERE id = ?", (rid,))
+            else:
+                cur.execute("UPDATE xom_kutish SET amount = ? WHERE id = ?", (ramount - amount, rid))
+        if restore_xom:
+            xom_needs = get_xom_requirements(cur, model, item)
+            for xomashyo, per_unit in xom_needs.items():
+                need = per_unit * amount
+                cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (xomashyo,))
+                xrow = cur.fetchone()
+                current_xom = xrow[0] if xrow else 0
+                cur.execute("UPDATE xomashyo SET quantity = ? WHERE name = ?", (current_xom + need, xomashyo))
 
         # 3) Bog'liq to'lanmagan upakovka ishchi puli yozuvini o'chiramiz
         cur.execute(
@@ -2683,6 +2820,13 @@ async def kirimmodeltuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE)
         old_needs = get_xom_requirements(cur, old_model, item)
         new_needs = get_xom_requirements(cur, new_model, item)
         xom_names = set(old_needs) | set(new_needs)
+        rec = latest_xom_record(cur, old_model, item, amount)
+        if rec is not None:
+            rid, ramount, rstatus = rec
+            # Yozuvni yangi modelga ko'chiramiz; ayirilmagan (kutilmoqda/rad) bo'lsa, ombor hisobi o'zgarmaydi.
+            cur.execute("UPDATE xom_kutish SET model = ? WHERE id = ?", (new_model, rid))
+            if rstatus != "tasdiqlandi":
+                xom_names = set()
         for xomashyo in xom_names:
             delta = (old_needs.get(xomashyo, 0) - new_needs.get(xomashyo, 0)) * amount
             if delta:
@@ -2785,6 +2929,7 @@ async def oyna_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             [InlineKeyboardButton("📦 Qoldiqni ko'rish", callback_data="oy:qoldiq")],
             [InlineKeyboardButton("📥 Kirim qilish", callback_data="oy:kirim")],
+            [InlineKeyboardButton("⏳ Tasdiqlanmaganlar", callback_data="oy:pending")],
         ]
     )
     await update.message.reply_text("🪟 Oyna — nima qilamiz?", reply_markup=buttons)
@@ -2841,6 +2986,10 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     oy = context.user_data.setdefault("oy", {})
+
+    if data == "oy:pending":
+        await send_pending_xom(query.message)
+        return
 
     if data == "oy:qoldiq":
         conn = get_conn()
@@ -4390,6 +4539,16 @@ async def kirimtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"👷 {worker} — bu ishga hisoblangan upakovka puli butunlay bekor qilindi.")
 
     xom_needs = get_xom_requirements(cur, matched_model, item)
+    rec = latest_xom_record(cur, matched_model, item)
+    if rec is not None:
+        left = rec[1] - excess
+        if left > 0:
+            cur.execute("UPDATE xom_kutish SET amount = ? WHERE id = ?", (left, rec[0]))
+        else:
+            cur.execute("UPDATE xom_kutish SET status = 'bekor' WHERE id = ?", (rec[0],))
+        if rec[2] != "tasdiqlandi":
+            # Oyna hali ayirilmagan (tasdiq kutilmoqda yoki "Yo'q" bosilgan) - qaytaradigan narsa yo'q.
+            xom_needs = {}
     if xom_needs:
         xom_lines = []
         for xomashyo, per_unit in xom_needs.items():
@@ -7354,6 +7513,8 @@ def main():
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
     app.add_handler(CommandHandler("xomtarkibiochirish", xomtarkibiochirish))
     app.add_handler(CommandHandler("xomnomi", xomnomi))
+    app.add_handler(CommandHandler("oynatasdiq", oynatasdiq))
+    app.add_handler(CallbackQueryHandler(xq_callback, pattern=r"^xq:"))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
     app.add_handler(CommandHandler("xomkirimlar", xomkirimlar))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
