@@ -2822,7 +2822,11 @@ def oyna_usage_label(cur, xomashyo_name):
             return " (" + ", ".join(models) + " — " + items[0] + ")"
         return " (" + ", ".join(f"{m} {i}" for m, i in rows) + ")"
     name_lower = xomashyo_name.lower()
-    missing_items = [i for i in items if i.lower() not in name_lower]
+    missing_items = [
+        i for i in items
+        if i.lower() not in name_lower
+        and not (UPGRADE_BASE_ITEM.get(i.lower()) and UPGRADE_BASE_ITEM[i.lower()] in name_lower)
+    ]
     if not missing_items:
         return ""
     return " (" + ", ".join(missing_items) + ")"
@@ -4464,6 +4468,124 @@ async def xomtarkiblar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply.append(f"  {ln}")
         reply.append("\nFormat: <model> <detal> <xomashyo> <miqdor>")
     await update.message.reply_text("\n".join(reply))
+
+
+def _bulk_or_single_lines(update, context):
+    """Xabar bir nechta qatordan iborat bo'lsa - birinchi qatordan keyingi qatorlarni,
+    aks holda buyruqdan keyingi argumentlarni bitta qator sifatida qaytaradi."""
+    text = update.message.text or ""
+    raw_lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if len(raw_lines) > 1:
+        return raw_lines[1:]
+    if context.args:
+        return [" ".join(context.args)]
+    return []
+
+
+async def xomtarkibiochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Xomashyo tarkibidagi (qaysi detalga qaysi oyna bog'langan) yozuvni butunlay o'chiradi.\n\n"
+        "Foydalanish: /xomtarkibiochirish <model> <detal> <xomashyo>\n"
+        "Misol: /xomtarkibiochirish maya kamod maya-oyna\n\n"
+        "Bir nechtasini birdan:\n"
+        "/xomtarkibiochirish\n"
+        "maya kamod maya-oyna\n"
+        "bella kamod bella-oyna"
+    )
+    lines = _bulk_or_single_lines(update, context)
+    if not lines:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    done, missing, bad = [], [], []
+    for ln in lines:
+        tokens = ln.split()
+        if len(tokens) != 3:
+            bad.append(ln)
+            continue
+        model, item, xomashyo = (t.lower() for t in tokens)
+        cur.execute(
+            "DELETE FROM xomashyo_tarkibi WHERE model = ? AND item = ? AND xomashyo = ?",
+            (model, item, xomashyo),
+        )
+        if cur.rowcount:
+            done.append(f"• {model} {item} → {xomashyo}")
+        else:
+            missing.append(f"• {model} {item} → {xomashyo}")
+    conn.commit()
+    conn.close()
+
+    out = []
+    if done:
+        out.append(f"✅ O'chirildi ({len(done)} ta):")
+        out.extend(done)
+    if missing:
+        out.append(f"\n⚠️ Bunday bog'lanish topilmadi ({len(missing)} ta):")
+        out.extend(missing)
+    if bad:
+        out.append(f"\n⚠️ Tushunilmadi ({len(bad)} ta): format <model> <detal> <xomashyo>")
+        out.extend(f"  {b}" for b in bad)
+    await update.message.reply_text("\n".join(out))
+
+
+async def xomnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    usage = (
+        "Xomashyo (oyna) nomini o'zgartiradi. Qoldiq va detallarga bog'lanishlar yangi nomga "
+        "ko'chadi, hech narsa yo'qolmaydi.\n\n"
+        "Foydalanish: /xomnomi <eski nom> <yangi nom>\n"
+        "Misol: /xomnomi maya-oyna maya-shkaf-oyna\n\n"
+        "Bir nechtasini birdan:\n"
+        "/xomnomi\n"
+        "maya-oyna maya-shkaf-oyna\n"
+        "bella-oyna bella-shkaf-oyna"
+    )
+    lines = _bulk_or_single_lines(update, context)
+    if not lines:
+        await update.message.reply_text(usage)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    done, errors = [], []
+    for ln in lines:
+        tokens = ln.split()
+        if len(tokens) != 2:
+            errors.append(f"• '{ln}' — format: <eski nom> <yangi nom>")
+            continue
+        old, new = tokens[0].lower(), tokens[1].lower()
+        cur.execute("SELECT quantity FROM xomashyo WHERE name = ?", (old,))
+        row = cur.fetchone()
+        if row is None:
+            errors.append(f"• '{old}' topilmadi")
+            continue
+        cur.execute("SELECT 1 FROM xomashyo WHERE name = ?", (new,))
+        if cur.fetchone() is not None:
+            errors.append(f"• '{new}' nomi allaqachon bor, '{old}' o'zgartirilmadi")
+            continue
+        cur.execute("UPDATE xomashyo SET name = ? WHERE name = ?", (new, old))
+        cur.execute("UPDATE xomashyo_tarkibi SET xomashyo = ? WHERE xomashyo = ?", (new, old))
+        done.append(f"• {old} → {new} (qoldiq: {row[0]} ta saqlandi)")
+    conn.commit()
+    conn.close()
+
+    out = []
+    if done:
+        out.append(f"✅ Nomi o'zgartirildi ({len(done)} ta):")
+        out.extend(done)
+    if errors:
+        out.append(f"\n⚠️ O'zgartirilmadi ({len(errors)} ta):")
+        out.extend(errors)
+    await update.message.reply_text("\n".join(out))
 
 
 async def xommodeltarkibi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7230,6 +7352,8 @@ def main():
     app.add_handler(CommandHandler("xomqoldiq", xomqoldiq))
     app.add_handler(CommandHandler("xomtarkibi", xomtarkibi))
     app.add_handler(CommandHandler("xommodeltarkibi", xommodeltarkibi))
+    app.add_handler(CommandHandler("xomtarkibiochirish", xomtarkibiochirish))
+    app.add_handler(CommandHandler("xomnomi", xomnomi))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
     app.add_handler(CommandHandler("xomkirimlar", xomkirimlar))
     app.add_handler(CommandHandler("kirimtuzatish", kirimtuzatish))
