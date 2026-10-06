@@ -248,6 +248,10 @@ def init_db():
         )
         """
     )
+    cur.execute("PRAGMA table_info(worker_accounts)")
+    if "kirim_huquqi" not in [r[1] for r in cur.fetchall()]:
+        # 1 = kirim/upakovka qila oladi (avvalgi holat), 0 = faqat ko'rish va "bajarildi" belgilash
+        cur.execute("ALTER TABLE worker_accounts ADD COLUMN kirim_huquqi INTEGER NOT NULL DEFAULT 1")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS work_log (
@@ -550,9 +554,24 @@ def get_linked_worker(update: Update):
     return row[0] if row else None
 
 
-def can_kirim(update: Update) -> bool:
-    """Kirim (upakovka) qilish huquqi: egasi yoki bog'langan ishchi."""
+def is_member(update: Update) -> bool:
+    """Jamoa a'zosi: egasi yoki botga bog'langan ixtiyoriy ishchi (ko'rish, 'bajarildi' belgilash)."""
     return is_owner(update) or get_linked_worker(update) is not None
+
+
+def can_kirim(update: Update) -> bool:
+    """Kirim/upakovka/spinka qilish huquqi: egasi yoki kirim huquqi berilgan bog'langan ishchi."""
+    if is_owner(update):
+        return True
+    user = update.effective_user
+    if not user:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT kirim_huquqi FROM worker_accounts WHERE telegram_id = ?", (user.id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
 
 
 async def deny_access(update: Update):
@@ -561,8 +580,8 @@ async def deny_access(update: Update):
         return
     if get_linked_worker(update) is not None:
         await target.reply_text(
-            "Kechirasiz, faqat egasi mahsulot kirim/chiqim/o'chirish qila oladi. "
-            "Siz /qoldiq, /modellar va /tarix orqali ko'rib turishingiz mumkin."
+            "Kechirasiz, bu amalni faqat egasi (yoki kirim huquqi berilgan ishchi) qila oladi. "
+            "Siz ko'rishingiz (/qoldiq, /buyurtmalar) va buyurtmani 'bajarildi' deb belgilashingiz mumkin."
         )
     else:
         await target.reply_text("Kechirasiz, bu bot faqat ichki foydalanish uchun.")
@@ -702,6 +721,9 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
 
 
 async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args):
+    if change_type == "kirim" and not can_kirim(update):
+        await deny_access(update)
+        return
     if len(args) < 3:
         cmd = "/kirim" if change_type == "kirim" else "/chiqim"
         await update.effective_message.reply_text(
@@ -946,7 +968,7 @@ async def sb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     sb = context.user_data.get("sb")
     mode = sb.get("mode") if sb else None
-    allowed = is_owner(update) or (mode == "kirim" and get_linked_worker(update) is not None)
+    allowed = is_owner(update) or (mode == "kirim" and can_kirim(update))
     if not allowed:
         await query.answer("Faqat egasi (yoki ruxsat berilgan ishchi kirim uchun) qila oladi.", show_alert=True)
         return
@@ -1604,7 +1626,7 @@ def stock_indicator(quantity: int) -> str:
 
 
 async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -1640,7 +1662,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (8) | upakovkachilar ro'yxati"
+BOT_VERSION = "2026-10-06 (9) | kirim huquqi ishchi bo'yicha"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -1668,7 +1690,7 @@ def upgrade_auto_exclusions(entries):
 
 
 async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -1711,7 +1733,7 @@ async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -1775,7 +1797,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -2050,7 +2072,7 @@ async def narxtozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -2116,7 +2138,7 @@ async def maoshdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -2349,7 +2371,7 @@ async def modeltartib(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tartib_korish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -2556,6 +2578,56 @@ async def kk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         extra = f"{total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
     await query.edit_message_text(base + f"\n\n✅ {worker} — upakovka: {extra}")
+
+
+async def kirimhuquqi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    args = context.args
+
+    if not args:
+        cur.execute("SELECT worker_name, kirim_huquqi FROM worker_accounts ORDER BY worker_name")
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text("Botga bog'langan ishchi yo'q. Bog'lash: /ishchiulash <ism> <telegram id>")
+            return
+        lines = ["🔐 Bog'langan ishchilar huquqi:\n"]
+        for name, h in rows:
+            lines.append(f"• {name}: " + ("kirim qila oladi ✅" if h else "faqat ko'rish va 'bajarildi' ⛔ (kirim yo'q)"))
+        lines.append("\nO'zgartirish: /kirimhuquqi <ishchi ismi> ha  yoki  yoq")
+        lines.append("Misol: /kirimhuquqi Hojiakbar yoq")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if len(args) < 2 or args[-1].lower() not in ("ha", "yoq", "yo'q"):
+        conn.close()
+        await update.message.reply_text("Foydalanish: /kirimhuquqi <ishchi ismi> ha|yoq\nMisol: /kirimhuquqi Hojiakbar yoq")
+        return
+
+    name = " ".join(args[:-1]).strip()
+    value = 1 if args[-1].lower() == "ha" else 0
+    cur.execute("UPDATE worker_accounts SET kirim_huquqi = ? WHERE worker_name = ?", (value, name))
+    if cur.rowcount == 0:
+        cur.execute("SELECT worker_name FROM worker_accounts ORDER BY worker_name")
+        known = ", ".join(r[0] for r in cur.fetchall()) or "yo'q"
+        conn.close()
+        await update.message.reply_text(
+            f"'{name}' botga bog'langan ishchilar orasida topilmadi.\nBog'langanlar: {known}"
+        )
+        return
+    conn.commit()
+    conn.close()
+    if value:
+        await update.message.reply_text(f"✅ {name} endi kirim qila oladi.")
+    else:
+        await update.message.reply_text(
+            f"⛔ {name} endi kirim qila olmaydi. U faqat ko'ra oladi va buyurtmani 'bajarildi' deb belgilay oladi."
+        )
 
 
 async def upakovkachilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2806,7 +2878,7 @@ async def xomkirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def xomqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -6680,7 +6752,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
 
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -6779,7 +6851,7 @@ async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_
 
 async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not can_kirim(update):
+    if not is_member(update):
         await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
@@ -6812,7 +6884,7 @@ async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def neww_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not can_kirim(update):
+    if not is_member(update):
         await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
@@ -6836,7 +6908,7 @@ async def neww_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def markdastavka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not can_kirim(update):
+    if not is_member(update):
         await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
@@ -6855,7 +6927,7 @@ async def markdastavka_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not can_kirim(update):
+    if not is_member(update):
         await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
     await query.answer()
@@ -6874,7 +6946,7 @@ async def workerdone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -7410,7 +7482,7 @@ async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not is_member(update):
         await deny_access(update)
         return
 
@@ -8094,6 +8166,7 @@ def main():
     app.add_handler(CommandHandler("oynatasdiq", oynatasdiq))
     app.add_handler(CommandHandler("kirimkimlar", kirimkimlar))
     app.add_handler(CommandHandler("upakovkachilar", upakovkachilar))
+    app.add_handler(CommandHandler("kirimhuquqi", kirimhuquqi))
     app.add_handler(CallbackQueryHandler(kk_callback, pattern=r"^kk:"))
     app.add_handler(CallbackQueryHandler(xq_callback, pattern=r"^xq:"))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
