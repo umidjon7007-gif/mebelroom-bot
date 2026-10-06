@@ -59,6 +59,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx har so'rovni (URL ichida bot tokeni bilan) INFO darajasida logga yozadi - tokenni
+# loglarda ochiq qoldirmaslik uchun faqat ogohlantirish va xatolarni qoldiramiz.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Tugmalar tez-tez bosilganda (masalan '+'/'-' hisoblagichda chegaraga yetganda),
 # Telegram "xabar o'zgarmadi" degan zararsiz xatoni beradi. Buni butun bot bo'ylab
@@ -1594,7 +1598,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (4) | tugmali oqimda raqam + izoh, /zaxiranusxa"
+BOT_VERSION = "2026-10-06 (5) | loglarda token yashirildi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
