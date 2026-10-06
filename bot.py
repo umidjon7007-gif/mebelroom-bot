@@ -1155,6 +1155,9 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
         [guruh_id] + [oid for oid, _, _, _ in created],
     )
+    raqam = ob.get("raqam")
+    if raqam:
+        cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (raqam, guruh_id))
 
     entries_4 = [(m, i, a, None) for m, i, a in entries]
     shortage_text = shortage_warning_for_new_order(cur, entries_4)
@@ -1166,7 +1169,7 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (f"{entry_model} komplekt" if item is None else f"{entry_model} {item} ({amount} ta)")
         for _, entry_model, item, amount in created
     )
-    lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
+    lines = [f"📝 Yangi buyurtma qabul qilindi — {order_label(guruh_id, raqam)}:", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
@@ -1384,6 +1387,42 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Kunni faqat raqam bilan yozing. Misol: 14")
             return
         ob["day"] = int(text)
+        if compute_deadline(ob["day"], MONTH_NAMES[ob["month"]]) is None:
+            await update.message.reply_text("Sana noto'g'ri. Qaytadan /buyurtma tugmasini bosing.")
+            context.user_data["ob"] = None
+            context.user_data["awaiting"] = None
+            return
+        context.user_data["awaiting"] = "buyurtma_raqam"
+        await update.message.reply_text(
+            "🔢 Guruhdagi buyurtma raqamini yozing (masalan: 20).\n"
+            "Guruhda bu buyurtma qaysi raqam bilan yozilgan bo'lsa, shuni kiriting."
+        )
+        return
+
+    if awaiting == "buyurtma_raqam":
+        ob = context.user_data.get("ob")
+        if ob is None:
+            context.user_data["awaiting"] = None
+            return
+        raqam = text.strip().lstrip("#№").rstrip(").:").strip()
+        if not raqam.isdigit():
+            await update.message.reply_text("Raqamni faqat son bilan yozing. Misol: 20")
+            return
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT guruh_id FROM orders WHERE tashqi_raqam = ? AND status = 'kutilmoqda'",
+            (raqam,),
+        )
+        dup = cur.fetchone()
+        conn.close()
+        if dup:
+            await update.message.reply_text(
+                f"⚠️ №{raqam} raqamli buyurtma allaqachon kutilmoqda (bot raqami: {dup[0]}).\n"
+                "Boshqa raqam yozing (yoki bekor qilish uchun '✅ Tayyor' tugmasini bosing)."
+            )
+            return
+        ob["raqam"] = raqam
         await ob_finalize_order(update, context)
         return
 
@@ -1524,7 +1563,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (2) | buyurtma raqami asosiy + izoh"
+BOT_VERSION = "2026-10-06 (3) | raqam tugmali oqimda + /zaxiranusxa"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -3702,6 +3741,47 @@ async def buyurtmasana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🕐 №{guruh_id} botga yozilgan sana: {date_part}" + (f", soat {time_part}" if time_part else "")
     )
+
+
+async def zaxiranusxa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        # sqlite backup API: baza ishlab turgan paytda ham butun, buzilmagan nusxa beradi.
+        src_conn = sqlite3.connect(DB_PATH)
+        dst_conn = sqlite3.connect(tmp_path)
+        src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+
+        size = os.path.getsize(tmp_path)
+        if size > 49 * 1024 * 1024:
+            await update.message.reply_text(
+                f"⚠️ Baza juda katta ({size // (1024 * 1024)} MB), Telegram orqali yuborib bo'lmaydi (50 MB chegara)."
+            )
+            return
+
+        today = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d")
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"zaxira_{today}.db",
+                caption=(
+                    f"💾 Bazaning nusxasi ({today}, {size // 1024} KB).\n"
+                    "Buni telefoningizda yoki kompyuteringizda saqlab qo'ying."
+                ),
+            )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 async def versiya(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7733,6 +7813,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
     app.add_handler(CommandHandler("buyurtmaizoh", buyurtmaizoh))
     app.add_handler(CommandHandler("versiya", versiya))
+    app.add_handler(CommandHandler("zaxiranusxa", zaxiranusxa))
     app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
