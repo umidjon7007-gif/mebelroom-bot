@@ -1524,7 +1524,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 | buyurtma raqami asosiy + izoh"
+BOT_VERSION = "2026-10-06 (2) | buyurtma raqami asosiy + izoh"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
