@@ -62,8 +62,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # httpx har so'rovni (URL ichida bot tokeni bilan) INFO darajasida logga yozadi - tokenni
 # loglarda ochiq qoldirmaslik uchun faqat ogohlantirish va xatolarni qoldiramiz.
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _QuietPolling(logging.Filter):
+    """httpx loglarida oddiy (muvaffaqiyatli) getUpdates so'rovlarini yashiradi, qolganini
+    (javob yuborish sendMessage va har qanday xato) ko'rsatadi."""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not ("getUpdates" in msg and "200 OK" in msg)
+
+
+logging.getLogger("httpx").addFilter(_QuietPolling())
+logging.getLogger("httpx").setLevel(logging.INFO)
 
 
 class _TokenRedactor(logging.Filter):
@@ -1683,7 +1698,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (10) | diagnostika: kelgan xabarlar logda"
+BOT_VERSION = "2026-10-06 (11) | diagnostika: javob yuborish logda"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
