@@ -379,6 +379,13 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS upakovkachilar (
+            name TEXT PRIMARY KEY COLLATE NOCASE
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS kirim_kim (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             model TEXT NOT NULL COLLATE NOCASE,
@@ -826,8 +833,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
         else:
             # Ishchi o'zi emas (odatda ega kiritmoqda): upakovka puli kimga yozilishini so'raymiz.
-            cur.execute("SELECT COUNT(*) FROM workers")
-            if cur.fetchone()[0]:
+            if upakovka_workers(cur):
                 cur.execute(
                     "INSERT INTO kirim_kim (model, item, amount, status, created_at) "
                     "VALUES (?, ?, ?, 'kutilmoqda', ?)",
@@ -1634,7 +1640,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (7) | kirimda 'kim uchun' tugmalari"
+BOT_VERSION = "2026-10-06 (8) | upakovkachilar ro'yxati"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2455,11 +2461,23 @@ def latest_xom_record(cur, model, item, amount=None):
     return cur.fetchone()
 
 
+def upakovka_workers(cur):
+    """Upakovka puli yoziladigan ishchilar: [(rowid, name), ...]. Maxsus ro'yxat
+    belgilanmagan bo'lsa (yoki undagi ismlar topilmasa) - hamma ishchilar."""
+    cur.execute(
+        "SELECT rowid, name FROM workers WHERE name IN (SELECT name FROM upakovkachilar) ORDER BY name"
+    )
+    rows = cur.fetchall()
+    if rows:
+        return rows
+    cur.execute("SELECT rowid, name FROM workers ORDER BY name")
+    return cur.fetchall()
+
+
 def kim_keyboard(kid):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT rowid, name FROM workers ORDER BY name")
-    workers = cur.fetchall()
+    workers = upakovka_workers(cur)
     conn.close()
     rows, row = [], []
     for rid, name in workers:
@@ -2538,6 +2556,65 @@ async def kk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         extra = f"{total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
     await query.edit_message_text(base + f"\n\n✅ {worker} — upakovka: {extra}")
+
+
+async def upakovkachilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    text = " ".join(context.args).strip()
+    cur.execute("SELECT name FROM workers ORDER BY name")
+    all_workers = [r[0] for r in cur.fetchall()]
+
+    if not text:
+        cur.execute("SELECT name FROM upakovkachilar ORDER BY name")
+        current = [r[0] for r in cur.fetchall()]
+        conn.close()
+        shown = ", ".join(current) if current else "hamma ishchilar"
+        await update.message.reply_text(
+            f"📦 Kirimda 'kim uchun?' tugmalarida chiqadigan ishchilar: {shown}\n\n"
+            "O'zgartirish: /upakovkachilar Ibrohim, Abdulloh\n"
+            "(ismlarni vergul bilan ajrating)\n"
+            "Hammasini qaytarish: /upakovkachilar hammasi\n"
+            f"Mavjud ishchilar: {', '.join(all_workers)}"
+        )
+        return
+
+    if text.lower() == "hammasi":
+        cur.execute("DELETE FROM upakovkachilar")
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("✅ Endi tugmalarda hamma ishchilar chiqadi.")
+        return
+
+    wanted = [n.strip() for n in text.split(",") if n.strip()]
+    lookup = {w.lower(): w for w in all_workers}
+    found, missing = [], []
+    for n in wanted:
+        if n.lower() in lookup:
+            found.append(lookup[n.lower()])
+        else:
+            missing.append(n)
+    if missing or not found:
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ Bunday ishchi topilmadi: {', '.join(missing) if missing else text}\n"
+            f"Mavjud ishchilar: {', '.join(all_workers)}\n"
+            "Hech narsa o'zgartirilmadi."
+        )
+        return
+
+    cur.execute("DELETE FROM upakovkachilar")
+    for w in found:
+        cur.execute("INSERT OR IGNORE INTO upakovkachilar (name) VALUES (?)", (w,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ Kirimda 'kim uchun?' tugmalarida endi faqat shular chiqadi: {', '.join(found)}"
+    )
 
 
 async def kirimkimlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8016,6 +8093,7 @@ def main():
     app.add_handler(CommandHandler("xomnomi", xomnomi))
     app.add_handler(CommandHandler("oynatasdiq", oynatasdiq))
     app.add_handler(CommandHandler("kirimkimlar", kirimkimlar))
+    app.add_handler(CommandHandler("upakovkachilar", upakovkachilar))
     app.add_handler(CallbackQueryHandler(kk_callback, pattern=r"^kk:"))
     app.add_handler(CallbackQueryHandler(xq_callback, pattern=r"^xq:"))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
