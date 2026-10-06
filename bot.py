@@ -1524,6 +1524,8 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
+BOT_VERSION = "2026-10-06 | buyurtma raqami asosiy + izoh"
+
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
 # Standart komplekt detalini "yangilangan variant" bilan almashtirish uchun ishlatiladi
@@ -3700,6 +3702,13 @@ async def buyurtmasana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🕐 №{guruh_id} botga yozilgan sana: {date_part}" + (f", soat {time_part}" if time_part else "")
     )
+
+
+async def versiya(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    await update.message.reply_text(f"🤖 Bot versiyasi: {BOT_VERSION}")
 
 
 async def buyurtmaizoh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7723,6 +7732,7 @@ def main():
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
     app.add_handler(CommandHandler("buyurtmaizoh", buyurtmaizoh))
+    app.add_handler(CommandHandler("versiya", versiya))
     app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
