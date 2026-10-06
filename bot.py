@@ -54,6 +54,7 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+from telegram import MessageEntity
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1698,7 +1699,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (12) | diagnostika: buyruq boshlandi/tugadi"
+BOT_VERSION = "2026-10-06 (13) | nusxalangan buyruqlar ham ishlaydi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4196,6 +4197,28 @@ def _wrap_commands_for_logging(app):
             if isinstance(h, CommandHandler):
                 name = sorted(h.commands)[0] if h.commands else "?"
                 h.callback = make(h.callback, name)
+
+
+async def fix_pasted_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram'da buyruqni boshqa joydan (masalan kod bloki) nusxalab yuborilsa, u 'buyruq' emas,
+    'kod' (monospace) deb belgilanib qoladi va bot javob bermaydi. Matn '/' bilan boshlansa,
+    uni buyruq sifatida belgilab qo'yamiz."""
+    try:
+        msg = update.effective_message
+        if msg is None or not msg.text or not msg.text.startswith("/"):
+            return
+        m = re.match(r"/[A-Za-z0-9_]+(?:@\w+)?", msg.text)
+        if not m:
+            return
+        entities = list(msg.entities or ())
+        if any(e.type == MessageEntity.BOT_COMMAND and e.offset == 0 for e in entities):
+            return
+        entities = [e for e in entities if e.offset >= m.end() or e.offset + e.length <= 0 or e.offset != 0]
+        entities.insert(0, MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=m.end()))
+        with msg._unfrozen():
+            msg.entities = tuple(entities)
+    except Exception:
+        logger.exception("fix_pasted_command xatosi")
 
 
 async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8257,6 +8280,7 @@ def main():
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
     app.add_handler(CommandHandler("buyurtmaizoh", buyurtmaizoh))
+    app.add_handler(TypeHandler(Update, fix_pasted_command), group=-2)
     app.add_handler(TypeHandler(Update, log_incoming_update), group=-1)
     app.add_handler(CommandHandler("versiya", versiya))
     app.add_handler(CommandHandler("zaxiranusxa", zaxiranusxa))
