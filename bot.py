@@ -2605,11 +2605,19 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
     return ordered[:limit]
 
 
+def order_label(guruh_id, tashqi_raqam=None):
+    """Guruhdagi raqam bo'lsa u asosiy ko'rsatiladi, botning raqami qavsda; bo'lmasa faqat botning raqami."""
+    if tashqi_raqam:
+        return f"№{tashqi_raqam} (bot raqami: {guruh_id})"
+    return f"№{guruh_id}"
+
+
 def format_fulfilled_group_text(group):
     bajarildi_date = group["bajarildi_at"].split("T")[0] if group["bajarildi_at"] else "?"
-    lines = [f"✅ Buyurtma №{group['guruh_id']} — {group['deadline_display']} (bajarildi: {bajarildi_date})"]
-    if group.get("tashqi_raqam"):
-        lines.append(f"Tashqi raqam: #{group['tashqi_raqam']}")
+    lines = [
+        f"✅ Buyurtma {order_label(group['guruh_id'], group.get('tashqi_raqam'))} — "
+        f"{group['deadline_display']} (bajarildi: {bajarildi_date})"
+    ]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
@@ -5414,7 +5422,7 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
 
     lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
     if tashqi_raqam:
-        lines.append(f"Tashqi raqam: #{tashqi_raqam}")
+        lines.append(f"Guruhdagi raqam: №{tashqi_raqam}")
     lines.append(f"Taxminiy model: {model}")
     if len(entries) == 1 and entries[0][0] is None:
         lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
@@ -5601,7 +5609,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     what_all = ", ".join(describe(item, amount, mod_type) for item, amount, mod_type in entries)
     final_text = (
         query.message.text
-        + f"\n\n✅ Tasdiqlandi! Buyurtma №{guruh_id} yaratildi: {what_all}, muddat {deadline_display}."
+        + f"\n\n✅ Tasdiqlandi! Buyurtma {order_label(guruh_id, tashqi_raqam)} yaratildi: {what_all}, muddat {deadline_display}."
     )
     if shortage_text:
         final_text += shortage_text
@@ -5810,12 +5818,10 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     what_all = ", ".join(
         describe(entry_model, item, amount, mod_type) for _, entry_model, item, amount, mod_type in created
     )
-    lines = [f"📝 Yangi buyurtma qabul qilindi (№{guruh_id}):", what_all]
+    lines = [f"📝 Yangi buyurtma qabul qilindi — {order_label(guruh_id, tashqi_raqam)}:", what_all]
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
-    if tashqi_raqam:
-        lines.append(f"Tashqi raqam: #{tashqi_raqam}")
     lines.append("Holati: Kutilmoqda")
     if shortage_text:
         lines.append(shortage_text)
@@ -6127,9 +6133,10 @@ def format_group_text(group):
         days_text = f"muddati {abs(days_left)} kun o'tgan"
         urgency = "🔴"
 
-    lines = [f"{urgency} Buyurtma №{group['guruh_id']} — {group['deadline_display']} ({days_text})"]
-    if group.get("tashqi_raqam"):
-        lines.append(f"Tashqi raqam: #{group['tashqi_raqam']}")
+    lines = [
+        f"{urgency} Buyurtma {order_label(group['guruh_id'], group.get('tashqi_raqam'))} — "
+        f"{group['deadline_display']} ({days_text})"
+    ]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
     lines.append("")
@@ -6211,7 +6218,7 @@ async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for group in groups:
         text = format_group_text(group)
         button = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"✅ №{group['guruh_id']} topshirildi", callback_data=f"orddone:{group['guruh_id']}")]]
+            [[InlineKeyboardButton(f"✅ №{group.get('tashqi_raqam') or group['guruh_id']} topshirildi", callback_data=f"orddone:{group['guruh_id']}")]]
         )
         await update.message.reply_text(text, reply_markup=button)
 
