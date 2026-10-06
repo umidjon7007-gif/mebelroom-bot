@@ -51,6 +51,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -63,6 +64,26 @@ logger = logging.getLogger(__name__)
 # loglarda ochiq qoldirmaslik uchun faqat ogohlantirish va xatolarni qoldiramiz.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _TokenRedactor(logging.Filter):
+    """Loglarda bot tokenini (…/bot123:ABC…/) yashiradi - har ehtimolga qarshi."""
+
+    _pat = re.compile(r"bot\d+:[A-Za-z0-9_\-]+")
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "bot" in msg and self._pat.search(msg):
+            record.msg = self._pat.sub("bot<TOKEN>", msg)
+            record.args = ()
+        return True
+
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_TokenRedactor())
 
 # Tugmalar tez-tez bosilganda (masalan '+'/'-' hisoblagichda chegaraga yetganda),
 # Telegram "xabar o'zgarmadi" degan zararsiz xatoni beradi. Buni butun bot bo'ylab
@@ -1662,7 +1683,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (9) | kirim huquqi ishchi bo'yicha"
+BOT_VERSION = "2026-10-06 (10) | diagnostika: kelgan xabarlar logda"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4139,6 +4160,21 @@ async def zaxiranusxa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostika: botga kelgan har bir xabar/tugma haqida qisqa log (kim, nima). Hech narsani to'smaydi."""
+    try:
+        user = update.effective_user
+        if update.callback_query is not None:
+            what = f"tugma: {update.callback_query.data}"
+        elif update.effective_message is not None:
+            what = f"xabar: {(update.effective_message.text or '<matn emas>')[:40]!r}"
+        else:
+            what = "boshqa update"
+        logger.info("KELDI user_id=%s %s", user.id if user else None, what)
+    except Exception:
+        pass
 
 
 async def versiya(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8181,6 +8217,7 @@ def main():
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
     app.add_handler(CommandHandler("buyurtmaizoh", buyurtmaizoh))
+    app.add_handler(TypeHandler(Update, log_incoming_update), group=-1)
     app.add_handler(CommandHandler("versiya", versiya))
     app.add_handler(CommandHandler("zaxiranusxa", zaxiranusxa))
     app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
