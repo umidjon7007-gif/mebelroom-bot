@@ -1698,7 +1698,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (11) | diagnostika: javob yuborish logda"
+BOT_VERSION = "2026-10-06 (12) | diagnostika: buyruq boshlandi/tugadi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4177,6 +4177,27 @@ async def zaxiranusxa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+def _wrap_commands_for_logging(app):
+    """Har bir buyruq handlerini o'raydi: ishga tushganini va tugaganini logga yozadi (diagnostika)."""
+    import functools
+
+    def make(cb, name):
+        @functools.wraps(cb)
+        async def wrapper(update, context):
+            logger.info("BUYRUQ boshlandi: /%s", name)
+            try:
+                return await cb(update, context)
+            finally:
+                logger.info("BUYRUQ tugadi: /%s", name)
+        return wrapper
+
+    for group in app.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler):
+                name = sorted(h.commands)[0] if h.commands else "?"
+                h.callback = make(h.callback, name)
+
+
 async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostika: botga kelgan har bir xabar/tugma haqida qisqa log (kim, nima). Hech narsani to'smaydi."""
     try:
@@ -4184,7 +4205,11 @@ async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         if update.callback_query is not None:
             what = f"tugma: {update.callback_query.data}"
         elif update.effective_message is not None:
-            what = f"xabar: {(update.effective_message.text or '<matn emas>')[:40]!r}"
+            msg = update.effective_message
+            text = msg.text or ""
+            ents = [(e.type, e.offset, e.length) for e in (msg.entities or [])]
+            lat = "lotin" if text.isascii() else "LOTIN-EMAS"
+            what = f"xabar: {text[:40]!r} [{lat}; entity={ents}]"
         else:
             what = "boshqa update"
         logger.info("KELDI user_id=%s %s", user.id if user else None, what)
@@ -8346,6 +8371,7 @@ def main():
     logger.info("Bot ishga tushdi...")
     app.add_error_handler(global_error_handler)
 
+    _wrap_commands_for_logging(app)
     app.run_polling()
 
 
