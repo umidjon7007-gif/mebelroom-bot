@@ -536,10 +536,16 @@ def can_kirim(update: Update) -> bool:
 
 
 async def deny_access(update: Update):
-    await update.message.reply_text(
-        "Kechirasiz, faqat egasi mahsulot kirim/chiqim/o'chirish qila oladi. "
-        "Siz /qoldiq, /modellar va /tarix orqali ko'rib turishingiz mumkin."
-    )
+    target = update.effective_message
+    if target is None:
+        return
+    if get_linked_worker(update) is not None:
+        await target.reply_text(
+            "Kechirasiz, faqat egasi mahsulot kirim/chiqim/o'chirish qila oladi. "
+            "Siz /qoldiq, /modellar va /tarix orqali ko'rib turishingiz mumkin."
+        )
+    else:
+        await target.reply_text("Kechirasiz, bu bot faqat ichki foydalanish uchun.")
 
 
 MENU_BUTTONS = {
@@ -1566,6 +1572,10 @@ def stock_indicator(quantity: int) -> str:
 
 
 async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     args = context.args
     conn = get_conn()
     cur = conn.cursor()
@@ -1598,7 +1608,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (5) | loglarda token yashirildi"
+BOT_VERSION = "2026-10-06 (6) | ko'rish buyruqlari begonaga yopiq"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -1626,6 +1636,10 @@ def upgrade_auto_exclusions(entries):
 
 
 async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
@@ -1665,6 +1679,10 @@ async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
@@ -1725,6 +1743,10 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     args = context.args
     if not args:
         await update.message.reply_text("Foydalanish: /tarix <model> <detal> [soni]\nMisol: /tarix laura tumba 10")
@@ -1996,6 +2018,10 @@ async def narxtozalash(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT turi, model, item, rate FROM narxlar ORDER BY turi, model, item")
@@ -2058,6 +2084,10 @@ async def maoshdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT name FROM workers ORDER BY name")
@@ -2287,6 +2317,10 @@ async def modeltartib(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tartib_korish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -2567,6 +2601,10 @@ async def xomkirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def xomqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT name, quantity FROM xomashyo ORDER BY name")
@@ -6430,6 +6468,10 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
 
 
 async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     args = context.args or []
     model_filter = None
     customer_filter = None
@@ -7156,6 +7198,10 @@ async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
