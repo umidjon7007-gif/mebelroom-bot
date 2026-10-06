@@ -165,6 +165,9 @@ def init_db():
         # Mijoz/guruh tomonidan berilgan tashqi (o'z) buyurtma raqami - botning ichki
         # raqamidan alohida, faqat solishtirish/qidirish uchun.
         cur.execute("ALTER TABLE orders ADD COLUMN tashqi_raqam TEXT")
+    if "izoh" not in orders_columns:
+        # Buyurtmaga qo'lda yozilgan erkin izoh (masalan "krovat 110 lik, ruchkasi anta ruchkasidan")
+        cur.execute("ALTER TABLE orders ADD COLUMN izoh TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -2577,7 +2580,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
         )
         params.append(model_filter)
     cur.execute(
-        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam "
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam, izoh "
         "FROM orders WHERE " + " AND ".join(conditions) +
         " ORDER BY bajarildi_at DESC, guruh_id DESC, id ASC",
         params,
@@ -2587,7 +2590,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, bajarildi_at, tashqi_raqam, izoh in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -2596,6 +2599,7 @@ def fetch_fulfilled_order_groups(customer_filter=None, limit=20, date_filter=Non
                 "customer": customer,
                 "bajarildi_at": bajarildi_at,
                 "tashqi_raqam": tashqi_raqam,
+                "izoh": izoh,
                 "items": [],
             }
             order_of_groups.append(gid)
@@ -2620,6 +2624,8 @@ def format_fulfilled_group_text(group):
     ]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
+    if group.get("izoh"):
+        lines.append(f"📝 Izoh: {group['izoh']}")
     lines.append("")
     for _, model, item, amount, mod_type in group["items"]:
         what = f"{model} komplekt" if item is None else f"{model} {item}"
@@ -3696,6 +3702,46 @@ async def buyurtmasana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyurtmaizoh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Buyurtmaning izohini yozadi yoki o'zgartiradi.\n\n"
+        "Foydalanish: /buyurtmaizoh <botdagi raqam> <izoh matni>\n"
+        "Misol: /buyurtmaizoh 235 krovat 110 lik, ruchkasi anta ruchkasidan\n"
+        "Izohni o'chirish: /buyurtmaizoh 235 -"
+    )
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    text = " ".join(args[1:]).strip()
+    new_izoh = None if text == "-" else text
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT tashqi_raqam FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+
+    cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (new_izoh, guruh_id))
+    conn.commit()
+    conn.close()
+
+    label = order_label(guruh_id, row[0])
+    if new_izoh:
+        await update.message.reply_text(f"✅ {label} izohi yozildi:\n📝 {new_izoh}")
+    else:
+        await update.message.reply_text(f"✅ {label} izohi o'chirildi.")
+
+
 async def buyurtmaraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -3723,11 +3769,24 @@ async def buyurtmaraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
         return
 
+    cur.execute(
+        "SELECT DISTINCT guruh_id FROM orders WHERE tashqi_raqam = ? AND status = 'kutilmoqda' AND guruh_id != ?",
+        (tashqi_raqam, guruh_id),
+    )
+    dup = cur.fetchone()
+    if dup:
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ №{tashqi_raqam} raqamli buyurtma allaqachon kutilmoqda (bot raqami: {dup[0]}). "
+            "O'zgartirilmadi. Avval shu buyurtmaning raqamini tekshiring."
+        )
+        return
+
     cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ №{guruh_id} — tashqi raqam: #{tashqi_raqam} deb yozildi.")
+    await update.message.reply_text(f"✅ №{guruh_id} — raqami endi №{tashqi_raqam} deb yozildi.")
 
 
 async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5574,6 +5633,23 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # action == "yes"
+    if tashqi_raqam:
+        cur.execute(
+            "SELECT DISTINCT guruh_id FROM orders WHERE tashqi_raqam = ? AND status = 'kutilmoqda'",
+            (tashqi_raqam,),
+        )
+        dup = cur.fetchone()
+        if dup:
+            cur.execute("UPDATE pending_group_orders SET status = 'rad etildi' WHERE id = ?", (pending_id,))
+            conn.commit()
+            conn.close()
+            await query.edit_message_text(
+                query.message.text
+                + f"\n\n⚠️ №{tashqi_raqam} raqamli buyurtma allaqachon kutilmoqda (bot raqami: {dup[0]}). "
+                "Yangi buyurtma yaratilmadi."
+            )
+            return
+
     now = datetime.now().isoformat(timespec="seconds")
     created_ids = []
     for item, amount, mod_type in entries:
@@ -5634,6 +5710,17 @@ async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_args):
+    # "izoh:" so'zidan keyingi HAMMA narsa buyurtma izohi bo'ladi (qolgan tahlilga aralashmasin).
+    raw_args = list(raw_args)
+    izoh = None
+    for idx, tok in enumerate(raw_args):
+        if tok.lower().startswith("izoh:"):
+            first = tok[5:]
+            izoh_tokens = ([first] if first else []) + raw_args[idx + 1:]
+            izoh = " ".join(izoh_tokens).strip() or None
+            raw_args = raw_args[:idx]
+            break
+
     # "12-avgust" kabi chiziqcha bilan yozilgan sanalarni ham qabul qilamiz.
     fixed_args = []
     for tok in raw_args:
@@ -5673,12 +5760,22 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
         "/buyurtma maya shkaf 1 tumba 1 krovat 1 kamod 1 14 avgust\n"
         "/buyurtma neo komplekt +krovat 1 25 avgust Mebel For Home\n"
         "/buyurtma aven komplekt anta:shkaf 1 25 avgust Mebel For Home\n\n"
-        "Mijoz/guruh bergan tashqi raqamni ham yozib qo'yish uchun, istalgan joyga "
-        "'#raqam' qo'shing:\n"
-        "/buyurtma vena komplekt #45 5 avgust"
+        "Guruhdagi buyurtma raqamini '#raqam' ko'rinishida yozish MAJBURIY (istalgan joyga):\n"
+        "/buyurtma vena komplekt #45 5 avgust\n\n"
+        "Qo'shimcha izoh bo'lsa, oxiriga 'izoh:' deb yozing (undan keyingi hammasi izoh bo'ladi):\n"
+        "/buyurtma vena komplekt #45 5 avgust Mebel For Home izoh: krovat 110 lik"
     )
     if len(args) < 3:
         await update.message.reply_text(usage)
+        return
+
+    if not tashqi_raqam:
+        await update.message.reply_text(
+            "❗ Guruhdagi buyurtma raqami kiritilmagan.\n"
+            "Buyruqning istalgan joyiga '#raqam' qo'shing, masalan:\n"
+            "/buyurtma vena komplekt #45 5 avgust Mebel For Home\n\n"
+            "Guruhda bu buyurtma qaysi raqam bilan yozilgan bo'lsa, shuni yozing."
+        )
         return
 
     found = find_month_index(args)
@@ -5708,6 +5805,19 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     # (ko'p so'zli modellarni ham, masalan "bella spalniy", to'g'ri aniqlash uchun).
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT guruh_id FROM orders WHERE tashqi_raqam = ? AND status = 'kutilmoqda'",
+        (tashqi_raqam,),
+    )
+    dup = cur.fetchone()
+    if dup:
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ №{tashqi_raqam} raqamli buyurtma allaqachon kutilmoqda (bot raqami: {dup[0]}).\n"
+            "Takror yozilmadi. Agar bu boshqa buyurtma bo'lsa, raqamini tekshiring; "
+            "eskisini o'zgartirish uchun /buyurtmaraqam ishlating."
+        )
+        return
     cur.execute("SELECT DISTINCT model FROM products")
     all_models = [row[0] for row in cur.fetchall()]
     all_models.sort(key=lambda m: -len(m.split()))
@@ -5804,6 +5914,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     )
     if tashqi_raqam:
         cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
+    if izoh:
+        cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (izoh, guruh_id))
 
     shortage_text = shortage_warning_for_new_order(cur, entries)
 
@@ -5822,6 +5934,8 @@ async def buyurtma_core(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
+    if izoh:
+        lines.append(f"📝 Izoh: {izoh}")
     lines.append("Holati: Kutilmoqda")
     if shortage_text:
         lines.append(shortage_text)
@@ -6139,6 +6253,8 @@ def format_group_text(group):
     ]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
+    if group.get("izoh"):
+        lines.append(f"📝 Izoh: {group['izoh']}")
     lines.append("")
     for _, model, item, amount, mod_type in group["items"]:
         what = f"{model} komplekt" if item is None else f"{model} {item}"
@@ -6162,7 +6278,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
         conditions.append("LOWER(customer) = LOWER(?)")
         params.append(customer_filter)
     cur.execute(
-        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam "
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam, izoh "
         "FROM orders WHERE " + " AND ".join(conditions) +
         " ORDER BY deadline ASC, guruh_id ASC, id ASC",
         params,
@@ -6172,7 +6288,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, tashqi_raqam in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, tashqi_raqam, izoh in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -6181,6 +6297,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
                 "deadline_display": deadline_display,
                 "customer": customer,
                 "tashqi_raqam": tashqi_raqam,
+                "izoh": izoh,
                 "items": [],
             }
             order_of_groups.append(gid)
@@ -7605,6 +7722,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmatuzatish", buyurtmatuzatish))
     app.add_handler(CommandHandler("muddattuzatish", muddattuzatish))
     app.add_handler(CommandHandler("buyurtmaraqam", buyurtmaraqam))
+    app.add_handler(CommandHandler("buyurtmaizoh", buyurtmaizoh))
     app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
