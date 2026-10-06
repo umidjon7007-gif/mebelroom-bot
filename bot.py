@@ -1113,12 +1113,13 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ob = context.user_data.get("ob")
     if not ob:
         return
+    reply_target = update.message or update.callback_query.message
 
     day = ob["day"]
     month = MONTH_NAMES[ob["month"]]
     deadline = compute_deadline(day, month)
     if deadline is None:
-        await update.message.reply_text("Sana noto'g'ri. Qaytadan /buyurtma tugmasini bosing.")
+        await reply_target.reply_text("Sana noto'g'ri. Qaytadan /buyurtma tugmasini bosing.")
         context.user_data["ob"] = None
         context.user_data["awaiting"] = None
         return
@@ -1158,6 +1159,9 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raqam = ob.get("raqam")
     if raqam:
         cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (raqam, guruh_id))
+    izoh = ob.get("izoh")
+    if izoh:
+        cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (izoh, guruh_id))
 
     entries_4 = [(m, i, a, None) for m, i, a in entries]
     shortage_text = shortage_warning_for_new_order(cur, entries_4)
@@ -1173,13 +1177,15 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Muddat: {deadline_display}")
     if customer:
         lines.append(f"Kimdan: {customer}")
+    if izoh:
+        lines.append(f"📝 Izoh: {izoh}")
     lines.append("Holati: Kutilmoqda")
     if shortage_text:
         lines.append(shortage_text)
 
     context.user_data["ob"] = None
     context.user_data["awaiting"] = None
-    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
+    await reply_target.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
 
 
 async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1347,6 +1353,15 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✍️ Mijoz nomini yozing:")
         return
 
+    if data == "ob:izoh:skip":
+        if not ob or context.user_data.get("awaiting") != "buyurtma_izoh":
+            await query.edit_message_text("Bu so'rov eskirgan.")
+            return
+        ob["izoh"] = None
+        await query.edit_message_text("📝 Izoh: yo'q")
+        await ob_finalize_order(update, context)
+        return
+
     if data.startswith("ob:month:"):
         month = data.split(":", 2)[2]
         ob["month"] = month
@@ -1423,6 +1438,22 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
         ob["raqam"] = raqam
+        context.user_data["awaiting"] = "buyurtma_izoh"
+        await update.message.reply_text(
+            "📝 Izoh bormi? (masalan: krovat 110 lik, ruchkasi boshqacha)\n"
+            "Yozib yuboring yoki izoh bo'lmasa tugmani bosing.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚫 Izohsiz", callback_data="ob:izoh:skip")]]
+            ),
+        )
+        return
+
+    if awaiting == "buyurtma_izoh":
+        ob = context.user_data.get("ob")
+        if ob is None:
+            context.user_data["awaiting"] = None
+            return
+        ob["izoh"] = text
         await ob_finalize_order(update, context)
         return
 
@@ -1563,7 +1594,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (3) | raqam tugmali oqimda + /zaxiranusxa"
+BOT_VERSION = "2026-10-06 (4) | tugmali oqimda raqam + izoh, /zaxiranusxa"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
