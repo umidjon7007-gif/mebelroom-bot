@@ -379,6 +379,19 @@ def init_db():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS kirim_kim (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT NOT NULL COLLATE NOCASE,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'kutilmoqda',  -- kutilmoqda / berildi / hechkim / bekor
+            worker TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS xom_kutish (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             model TEXT NOT NULL COLLATE NOCASE,
@@ -789,6 +802,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     payment_line = ""
     xom_line = ""
     pending_xom_id = None
+    pending_kim_id = None
     if change_type == "kirim":
         # Agar shu foydalanuvchi bog'langan ishchi bo'lsa, kirim = upakovka ishi
         # deb hisoblab, avtomatik to'lovni yozib qo'yamiz.
@@ -810,6 +824,16 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 payment_line = f"\n📦 {worker} — upakovka narxi belgilanmagan ('{item}' uchun /narx upakovka {item} <summa> bilan belgilang)."
             else:
                 payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+        else:
+            # Ishchi o'zi emas (odatda ega kiritmoqda): upakovka puli kimga yozilishini so'raymiz.
+            cur.execute("SELECT COUNT(*) FROM workers")
+            if cur.fetchone()[0]:
+                cur.execute(
+                    "INSERT INTO kirim_kim (model, item, amount, status, created_at) "
+                    "VALUES (?, ?, ?, 'kutilmoqda', ?)",
+                    (model, item, amount, datetime.now().isoformat(timespec="seconds")),
+                )
+                pending_kim_id = cur.lastrowid
 
         # Tayyor mahsulotga xomashyo (masalan oyna) ketadigan bo'lsa, uni DARHOL ayirmaymiz:
         # avval "o'rnatildimi?" deb so'raymiz, faqat "Ha" bosilganda ayiramiz.
@@ -847,6 +871,8 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             ]]
         )
     await update.effective_message.reply_text(text, reply_markup=markup)
+    if pending_kim_id is not None:
+        await send_kim_question(update.effective_message, pending_kim_id, product_display, amount)
 
 
 async def sb_start(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
@@ -1608,7 +1634,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (6) | ko'rish buyruqlari begonaga yopiq"
+BOT_VERSION = "2026-10-06 (7) | kirimda 'kim uchun' tugmalari"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2429,6 +2455,108 @@ def latest_xom_record(cur, model, item, amount=None):
     return cur.fetchone()
 
 
+def kim_keyboard(kid):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT rowid, name FROM workers ORDER BY name")
+    workers = cur.fetchall()
+    conn.close()
+    rows, row = [], []
+    for rid, name in workers:
+        row.append(InlineKeyboardButton(f"👷 {name}", callback_data=f"kk:{kid}:{rid}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🚫 Hech kimga", callback_data=f"kk:{kid}:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_kim_question(message, kid, product_display, amount):
+    await message.reply_text(
+        f"👷 Upakovka puli kimga yozilsin?\n📥 {product_display}: {amount} ta",
+        reply_markup=kim_keyboard(kid),
+    )
+
+
+async def kk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_kirim(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+    await query.answer()
+
+    _, kid_str, wid_str = query.data.split(":")
+    kid, wid = int(kid_str), int(wid_str)
+    base = query.message.text or ""
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, amount, status FROM kirim_kim WHERE id = ?", (kid,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await query.edit_message_text(base + "\n\n⚠️ Bu so'rov topilmadi.")
+        return
+    model, item, amount, status = row
+    if status != "kutilmoqda":
+        conn.close()
+        await query.edit_message_text(base + f"\n\n(Allaqachon hal qilingan: {status})")
+        return
+
+    if wid == 0:
+        cur.execute("UPDATE kirim_kim SET status = 'hechkim' WHERE id = ?", (kid,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(base + "\n\n🚫 Upakovka puli hech kimga yozilmadi.")
+        return
+
+    cur.execute("SELECT name FROM workers WHERE rowid = ?", (wid,))
+    wrow = cur.fetchone()
+    if wrow is None:
+        conn.close()
+        await query.edit_message_text(base + "\n\n⚠️ Ishchi topilmadi.")
+        return
+    worker = wrow[0]
+
+    rate = get_rate(cur, "upakovka", model, item)
+    total = amount * rate
+    cur.execute(
+        """
+        INSERT INTO work_log (worker, turi, order_id, model, item, amount, rate, total, paid, created_at)
+        VALUES (?, 'upakovka', NULL, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (worker, model, item, amount, rate, total, datetime.now().isoformat(timespec="seconds")),
+    )
+    cur.execute("UPDATE kirim_kim SET status = 'berildi', worker = ? WHERE id = ?", (worker, kid))
+    conn.commit()
+    conn.close()
+
+    if rate == 0:
+        extra = f"⚠️ '{item}' uchun upakovka narxi belgilanmagan (/narx upakovka {item} <summa>)."
+    else:
+        extra = f"{total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
+    await query.edit_message_text(base + f"\n\n✅ {worker} — upakovka: {extra}")
+
+
+async def kirimkimlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_kirim(update):
+        await deny_access(update)
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, model, item, amount FROM kirim_kim WHERE status = 'kutilmoqda' ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("✅ Upakovka puli kimga yozilishi kutilayotgan kirim yo'q.")
+        return
+    await update.message.reply_text(f"⏳ Kimga yozilishi kutilayotgan kirimlar ({len(rows)} ta):")
+    for kid, model, item, amount in rows:
+        await send_kim_question(update.message, kid, f"{model} {item}", amount)
+
+
 async def xq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not can_kirim(update):
@@ -2831,6 +2959,13 @@ async def kirimbekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = cur.fetchone()
         current_qty = row[0] if row else 0
         cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (current_qty - amount, key))
+
+        cur.execute(
+            "UPDATE kirim_kim SET status = 'bekor' WHERE id = ("
+            "SELECT id FROM kirim_kim WHERE model = ? AND item = ? AND status = 'kutilmoqda' "
+            "ORDER BY id DESC LIMIT 1)",
+            (model, item),
+        )
 
         # 2) Xomashyoni qaytaramiz - faqat u haqiqatan ayrilgan bo'lsa ("Ha" bosilgan yoki eski kirim).
         restore_xom = True
@@ -7880,6 +8015,8 @@ def main():
     app.add_handler(CommandHandler("xomtarkibiochirish", xomtarkibiochirish))
     app.add_handler(CommandHandler("xomnomi", xomnomi))
     app.add_handler(CommandHandler("oynatasdiq", oynatasdiq))
+    app.add_handler(CommandHandler("kirimkimlar", kirimkimlar))
+    app.add_handler(CallbackQueryHandler(kk_callback, pattern=r"^kk:"))
     app.add_handler(CallbackQueryHandler(xq_callback, pattern=r"^xq:"))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
     app.add_handler(CommandHandler("xomkirimlar", xomkirimlar))
