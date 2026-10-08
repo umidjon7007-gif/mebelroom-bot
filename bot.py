@@ -1699,7 +1699,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-06 (13) | nusxalangan buyruqlar ham ishlaydi"
+BOT_VERSION = "2026-10-08 (14) | modelochirish: ikki so'zli nom va qoldiq bilan"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5550,16 +5550,23 @@ async def modelochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny_access(update)
         return
 
-    args = context.args
-    if len(args) != 1:
+    args = [a for a in context.args]
+    force = False
+    if args and args[-1].lower() in ("ha", "majburan"):
+        force = True
+        args = args[:-1]
+    if not args:
         await update.message.reply_text(
-            "Modelni RO'YXATDAN butunlay o'chiradi (faqat hammasi 0 bo'lsa ishlaydi).\n\n"
+            "Modelni RO'YXATDAN butunlay o'chiradi.\n\n"
             "Foydalanish: /modelochirish <model>\n"
-            "Misol: /modelochirish kafini"
+            "Misol: /modelochirish kafini\n"
+            "Ikki so'zli: /modelochirish bella spalniy\n"
+            "Qoldig'i bor bo'lsa ham o'chirish: oxiriga 'ha' qo'shing\n"
+            "Misol: /modelochirish bella spalniy ha"
         )
         return
 
-    model = args[0].lower()
+    model = " ".join(args).lower()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT item, quantity FROM products WHERE model = ?", (model,))
@@ -5571,13 +5578,13 @@ async def modelochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     nonzero = [(item, qty) for item, qty in rows if qty != 0]
-    if nonzero:
+    if nonzero and not force:
         conn.close()
-        lines = [f"⚠️ '{model}' modelida hali miqdor bor, o'chirib bo'lmaydi:"]
+        lines = [f"⚠️ '{model}' modelida hali miqdor bor:"]
         lines.extend(f"• {item}: {qty} ta" for item, qty in nonzero)
         lines.append(
-            "\nAvval bu miqdorlarni boshqa modelga ko'chiring (/chiqim va /kirim orqali), "
-            "keyin qayta urinib ko'ring."
+            "\nBaribir ro'yxatdan o'chirish (bu qoldiqlar ko'rinmay qoladi) uchun:\n"
+            f"/modelochirish {model} ha"
         )
         await update.message.reply_text("\n".join(lines))
         return
@@ -5586,9 +5593,16 @@ async def modelochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
-        f"🗑 '{model}' modeli ro'yxatdan butunlay o'chirildi ({len(rows)} ta detal, barchasi 0 edi)."
-    )
+    if nonzero:
+        left = ", ".join(f"{item} {qty}" for item, qty in nonzero)
+        await update.message.reply_text(
+            f"🗑 '{model}' modeli ro'yxatdan o'chirildi ({len(rows)} ta detal).\n"
+            f"Qoldiqlari bilan birga ketdi: {left}"
+        )
+    else:
+        await update.message.reply_text(
+            f"🗑 '{model}' modeli ro'yxatdan butunlay o'chirildi ({len(rows)} ta detal, barchasi 0 edi)."
+        )
 
 
 async def modelnomi(update: Update, context: ContextTypes.DEFAULT_TYPE):
