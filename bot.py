@@ -425,6 +425,42 @@ def init_db():
         )
         """
     )
+    # Spinkasi qoqilgan ("tayyor") krovatlar soni - har model va krovat turi (krovat/krovat110) uchun.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spinka_stock (
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT NOT NULL COLLATE NOCASE,
+            quantity INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (model, item)
+        )
+        """
+    )
+    # Buyurtma bajarilganda spinkali sondan qancha ayirilgani (bekor qilinsa qaytarish uchun).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spinka_sarf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            item TEXT NOT NULL,
+            amount INTEGER NOT NULL
+        )
+        """
+    )
+    # Har bir spinka yozuvi qaysi krovat turiga (krovat/krovat110) tegishli ekani.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spinka_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_log_id INTEGER,
+            model TEXT NOT NULL,
+            item TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS kirim_kim (
@@ -864,6 +900,11 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         """,
         (product_key, change_type, amount, user_name, user_id, datetime.now().isoformat(timespec="seconds")),
     )
+    spinka_unready_line = ""
+    if change_type == "chiqim" and item in SPINKA_ITEMS:
+        unready_out = spinka_consume(cur, None, model, item, amount, current_qty)
+        if unready_out:
+            spinka_unready_line = f"\n⚠️ shundan {unready_out} tasi spinkasiz krovat edi."
 
     payment_line = ""
     xom_line = ""
@@ -925,6 +966,8 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
     if payment_line:
         text += payment_line
+    if spinka_unready_line:
+        text += spinka_unready_line
     if xom_line:
         text += xom_line
     markup = None
@@ -1683,14 +1726,17 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         name, model, item, quantity = row
         total_demand = compute_all_pending_demand(cur)
-        conn.close()
         reserved = total_demand.get((model, item), 0)
         free = quantity - reserved
+        spinka_line = spinka_extra_line(cur, model, item, quantity, reserved)
+        conn.close()
 
         lines = [f"{stock_indicator(quantity)} {name}: {quantity} ta (skladda)"]
         if reserved:
             lines.append(f"   📝 Band qilingan (kutilmoqda buyurtmalar): {reserved} ta")
             lines.append(f"   ✅ Erkin (yangi buyurtmaga bo'sh): {free} ta")
+        if spinka_line:
+            lines.append(spinka_line)
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -1699,7 +1745,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-08 (14) | modelochirish: ikki so'zli nom va qoldiq bilan"
+BOT_VERSION = "2026-10-19 (15) | spinkali/spinkasiz krovat hisobi + spinkatarix"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -1809,6 +1855,10 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = cur.fetchall()
     total_demand = compute_all_pending_demand(cur)
+    spinka_lines = {
+        item: spinka_extra_line(cur, model, item, quantity, total_demand.get((model, item), 0))
+        for item, quantity in rows
+    }
     conn.close()
 
     if not rows:
@@ -1828,6 +1878,8 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+        if spinka_lines.get(item):
+            lines.append(spinka_lines[item])
     if any_reserved:
         lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
     await query.edit_message_text("\n".join(lines))
@@ -3062,8 +3114,89 @@ def format_fulfilled_group_text(group):
     return "\n".join(lines)
 
 
-def log_spinka_work(worker, model_display, amount):
-    """Spinka ishini work_log ga yozadi va tayyor xabar qaytaradi (rate/total bilan)."""
+SPINKA_ITEMS = ("krovat", "krovat110")
+
+
+def spinka_get(cur, model, item):
+    cur.execute(
+        "SELECT quantity FROM spinka_stock WHERE model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE",
+        (model.lower(), item.lower()),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def spinka_set(cur, model, item, quantity):
+    quantity = max(0, int(quantity))
+    cur.execute(
+        "INSERT INTO spinka_stock (model, item, quantity) VALUES (?, ?, ?) "
+        "ON CONFLICT(model, item) DO UPDATE SET quantity = excluded.quantity",
+        (model.lower(), item.lower(), quantity),
+    )
+
+
+def spinka_add(cur, model, item, delta):
+    """Spinkali (tayyor) sonni delta ga o'zgartiradi (0 dan pastga tushmaydi)."""
+    spinka_set(cur, model, item, spinka_get(cur, model, item) + delta)
+
+
+def spinka_consume(cur, order_id, model, item, deduct, qty_before):
+    """Krovat omborxonadan chiqqanda spinkali sondan ayiradi (avval tayyorlari chiqadi).
+    order_id berilsa, ayirilgan miqdor yozib qo'yiladi (buyurtma bekor qilinsa qaytariladi).
+    Qaytaradi: omborda bor edi-yu, lekin spinkasi qoqilmagan holda chiqqan krovatlar soni."""
+    raw = spinka_get(cur, model, item)
+    on_hand = max(qty_before, 0)
+    ready_before = min(raw, on_hand)
+    unready_shipped = max(0, min(deduct, on_hand) - ready_before)
+    consumed = min(deduct, raw)
+    if consumed > 0:
+        spinka_add(cur, model, item, -consumed)
+        if order_id is not None:
+            cur.execute(
+                "INSERT INTO spinka_sarf (order_id, model, item, amount) VALUES (?, ?, ?, ?)",
+                (order_id, model.lower(), item.lower(), consumed),
+            )
+    return unready_shipped
+
+
+def spinka_restore_orders(cur, order_ids):
+    """Bekor qilingan (qaytarilgan/o'chirilgan) buyurtmalar uchun spinkali sonni qaytaradi.
+    Qaytaradi: [(model, item, amount), ...]."""
+    if not order_ids:
+        return []
+    placeholders = ",".join("?" for _ in order_ids)
+    cur.execute(
+        f"SELECT model, item, amount FROM spinka_sarf WHERE order_id IN ({placeholders})",
+        list(order_ids),
+    )
+    rows = cur.fetchall()
+    for model, item, amount in rows:
+        spinka_add(cur, model, item, amount)
+    cur.execute(f"DELETE FROM spinka_sarf WHERE order_id IN ({placeholders})", list(order_ids))
+    return rows
+
+
+def spinka_extra_line(cur, model, item, quantity, reserved=0):
+    """Krovat/krovat110 qatori ostiga qo'shiladigan "spinkali / spinkasiz" qatori.
+    Boshqa detallar uchun bo'sh qator qaytaradi."""
+    if item not in SPINKA_ITEMS:
+        return None
+    raw = spinka_get(cur, model, item)
+    on_hand = max(quantity, 0)
+    if on_hand == 0 and raw == 0:
+        return None
+    ready = min(raw, on_hand)
+    unready = on_hand - ready
+    line = f"   🔨 spinkali: {ready} ta, spinkasiz: {unready} ta"
+    if reserved:
+        line += f" · tayyor erkin: {ready - reserved}"
+    if raw > on_hand:
+        line += "\n   ⚠️ spinkali son krovatdan ko'p: krovat kirimi hali yozilmagan bo'lishi mumkin"
+    return line
+
+
+def log_spinka_work(worker, model_display, amount, item="krovat"):
+    """Spinka ishini work_log ga yozadi, spinkali (tayyor) sonni oshiradi va tayyor xabar qaytaradi."""
     conn = get_conn()
     cur = conn.cursor()
     rate = get_rate(cur, "spinka", model_display, "spinka")
@@ -3076,8 +3209,25 @@ def log_spinka_work(worker, model_display, amount):
         """,
         (worker, model_display, amount, rate, total, now),
     )
+    work_log_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO spinka_log (work_log_id, model, item, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+        (work_log_id, model_display.lower(), item, amount, now),
+    )
+    spinka_add(cur, model_display, item, amount)
+    ready_now = spinka_get(cur, model_display, item)
+    cur.execute(
+        "SELECT quantity FROM products WHERE model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE",
+        (model_display.lower(), item),
+    )
+    prow = cur.fetchone()
+    stock_now = prow[0] if prow else None
     conn.commit()
     conn.close()
+
+    status_line = ""
+    if stock_now is not None:
+        status_line = f"\n🔨 {model_display} {item}: spinkali {min(ready_now, max(stock_now, 0))} ta, spinkasiz {max(stock_now, 0) - min(ready_now, max(stock_now, 0))} ta."
 
     if rate == 0:
         return (
@@ -3085,11 +3235,11 @@ def log_spinka_work(worker, model_display, amount):
             f"Belgilash: /modelnarx spinka {model_display} spinka <summa>\n"
             f"(yoki barcha modellar uchun umumiy: /narx spinka spinka <summa>)\n\n"
             f"Ish {worker} nomiga 0 so'm bilan yozib qo'yildi — narx belgilangach, "
-            f"/maosh orqali tekshirib, kerak bo'lsa tuzating."
+            f"/maosh orqali tekshirib, kerak bo'lsa tuzating." + status_line
         )
     return (
         f"🔨 {worker} — spinka qoqish: {model_display} ({amount} ta) — "
-        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})."
+        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})." + status_line
     )
 
 
@@ -3362,14 +3512,227 @@ async def spinkaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log_id, amount, rate, total, created_at = row
+    cur.execute("SELECT id, item FROM spinka_log WHERE work_log_id = ?", (log_id,))
+    sl = cur.fetchone()
+    spinka_item = sl[1] if sl else "krovat"
     cur.execute("DELETE FROM work_log WHERE id = ?", (log_id,))
+    if sl:
+        cur.execute("DELETE FROM spinka_log WHERE id = ?", (sl[0],))
+    spinka_add(cur, model_display, spinka_item, -amount)
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
         f"✅ O'chirildi: {worker} — {model_display} ({amount} ta, {format_money(total, 'som')}) "
-        f"— {created_at.split('T')[0]}"
+        f"— {created_at.split('T')[0]}\n"
+        f"🔨 {model_display} {spinka_item}: spinkali son {amount} taga kamaytirildi."
     )
+
+
+async def spinkasoni(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hozirgi omborda spinkasi qoqilgan krovatlar sonini qo'lda belgilaydi (bir marta, boshlang'ich)."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    text = update.message.text or ""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    entry_lines = []
+    if lines:
+        parts = lines[0].split(None, 1)
+        if len(parts) > 1 and parts[1].strip():
+            entry_lines.append(parts[1].strip())
+        entry_lines.extend(lines[1:])
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products")
+    known_models = {m.lower() for (m,) in cur.fetchall()}
+
+    if not entry_lines:
+        cur.execute(
+            "SELECT model, item, quantity FROM products WHERE item IN ('krovat', 'krovat110') ORDER BY model, item"
+        )
+        stock_rows = cur.fetchall()
+        out = [
+            "Omborda spinkasi qoqilgan krovatlar sonini belgilaydi (mavjud sonni almashtiradi).",
+            "",
+            "Foydalanish (bitta):  /spinkasoni vena 3",
+            "Krovat110 uchun:      /spinkasoni vena krovat110 1",
+            "Bir nechtasi (har birini yangi qatorga):",
+            "/spinkasoni",
+            "vena 3",
+            "bella 2",
+            "anta krovat110 1",
+            "",
+            "Hozirgi holat (spinkali / omborda jami):",
+        ]
+        for model, item, qty in stock_rows:
+            raw = spinka_get(cur, model, item)
+            if qty or raw:
+                out.append(f"• {model} {item}: {raw} / {qty}")
+        conn.close()
+        await send_chunked(update.message, out)
+        return
+
+    done = []
+    errors = []
+    for ln in entry_lines:
+        tokens = ln.replace(",", " ").split()
+        if len(tokens) < 2 or not tokens[-1].isdigit():
+            errors.append(f"• tushunilmadi: {ln}")
+            continue
+        qty_new = int(tokens[-1])
+        words = [w.lower() for w in tokens[:-1]]
+        item = "krovat"
+        if words and words[-1] in SPINKA_ITEMS:
+            item = words[-1]
+            words = words[:-1]
+        model = " ".join(words)
+        if model not in known_models:
+            errors.append(f"• '{model}' modeli topilmadi: {ln}")
+            continue
+        spinka_set(cur, model, item, qty_new)
+        cur.execute(
+            "SELECT quantity FROM products WHERE model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE",
+            (model, item),
+        )
+        prow = cur.fetchone()
+        stock = prow[0] if prow else 0
+        note = ""
+        if qty_new > max(stock, 0):
+            note = " ⚠️ omborda krovat undan kam, kirimni tekshiring"
+        done.append(f"• {model} {item}: spinkali {qty_new} ta (omborda jami {stock} ta){note}")
+    conn.commit()
+    conn.close()
+
+    out = []
+    if done:
+        out.append("✅ Saqlandi:")
+        out.extend(done)
+    if errors:
+        out.append("\n⚠️ Bajarilmadi:")
+        out.extend(errors)
+    await send_chunked(update.message, out)
+
+
+SPINKA_OY_QISQA = ["yan", "fev", "mar", "apr", "may", "iyn", "iyl", "avg", "sen", "okt", "noy", "dek"]
+
+
+async def spinkatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Spinka qoqish yozuvlari ro'yxati: sana, model, miqdor, ishchi, pul."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = list(context.args or [])
+    limit = 30
+    if args and args[-1].isdigit():
+        limit = max(1, min(int(args[-1]), 200))
+        args = args[:-1]
+
+    date_filter = None
+    date_label = None
+    lowered = [a.lower() for a in args]
+    today = datetime.now(TASHKENT_TZ).date()
+    if lowered and lowered[0] in ("kecha", "bugun"):
+        date_filter = today - timedelta(days=1) if lowered[0] == "kecha" else today
+        date_label = lowered[0]
+        args = args[1:]
+    elif len(lowered) >= 2 and lowered[0].isdigit() and lowered[1] in MONTH_NAMES:
+        try:
+            date_filter = date(today.year, MONTH_NAMES[lowered[1]], int(lowered[0]))
+            date_label = f"{lowered[0]} {lowered[1]}"
+            args = args[2:]
+        except ValueError:
+            pass
+
+    rest_text = " ".join(args).strip().lower()
+    worker_filter = None
+    model_filter = None
+    conn = get_conn()
+    cur = conn.cursor()
+    if rest_text:
+        cur.execute("SELECT name FROM workers WHERE LOWER(name) = ?", (rest_text,))
+        wrow = cur.fetchone()
+        if wrow:
+            worker_filter = wrow[0]
+        else:
+            cur.execute(
+                "SELECT DISTINCT model FROM products WHERE LOWER(model) = ? "
+                "UNION SELECT DISTINCT model FROM work_log WHERE turi = 'spinka' AND LOWER(model) = ?",
+                (rest_text, rest_text),
+            )
+            mrow = cur.fetchone()
+            if mrow:
+                model_filter = mrow[0].lower()
+            else:
+                conn.close()
+                await update.message.reply_text(
+                    f"'{rest_text}' ishchi ham, model ham emas.\n\n"
+                    "Foydalanish: /spinkatarix [ishchi yoki model] [kecha|bugun|15 oktyabr] [soni]\n"
+                    "Misol: /spinkatarix Hojiakbar\n"
+                    "Misol: /spinkatarix vena 10"
+                )
+                return
+
+    cur.execute(
+        """
+        SELECT w.worker, w.model, w.amount, w.total, w.paid, w.created_at, COALESCE(l.item, 'krovat')
+        FROM work_log w LEFT JOIN spinka_log l ON l.work_log_id = w.id
+        WHERE w.turi = 'spinka'
+        ORDER BY w.created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    entries = []
+    for worker, model, amount, total, paid, created_at, item in rows:
+        try:
+            dt = datetime.fromisoformat(created_at)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TASHKENT_TZ)
+        dt = dt.astimezone(TASHKENT_TZ)
+        if date_filter and dt.date() != date_filter:
+            continue
+        if worker_filter and worker.lower() != worker_filter.lower():
+            continue
+        if model_filter and model.lower() != model_filter:
+            continue
+        entries.append((dt, worker, model, item, amount, total, paid))
+
+    title = "🔨 Spinka qoqish tarixi"
+    if worker_filter:
+        title += f" — {worker_filter}"
+    if model_filter:
+        title += f" — {model_filter}"
+    if date_label:
+        title += f" — {date_label}"
+    if not entries:
+        await update.message.reply_text(title + "\n\nYozuv topilmadi.")
+        return
+
+    shown = entries[:limit]
+    out = [title + f" (oxirgi {len(shown)} ta)", ""]
+    for dt, worker, model, item, amount, total, paid in shown:
+        what = model if item == "krovat" else f"{model} {item}"
+        status = "✅ to'langan" if paid else "⏳ to'lanmagan"
+        out.append(
+            f"📅 {dt.day} {SPINKA_OY_QISQA[dt.month - 1]} {dt:%H:%M} — {what} · {amount} ta · "
+            f"{worker} · {format_money(total, 'som')} {status}"
+        )
+    total_amount = sum(e[4] for e in shown)
+    total_sum = sum(e[5] for e in shown)
+    unpaid_sum = sum(e[5] for e in shown if not e[6])
+    out.append("")
+    out.append(
+        f"Jami: {total_amount} ta · {format_money(total_sum, 'som')} "
+        f"(shundan to'lanmagan: {format_money(unpaid_sum, 'som')})"
+    )
+    await send_chunked(update.message, out)
 
 
 async def oyna_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3722,9 +4085,10 @@ async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     usage = (
         "Krovat spinkasini qoqish xizmatini qayd etadi (buyurtmadan mustaqil, alohida xizmat).\n\n"
-        "Foydalanish: /spinkaqoqildi <model> <miqdor> [ishchi ismi]\n"
+        "Foydalanish: /spinkaqoqildi <model> [krovat110] <miqdor> [ishchi ismi]\n"
         "Misol (o'zingiz ishchi bo'lsangiz): /spinkaqoqildi vena 3\n"
-        "Misol (egasi, ishchi nomi bilan): /spinkaqoqildi vena 3 Hojiakbar"
+        "Misol (egasi, ishchi nomi bilan): /spinkaqoqildi vena 3 Hojiakbar\n"
+        "Krovat110 uchun: /spinkaqoqildi vena krovat110 2"
     )
     if len(args) < 2:
         await update.message.reply_text(usage)
@@ -3758,11 +4122,17 @@ async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Miqdor musbat butun son bo'lishi kerak.")
         return
 
+    spinka_item = "krovat"
+    model_words = model_display.split()
+    if model_words and model_words[-1] in SPINKA_ITEMS:
+        spinka_item = model_words[-1]
+        model_display = " ".join(model_words[:-1])
+
     if not model_display:
         await update.message.reply_text(usage)
         return
 
-    text = log_spinka_work(worker, model_display, amount)
+    text = log_spinka_work(worker, model_display, amount, spinka_item)
     await update.message.reply_text(text)
 
 
@@ -6579,6 +6949,7 @@ async def topshirilganibekor(update: Update, context: ContextTypes.DEFAULT_TYPE)
             cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
             stock_restored_lines.append(f"• {it}: +{qty}")
 
+    spinka_restored = spinka_restore_orders(cur, order_ids)
     cur.execute(
         f"SELECT worker, total, paid FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'",
         order_ids,
@@ -6600,6 +6971,8 @@ async def topshirilganibekor(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if stock_restored_lines:
         lines.append("\nZaxiradan ayirildi (qaytarildi):")
         lines.extend(stock_restored_lines)
+    if spinka_restored:
+        lines.append("🔨 Spinkali son qaytarildi: " + ", ".join(f"{m} {i} +{a}" for m, i, a in spinka_restored))
     if work_rows:
         lines.append("\n⚠️ Ishchi puli yozuvlari bekor qilindi:")
         for worker, total, paid in work_rows:
@@ -6682,6 +7055,7 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, product_key))
                 stock_restored_lines.append(f"• {it}: +{qty}")
 
+    spinka_restored = spinka_restore_orders(cur, order_ids)
     cur.execute(
         f"SELECT worker, total, paid FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'",
         order_ids,
@@ -6701,6 +7075,8 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stock_restored_lines:
         lines.append("\nZaxiraga qaytarildi:")
         lines.extend(stock_restored_lines)
+    if spinka_restored:
+        lines.append("🔨 Spinkali son qaytarildi: " + ", ".join(f"{m} {i} +{a}" for m, i, a in spinka_restored))
     if work_rows:
         lines.append("\n⚠️ Ishchi puli yozuvlari ham o'chirildi:")
         for worker, total, paid in work_rows:
@@ -7339,6 +7715,10 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
             (product_key, deduct, user_name, user_id, now),
         )
         warn = " ⚠️ yetarli emas edi!" if shortage else ""
+        if target_item in SPINKA_ITEMS:
+            unready = spinka_consume(cur, order_id, target_model, target_item, deduct, current_qty)
+            if unready:
+                warn += f" ⚠️ shundan {unready} tasi spinkasiz!"
         what = f"{model} komplekt" if item is None else f"{model} {item}"
         mod_note = " (➕ qo'shimcha)" if mod_type == "+" else ""
         result_lines.append(
@@ -8084,6 +8464,10 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT model, item, quantity FROM products ORDER BY model, item")
     rows = cur.fetchall()
     total_demand = compute_all_pending_demand(cur)
+    spinka_lines = {
+        (model, item): spinka_extra_line(cur, model, item, quantity, total_demand.get((model, item), 0))
+        for model, item, quantity in rows
+    }
     conn.close()
 
     if not rows:
@@ -8105,6 +8489,8 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
+        if spinka_lines.get((model, item)):
+            lines.append(spinka_lines[(model, item)])
     if any_reserved:
         lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
 
@@ -8310,6 +8696,8 @@ def main():
     app.add_handler(CommandHandler("oyna", oyna_button))
     app.add_handler(CallbackQueryHandler(oyna_callback, pattern=r"^oy:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
+    app.add_handler(CommandHandler("spinkasoni", spinkasoni))
+    app.add_handler(CommandHandler("spinkatarix", spinkatarix))
     app.add_handler(CommandHandler("kirimmodeltuzatish", kirimmodeltuzatish))
     app.add_handler(CommandHandler("kirimbekor", kirimbekor))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
