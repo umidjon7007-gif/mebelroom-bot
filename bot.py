@@ -1745,7 +1745,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-19 (15) | spinkali/spinkasiz krovat hisobi + spinkatarix"
+BOT_VERSION = "2026-10-25 (16) | /yetmaydi: buyurtmalarga yetmayotgan detal va oyna"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -7553,6 +7553,84 @@ XOM_BAND_FOOTER = (
 )
 
 
+async def yetmaydi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kutilayotgan buyurtmalarga hozir yetmayotgan detallar va oynalarni ko'rsatadi."""
+    if not is_member(update):
+        await deny_access(update)
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {(m, i): q for m, i, q in cur.fetchall()}
+    demand = compute_all_pending_demand(cur)
+
+    shortage = {}
+    for key in set(demand) | {k for k, q in stock.items() if q < 0}:
+        miss = demand.get(key, 0) - stock.get(key, 0)
+        if miss > 0:
+            shortage[key] = miss
+
+    # Qaysi buyurtmalar shu detalga muhtoj
+    cur.execute(
+        "SELECT guruh_id, model, item, amount, mod_type, tashqi_raqam FROM orders WHERE status = 'kutilmoqda' ORDER BY id"
+    )
+    by_guruh = {}
+    labels = {}
+    for guruh_id, model, item, amount, mod_type, tashqi in cur.fetchall():
+        by_guruh.setdefault(guruh_id, []).append((model, item, amount, mod_type))
+        labels[guruh_id] = tashqi or guruh_id
+    orders_for = {}
+    for guruh_id, entries in by_guruh.items():
+        for key in explode_entries_to_items(cur, entries):
+            if key in shortage:
+                lab = f"№{labels[guruh_id]}"
+                if lab not in orders_for.setdefault(key, []):
+                    orders_for[key].append(lab)
+
+    # Oynalar
+    band = compute_xom_commitments(cur)
+    cur.execute("SELECT name, quantity FROM xomashyo")
+    xom_stock = {n: q for n, q in cur.fetchall()}
+    oyna_lines = []
+    for name in sorted(band, key=str.lower):
+        miss = band[name] - xom_stock.get(name, 0)
+        if miss > 0:
+            oyna_lines.append(
+                f"  🔴 {name}{oyna_usage_label(cur, name)}: {miss} ta yetmaydi "
+                f"(kerak {band[name]}, omborda {xom_stock.get(name, 0)})"
+            )
+    conn.close()
+
+    if not shortage and not oyna_lines:
+        await update.message.reply_text("✅ Kutilayotgan buyurtmalarga hamma narsa yetarli.")
+        return
+
+    lines = ["⚠️ Buyurtmalarga yetmayotganlar:", ""]
+    totals = {}
+    by_model = {}
+    for (model, item), miss in shortage.items():
+        by_model.setdefault(model, []).append((item, miss))
+        totals[item] = totals.get(item, 0) + miss
+    for model in sorted(by_model, key=str.lower):
+        lines.append(f"📦 {model.capitalize()}")
+        for item, miss in sorted(by_model[model]):
+            have = stock.get((model, item), 0)
+            need = demand.get((model, item), 0)
+            nums = ", ".join(orders_for.get((model, item), []))
+            tail = f" — {nums}" if nums else ""
+            lines.append(f"  {item}: {miss} ta yetmaydi (kerak {need}, bor {have}){tail}")
+        lines.append("")
+    if totals:
+        lines.append("📊 Jami kesishga: " + ", ".join(f"{i} {q}" for i, q in sorted(totals.items())))
+    if oyna_lines:
+        lines.append("")
+        lines.append("🪟 Oyna yetishmasligi:")
+        lines.extend(oyna_lines)
+        lines.append("(oyna sonlari 0 bo'lsa, avval /xomkirimlar bilan kiriting)")
+    await send_chunked(update.message, lines)
+
+
 def shortage_warning_for_new_order(cur, entries):
     """Yangi yaratilgan buyurtma tarkibidagi detallar bo'yicha, agar BARCHA
     kutilayotgan buyurtmalar hisobga olinganda zaxira (yoki oyna) yetarli bo'lmasa,
@@ -8698,6 +8776,7 @@ def main():
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("spinkasoni", spinkasoni))
     app.add_handler(CommandHandler("spinkatarix", spinkatarix))
+    app.add_handler(CommandHandler("yetmaydi", yetmaydi))
     app.add_handler(CommandHandler("kirimmodeltuzatish", kirimmodeltuzatish))
     app.add_handler(CommandHandler("kirimbekor", kirimbekor))
     app.add_handler(CommandHandler("ishchinomitolash", ishchinomitolash))
