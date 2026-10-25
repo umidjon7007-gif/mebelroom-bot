@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sqlite3
+import uuid
 from datetime import date, datetime, time, timedelta, timezone
 
 from telegram import (
@@ -775,6 +776,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 
+RESERVED_MODEL_WORDS = {
+    "bekor", "kirim", "chiqim", "kirimbekor", "tuzatish", "ochirish", "ochir",
+    "o'chirish", "qaytarish", "tarix", "qoldiq", "buyurtma",
+}
+
+
+async def nm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Noma'lum model/detalga kirim yozishni tasdiqlash tugmalari."""
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Faqat ega tasdiqlay oladi.", show_alert=True)
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        await query.answer()
+        return
+    pending = context.application.bot_data.get("nm_pending", {})
+    data = pending.pop(token, None)
+    await query.answer()
+    if data is None:
+        try:
+            await query.edit_message_text("Bu so'rov eskirgan. Buyruqni qaytadan yozing.")
+        except BadRequest:
+            pass
+        return
+    if action == "no":
+        try:
+            await query.edit_message_text("❌ Bekor qilindi. Hech narsa o'zgarmadi.")
+        except BadRequest:
+            pass
+        return
+    change_type, args = data
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    await change_stock_core(update, context, change_type, args, allow_new=True)
+
+
 async def kirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
@@ -793,7 +834,7 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
     await change_stock_core(update, context, change_type, context.args)
 
 
-async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args):
+async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args, allow_new: bool = False):
     if change_type == "kirim" and not can_kirim(update):
         await deny_access(update)
         return
@@ -869,6 +910,38 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"'{product_display}' ro'yxatda yo'q, undan chiqim qilib bo'lmaydi."
             )
             return
+        if not allow_new:
+            first_word = (name_parts[0] if name_parts else "").lower()
+            if first_word in RESERVED_MODEL_WORDS:
+                conn.close()
+                await update.effective_message.reply_text(
+                    f"⚠️ '{first_word}' buyruq so'zi, model nomi emas. Hech narsa yozilmadi.\n"
+                    "Agar kirimni bekor qilmoqchi bo'lsangiz, buyruqni bitta so'z qilib yozing: "
+                    "/kirimbekor (ikki qatorda: 1-qator '/kirimbekor <model>', 2-qator '<detal> <miqdor>')."
+                )
+                return
+            cur.execute("SELECT 1 FROM products WHERE model = ? LIMIT 1", (model,))
+            model_known = cur.fetchone() is not None
+            cur.execute("SELECT 1 FROM products WHERE item = ? LIMIT 1", (item,))
+            item_known = cur.fetchone() is not None
+            if not model_known or not item_known:
+                conn.close()
+                if not model_known:
+                    what = f"'{model}' degan model ro'yxatda yo'q"
+                else:
+                    what = f"'{item}' degan detal hech bir modelda uchramagan (imlo xatosi bo'lishi mumkin)"
+                pending = context.application.bot_data.setdefault("nm_pending", {})
+                token = uuid.uuid4().hex[:8]
+                pending[token] = (change_type, list(args))
+                await update.effective_message.reply_text(
+                    f"⚠️ {what}.\nShunga qaramay '{model} {item}' ga {amount} ta {change_type} yozaymi?\n"
+                    "Xato yozgan bo'lsangiz ❌ ni bosing - hech narsa o'zgarmaydi.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Ha, yangi qo'sh", callback_data=f"nm:ok:{token}"),
+                        InlineKeyboardButton("❌ Yo'q", callback_data=f"nm:no:{token}"),
+                    ]]),
+                )
+                return
         current_qty = 0
         cur.execute(
             "INSERT INTO products (name, model, item, quantity) VALUES (?, ?, ?, ?)",
@@ -1745,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-25 (16) | /yetmaydi: buyurtmalarga yetmayotgan detal va oyna"
+BOT_VERSION = "2026-10-25 (17) | kirim: noma'lum model/detalga tasdiq so'rash"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8745,6 +8818,7 @@ def main():
     app.add_handler(CommandHandler("upakovkachilar", upakovkachilar))
     app.add_handler(CommandHandler("kirimhuquqi", kirimhuquqi))
     app.add_handler(CallbackQueryHandler(kk_callback, pattern=r"^kk:"))
+    app.add_handler(CallbackQueryHandler(nm_callback, pattern=r"^nm:"))
     app.add_handler(CallbackQueryHandler(xq_callback, pattern=r"^xq:"))
     app.add_handler(CommandHandler("xomtarkiblar", xomtarkiblar))
     app.add_handler(CommandHandler("xomkirimlar", xomkirimlar))
