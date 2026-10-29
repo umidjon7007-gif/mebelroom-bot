@@ -129,6 +129,9 @@ DB_PATH = os.path.join(DATA_DIR, "zaxira.db")
 _owner_id_raw = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
 
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL = os.environ.get("AI_MODEL", "claude-haiku-5-5").strip()
+
 _group_chat_id_raw = os.environ.get("GROUP_CHAT_ID", "").strip()
 GROUP_CHAT_ID = int(_group_chat_id_raw) if _group_chat_id_raw.lstrip("-").isdigit() else None
 
@@ -407,6 +410,10 @@ def init_db():
         cur.execute("ALTER TABLE pending_group_orders ADD COLUMN entries_json TEXT")
     if "source_message_id" not in pending_columns:
         cur.execute("ALTER TABLE pending_group_orders ADD COLUMN source_message_id INTEGER")
+    for col, coltype in (("tashqi_raqam", "TEXT"), ("izoh", "TEXT"), ("dastavka", "INTEGER"),
+                         ("ai_json", "TEXT"), ("savol", "TEXT")):
+        if col not in pending_columns:
+            cur.execute(f"ALTER TABLE pending_group_orders ADD COLUMN {col} {coltype}")
 
     cur.execute(
         """
@@ -1818,7 +1825,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (25) | spinka ishi: avval/keyin + tayyor spinkalar"
+BOT_VERSION = "2026-10-30 (26) | AI: guruhdagi zakazlarni tushunish, /yozilmagan, kechki eslatma"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -6682,96 +6689,392 @@ def generate_buyurtma_command(model, entries, deadline_display, customer, tashqi
     return "/buyurtma " + " ".join(parts)
 
 
-async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, sender_name):
-    if OWNER_ID is None:
-        return
+# ---------------------------------------------------------------------------
+# AI yordamida guruhdagi zakazlarni tushunish (Anthropic Claude API)
+# ---------------------------------------------------------------------------
 
+AI_ITEM_TUR = {"oddiy": None, "almashtir": "+", "ayir": "-"}
+
+
+def ai_enabled() -> bool:
+    return bool(ANTHROPIC_API_KEY) and (get_setting("ai_yoqilgan") or "ha") == "ha"
+
+
+def ai_catalog():
+    """{model: [detallar]} - botdagi mavjud modellar va detallar."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item FROM products ORDER BY model, item")
+    catalog = {}
+    for model, item in cur.fetchall():
+        catalog.setdefault(model.lower(), []).append(item.lower())
+    conn.close()
+    return catalog
+
+
+def ai_system_prompt(catalog):
+    cat_lines = "\n".join(f"- {m}: {', '.join(items)}" for m, items in sorted(catalog.items()))
+    return (
+        "You read furniture order messages posted in a Telegram group of a small Uzbek furniture "
+        "workshop and convert each message into JSON. Messages are informal Uzbek with typos.\n\n"
+        "CATALOG (model: items). Use ONLY these model and item names, lowercase:\n"
+        f"{cat_lines}\n\n"
+        "RULES:\n"
+        "- 'komplekt', 'mini komplekt', 'miniy komplekt', 'miniy' = a full set -> item \"komplekt\". "
+        "A full set is kamod, krovat, parta, shkaf, tumba (1 each).\n"
+        "- Synonyms: tryumo/tyumo/trumo = kamod; kravat/karavat/krvat/karavt = krovat.\n"
+        "- 'ozi'/'o'zi' after an item means only that item, not a set.\n"
+        "- Krovat '1.10', '110', '1.10 liy' = krovat110. Shkaf '4 eshik', '4 eshikli' = shkaf4eshik.\n"
+        "- Inside a set: 'bez X' / 'X siz' / 'X kerak emas' = remove X -> extra row {item: X, tur: \"ayir\"}. "
+        "If the set's krovat must be 110 -> row {item: \"krovat110\", tur: \"almashtir\"}; "
+        "if the set's shkaf must have 4 doors -> row {item: \"shkaf4eshik\", tur: \"almashtir\"}.\n"
+        "- Extra items ('+ 1 ta kravat', 'qoshimcha kravat 1ta') -> separate row with tur \"oddiy\".\n"
+        "- If a removal applies to only some of several sets (e.g. '2 ta komplekt, 1 tasi bez tryumo'), "
+        "do NOT use komplekt: list every item with exact counts, tur \"oddiy\".\n"
+        "- One message may hold several models; every row carries its own model.\n"
+        "- A word that is not in the catalog (e.g. veshilka, vitrina): never invent an item; mention it in "
+        "'savol' and 'izoh'.\n"
+        "- Deadline after 'Muddat'/'Muddati'/'Mudati': day and month (1-12). A range '3-4 sentyabr' -> last day.\n"
+        "- Order number: a number at the very start like '49)' or '№49' -> raqam \"49\"; else null.\n"
+        "- izoh: extra instructions (size, colour, 'viloyatga ketadi', 'bez zborka', 'olib kirib berish', "
+        "'shu kunga chiqish shart') as short Uzbek text, else null.\n"
+        "- dastavka: true if it goes to a region / is shipped ('viloyat', 'dastavka', 'pochta', 'jo'natiladi').\n"
+        "- buyurtma: false if the message is not an order (chat, question, greeting, report).\n"
+        "- savol: a short Uzbek note on anything unclear, else null.\n\n"
+        "Reply with JSON only, no other text:\n"
+        '{"buyurtma": true, "qatorlar": [{"model": "kafino", "item": "komplekt", "soni": 1, "tur": "oddiy"}, '
+        '{"model": "kafino", "item": "kamod", "soni": 1, "tur": "ayir"}], "kun": 28, "oy": 10, '
+        '"raqam": "49", "izoh": null, "dastavka": false, "savol": null}'
+    )
+
+
+def ai_record_usage(input_tokens=0, output_tokens=0, error=False):
+    try:
+        stats = json.loads(get_setting("ai_stats") or "{}")
+    except ValueError:
+        stats = {}
+    stats["calls"] = stats.get("calls", 0) + (0 if error else 1)
+    stats["in"] = stats.get("in", 0) + int(input_tokens or 0)
+    stats["out"] = stats.get("out", 0) + int(output_tokens or 0)
+    if error:
+        stats["err"] = stats.get("err", 0) + 1
+    stats.setdefault("since", datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d"))
+    set_setting("ai_stats", json.dumps(stats))
+
+
+async def ai_call(system_prompt, user_text):
+    """Claude API ga so'rov. Qaytaradi: javob matni yoki None (xato bo'lsa)."""
+    import httpx
+
+    payload = {
+        "model": AI_MODEL,
+        "max_tokens": 800,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_text}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
+        if resp.status_code != 200:
+            logger.warning("AI so'rovi xato: %s %s", resp.status_code, resp.text[:300])
+            ai_record_usage(error=True)
+            return None
+        data = resp.json()
+        usage = data.get("usage") or {}
+        ai_record_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    except Exception as e:  # tarmoq xatosi va h.k. - bot ishlashda davom etadi
+        logger.warning("AI so'rovi bajarilmadi: %s", e)
+        ai_record_usage(error=True)
+        return None
+
+
+def ai_extract_json(text):
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+
+
+def ai_normalize(result, catalog):
+    """AI javobini bot formatiga o'tkazadi va tekshiradi.
+    Qaytaradi: dict(not_order, entries[(model,item,amount,mod)], kun, oy, raqam, izoh, dastavka, problems)."""
+    if not isinstance(result, dict):
+        return None
+    if result.get("buyurtma") is False:
+        return {"not_order": True}
+    problems = []
+    entries = []
+    for row in result.get("qatorlar") or []:
+        if not isinstance(row, dict):
+            continue
+        model = str(row.get("model") or "").strip().lower()
+        item = str(row.get("item") or "").strip().lower()
+        try:
+            amount = max(1, int(row.get("soni") or 1))
+        except (TypeError, ValueError):
+            amount = 1
+        mod = AI_ITEM_TUR.get(str(row.get("tur") or "oddiy").lower())
+        if model not in catalog:
+            problems.append(f"'{model}' modeli botda yo'q")
+            continue
+        if item in ("komplekt", ""):
+            entries.append((model, None, amount, None))
+            continue
+        if item not in catalog[model]:
+            problems.append(f"'{model} {item}' botda yo'q")
+            continue
+        entries.append((model, item, amount, mod))
+    # 'almashtir'/'ayir' faqat shu modelning komplekti bilan ma'noli
+    komplekt_models = {m for m, it, _, _ in entries if it is None}
+    fixed = []
+    for model, item, amount, mod in entries:
+        if mod == "-" and model not in komplekt_models:
+            problems.append(f"{model} {item}: 'bez' komplektsiz yozilgan")
+            continue
+        if mod == "+" and model not in komplekt_models:
+            mod = None
+        fixed.append((model, item, amount, mod))
+    if not fixed and not problems:
+        problems.append("zakaz tarkibi topilmadi")
+    kun, oy = result.get("kun"), result.get("oy")
+    try:
+        kun = int(kun) if kun is not None else None
+        oy = int(oy) if oy is not None else None
+    except (TypeError, ValueError):
+        kun = oy = None
+    if oy is not None and not 1 <= oy <= 12:
+        kun = oy = None
+    raqam = result.get("raqam")
+    raqam = str(raqam).strip().lstrip("№#") if raqam not in (None, "", "null") else None
+    savol = result.get("savol")
+    if savol:
+        problems.append(str(savol))
+    return {
+        "not_order": False,
+        "entries": fixed,
+        "kun": kun,
+        "oy": oy,
+        "raqam": raqam,
+        "izoh": (str(result.get("izoh")).strip() or None) if result.get("izoh") else None,
+        "dastavka": bool(result.get("dastavka")),
+        "problems": problems,
+    }
+
+
+async def ai_parse_group_text(text):
+    catalog = ai_catalog()
+    if not catalog:
+        return None
+    raw = await ai_call(ai_system_prompt(catalog), text)
+    parsed = ai_extract_json(raw)
+    if parsed is None:
+        return None
+    norm = ai_normalize(parsed, catalog)
+    if norm is not None:
+        norm["ai_json"] = json.dumps(parsed, ensure_ascii=False)
+    return norm
+
+
+def rules_parse_group_text(text):
+    """Eski (qoidalarga asoslangan) tushunish - AI bo'lmasa yoki ishlamasa."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT model FROM products")
     all_models = [row[0] for row in cur.fetchall()]
     conn.close()
-
     model = parse_model_from_text(text, all_models)
     if model is None:
-        return  # Model aniqlanmadi - bu guruh xabari buyurtma emas bo'lishi mumkin, e'tiborsiz qoldiramiz.
-
-    deadline_info = parse_deadline_from_text(text)
+        return None
     entries, komplekt_aniq = parse_entries_from_text(text, model)
-    tashqi_raqam = parse_external_number_from_text(text)
+    deadline_info = parse_deadline_from_text(text)
+    problems = []
+    if len(entries) == 1 and entries[0][0] is None and not komplekt_aniq:
+        problems.append("komplekt ekani aniq topilmadi, tekshiring")
+    lowered = text.lower()
+    return {
+        "not_order": False,
+        "entries": [(model, it, am, mt) for it, am, mt in entries],
+        "kun": deadline_info[0] if deadline_info else None,
+        "oy": deadline_info[1] if deadline_info else None,
+        "raqam": parse_external_number_from_text(text),
+        "izoh": None,
+        "dastavka": any(kw in lowered for kw in ("viloyat", "dastavka", "pochta", "jo'natiladi", "jonatiladi")),
+        "problems": problems,
+        "ai_json": None,
+    }
 
-    lowered_text = text.lower()
-    dastavka_detected = any(
-        kw in lowered_text for kw in ("viloyat", "dastavka", "pochta", "jo'natiladi", "jonatiladi")
+
+def pending_entries(model, entries_json):
+    """pending_group_orders.entries_json -> [(model, item, amount, mod_type)] (eski 3-li format ham)."""
+    out = []
+    for e in json.loads(entries_json or "[]"):
+        if len(e) >= 4:
+            out.append((e[3], e[0], e[1], e[2]))
+        else:
+            out.append((model, e[0], e[1], e[2]))
+    return out
+
+
+def existing_order_by_number(cur, raqam):
+    if not raqam:
+        return None
+    cur.execute(
+        "SELECT guruh_id, status FROM orders WHERE tashqi_raqam = ? AND status != 'bekor qilindi' LIMIT 1",
+        (raqam,),
     )
+    return cur.fetchone()
 
-    lines = ["🔔 Guruhda yangi xabar - buyurtma bo'lishi mumkin:", ""]
-    if tashqi_raqam:
-        lines.append(f"Guruhdagi raqam: №{tashqi_raqam}")
-    lines.append(f"Taxminiy model: {model}")
-    if len(entries) == 1 and entries[0][0] is None:
-        lines.append(f"Taxminiy tur: komplekt {'✅' if komplekt_aniq else '(❗ aniq topilmadi, tekshiring)'}")
-    else:
-        for item, amount, mod_type in entries:
-            mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
-            label = "komplekt" if item is None else item
-            lines.append(f"Taxminiy detal: {mark}{label} ({amount} ta)")
 
-    if dastavka_detected:
-        lines.append(
-            "🚚 Ehtimol DASTAVKA (viloyatga/jo'natish) - agar shunday bo'lsa, tasdiqlagach "
-            "/dastavka buyrug'i bilan belgilashni unutmang."
+def describe_entry(model, item, amount, mod_type):
+    mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
+    if item is None:
+        return f"{mark}{model} komplekt ({amount} ta)"
+    if mod_type == "-":
+        return f"{mark}{model} {item} (komplektdan olib tashlanadi)"
+    if mod_type == "+":
+        return f"{mark}{model} {item} (komplektdagi o'rniga)"
+    return f"{mark}{model} {item} ({amount} ta)"
+
+
+def pending_card(pid):
+    """Tasdiqlash kartasi: (matn, tugmalar) yoki (None, None)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT model, entries_json, deadline_display, customer, raw_text, tashqi_raqam, izoh, dastavka, "
+        "ai_json, savol, deadline FROM pending_group_orders WHERE id = ?",
+        (pid,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return None, None
+    model, entries_json, deadline_display, customer, raw_text, raqam, izoh, dastavka, ai_json, savol, deadline = row
+    entries = pending_entries(model, entries_json)
+    lines = [f"🔔 Guruhda yangi zakaz{' · 🤖 AI tushundi' if ai_json else ''}", ""]
+    head = []
+    if raqam:
+        head.append(f"№{raqam}")
+    if customer:
+        head.append(f"Mijoz: {customer}")
+    if head:
+        lines.append(" · ".join(head))
+    for e in entries:
+        lines.append("• " + describe_entry(*e))
+    lines.append(f"Muddat: {deadline_display}" if deadline else "Muddat: ❗ topilmadi")
+    if izoh:
+        lines.append(f"📝 Izoh: {izoh}")
+    if dastavka:
+        lines.append("🚚 Viloyatga / dastavka")
+    if savol:
+        lines.append(f"❓ Tekshiring: {savol}")
+    lines += ["", "Asl xabar:", (raw_text or "").strip()]
+    buttons = []
+    if deadline and entries:
+        buttons.append(InlineKeyboardButton("✅ Yozish", callback_data=f"gord:{pid}:yes"))
+    buttons.append(InlineKeyboardButton("✏️ Tuzatish", callback_data=f"gord:{pid}:edit"))
+    buttons.append(InlineKeyboardButton("❌ Kerak emas", callback_data=f"gord:{pid}:no"))
+    if not deadline:
+        lines.append("\n⚠️ Muddat topilmadi - '✏️ Tuzatish' orqali qo'lda kiriting.")
+    return "\n".join(lines), InlineKeyboardMarkup([buttons])
+
+
+async def set_group_reaction(context, chat_id, message_id, emoji):
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji)] if emoji else [],
         )
+    except Exception:
+        pass  # reaksiya qo'yib bo'lmasa ham asosiy ish davom etadi
 
-    if deadline_info:
-        day, month, deadline_display = deadline_info
-        lines.append(f"Taxminiy muddat: {deadline_display}")
-    else:
-        lines.append("Muddat: ❗ topilmadi")
 
-    lines.append(f"Kimdan: {sender_name}")
-    lines.append("")
-    lines.append(f"Asl xabar:\n{text}")
-    lines.append("\n❗ Diqqat bilan tekshiring - bot taxmin qilyapti, xato bo'lishi mumkin.")
-
-    if deadline_info is None:
-        lines.append("\n⚠️ Muddat aniqlanmagani uchun avtomatik tasdiqlash mumkin emas. "
-                      "Kerak bo'lsa /buyurtma orqali qo'lda kiriting.")
-        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, sender_name):
+    if OWNER_ID is None:
         return
 
-    day, month, deadline_display = deadline_info
-    deadline = compute_deadline(day, month)
-    if deadline is None:
-        lines.append("\n⚠️ Sana noto'g'ri chiqdi, qo'lda kiriting.")
-        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
-        return
+    parsed = None
+    if ai_enabled():
+        parsed = await ai_parse_group_text(text)
+        if parsed and parsed.get("not_order"):
+            # AI "zakaz emas" dedi. Qoidalar ham model topmasa - jim o'tamiz.
+            parsed = rules_parse_group_text(text)
+            if parsed is None:
+                return
+            parsed["problems"].append("AI buni zakaz emas deb hisobladi")
+    if parsed is None:
+        parsed = rules_parse_group_text(text)
+        if parsed is None:
+            return  # model topilmadi - bu xabar zakaz emas bo'lishi mumkin
+
+    entries = parsed["entries"]
+    deadline = None
+    deadline_display = None
+    if parsed["kun"] and parsed["oy"]:
+        deadline = compute_deadline(parsed["kun"], parsed["oy"])
+        if deadline is not None:
+            deadline_display = f"{parsed['kun']} {UZ_MONTH_BY_NUM.get(parsed['oy'], '')}".strip()
 
     conn = get_conn()
     cur = conn.cursor()
+    existing = existing_order_by_number(cur, parsed["raqam"])
     now = datetime.now().isoformat(timespec="seconds")
+    status = "yozilgan" if existing else "kutilmoqda"
+    main_model = entries[0][0] if entries else None
     cur.execute(
         """
         INSERT INTO pending_group_orders
-            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id, source_message_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id,
+             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (model, json.dumps(entries), deadline.isoformat(), deadline_display, sender_name, text, chat_id, message_id, now),
+        (
+            main_model,
+            json.dumps([[it, am, mt, m] for m, it, am, mt in entries]),
+            deadline.isoformat() if deadline else None,
+            deadline_display,
+            sender_name,
+            text,
+            chat_id,
+            message_id,
+            status,
+            now,
+            parsed["raqam"],
+            parsed["izoh"],
+            1 if parsed["dastavka"] else 0,
+            parsed.get("ai_json"),
+            "; ".join(parsed["problems"]) or None,
+        ),
     )
     pending_id = cur.lastrowid
     conn.commit()
     conn.close()
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"gord:{pending_id}:yes"),
-                InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"gord:{pending_id}:edit"),
-                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"gord:{pending_id}:no"),
-            ]
-        ]
-    )
-    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines), reply_markup=keyboard)
+    if existing:
+        await set_group_reaction(context, chat_id, message_id, "👍")
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"ℹ️ Guruhdagi №{parsed['raqam']} zakaz botda allaqachon bor (bot raqami: {existing[0]}). Qayta yozilmadi.",
+        )
+        return
+
+    await set_group_reaction(context, chat_id, message_id, "👀")
+    card_text, keyboard = pending_card(pending_id)
+    await context.bot.send_message(chat_id=OWNER_ID, text=card_text, reply_markup=keyboard)
 
 
 async def group_order_intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6806,7 +7109,9 @@ async def group_order_intake(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if not is_owner(update):
+        await query.answer("Faqat ega tasdiqlay oladi.", show_alert=True)
+        return
 
     _, pending_id_str, action = query.data.split(":")
     pending_id = int(pending_id_str)
@@ -6814,22 +7119,26 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id, raw_text "
-        "FROM pending_group_orders WHERE id = ?",
+        "SELECT model, entries_json, deadline, deadline_display, customer, status, source_chat_id, "
+        "source_message_id, raw_text, tashqi_raqam, izoh, dastavka FROM pending_group_orders WHERE id = ?",
         (pending_id,),
     )
     row = cur.fetchone()
     if row is None:
         conn.close()
+        await query.answer()
         await query.edit_message_text("Bu taklif topilmadi (eskirgan bo'lishi mumkin).")
         return
 
-    model, entries_json, deadline, deadline_display, customer, status, source_chat_id, source_message_id, raw_text = row
-    entries = [tuple(e) for e in json.loads(entries_json)]
-    tashqi_raqam = parse_external_number_from_text(raw_text) if raw_text else None
+    (model, entries_json, deadline, deadline_display, customer, status, source_chat_id,
+     source_message_id, raw_text, tashqi_raqam, izoh, dastavka) = row
+    entries = pending_entries(model, entries_json)
+    if not tashqi_raqam and raw_text:
+        tashqi_raqam = parse_external_number_from_text(raw_text)
 
     if status != "kutilmoqda":
         conn.close()
+        await query.answer()
         await query.edit_message_text(query.message.text + "\n\n(Bu allaqachon ko'rib chiqilgan)")
         return
 
@@ -6837,54 +7146,73 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("UPDATE pending_group_orders SET status = 'rad etildi' WHERE id = ?", (pending_id,))
         conn.commit()
         conn.close()
-        await query.edit_message_text(query.message.text + "\n\n❌ Rad etildi.")
+        await query.answer()
+        await query.edit_message_text(query.message.text + "\n\n❌ Kerak emas deb belgilandi.")
+        await set_group_reaction(context, source_chat_id, source_message_id, None)
         return
 
     if action == "edit":
         cur.execute("UPDATE pending_group_orders SET status = 'tahrirga yuborildi' WHERE id = ?", (pending_id,))
         conn.commit()
         conn.close()
-        suggested = generate_buyurtma_command(model, entries, deadline_display, customer, tashqi_raqam)
-        await query.edit_message_text(
-            query.message.text + "\n\n✏️ Tahrirlash uchun yuborilgan (avtomatik yaratilmaydi)."
-        )
+        await query.answer()
+        by_model = {}
+        for m, it, am, mt in entries:
+            by_model.setdefault(m, []).append((it, am, mt))
+        if not by_model:
+            by_model = {model or "<model>": [(None, 1, None)]}
+        commands = []
+        for i, (m, ents) in enumerate(by_model.items()):
+            commands.append(
+                generate_buyurtma_command(
+                    m, ents, deadline_display or "<kun> <oy>", customer, tashqi_raqam if i == 0 else None
+                )
+            )
+        await query.edit_message_text(query.message.text + "\n\n✏️ Qo'lda kiritish uchun yuborildi.")
+        note = ""
+        if len(commands) > 1:
+            note = (
+                "\n\nBir nechta model bor: birinchisini yuboring, keyingilarini "
+                "/buyurtmaqoshish bilan o'sha buyurtmaga qo'shing."
+            )
         await context.bot.send_message(
             chat_id=OWNER_ID,
-            text=(
-                "Quyidagi buyruqni nusxalab, kerakli joyini to'g'rilab, keyin yuboring:\n\n"
-                f"`{suggested}`"
-            ),
+            text="Buyruqni nusxalab, kerakli joyini to'g'rilab, keyin yuboring:\n\n"
+            + "\n".join(f"`{c}`" for c in commands)
+            + note,
             parse_mode="Markdown",
         )
         return
 
     # action == "yes"
-    if tashqi_raqam:
-        cur.execute(
-            "SELECT DISTINCT guruh_id FROM orders WHERE tashqi_raqam = ? AND status = 'kutilmoqda'",
-            (tashqi_raqam,),
+    if not deadline or not entries:
+        conn.close()
+        await query.answer("Muddat yoki tarkib yo'q - '✏️ Tuzatish' ni bosing.", show_alert=True)
+        return
+    await query.answer()
+    existing = existing_order_by_number(cur, tashqi_raqam)
+    if existing:
+        cur.execute("UPDATE pending_group_orders SET status = 'yozilgan' WHERE id = ?", (pending_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(
+            query.message.text
+            + f"\n\n⚠️ №{tashqi_raqam} raqamli buyurtma botda allaqachon bor (bot raqami: {existing[0]}). "
+            "Yangi buyurtma yaratilmadi."
         )
-        dup = cur.fetchone()
-        if dup:
-            cur.execute("UPDATE pending_group_orders SET status = 'rad etildi' WHERE id = ?", (pending_id,))
-            conn.commit()
-            conn.close()
-            await query.edit_message_text(
-                query.message.text
-                + f"\n\n⚠️ №{tashqi_raqam} raqamli buyurtma allaqachon kutilmoqda (bot raqami: {dup[0]}). "
-                "Yangi buyurtma yaratilmadi."
-            )
-            return
+        await set_group_reaction(context, source_chat_id, source_message_id, "👍")
+        return
 
     now = datetime.now().isoformat(timespec="seconds")
     created_ids = []
-    for item, amount, mod_type in entries:
+    for m, item, amount, mod_type in entries:
         cur.execute(
             """
-            INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status,
+                                created_at, dastavka)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?, ?)
             """,
-            (model, item, amount, mod_type, deadline, deadline_display, customer, now),
+            (m, item, amount, mod_type, deadline, deadline_display, customer, now, 1 if dastavka else 0),
         )
         created_ids.append(cur.lastrowid)
 
@@ -6895,37 +7223,168 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if tashqi_raqam:
         cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
+    if izoh:
+        cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (izoh, guruh_id))
     cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
 
-    entries_4 = [(model, item, amount, mod_type) for item, amount, mod_type in entries]
-    shortage_text = shortage_warning_for_new_order(cur, entries_4)
+    shortage_text = shortage_warning_for_new_order(cur, entries)
 
     conn.commit()
     conn.close()
 
-    def describe(item, amount, mod_type):
-        base = f"{model} komplekt" if item is None else f"{model} {item}"
-        mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
-        return f"{mark}{base} ({amount} ta)"
-
-    what_all = ", ".join(describe(item, amount, mod_type) for item, amount, mod_type in entries)
+    what_all = ", ".join(describe_entry(*e) for e in entries)
     final_text = (
         query.message.text
-        + f"\n\n✅ Tasdiqlandi! Buyurtma {order_label(guruh_id, tashqi_raqam)} yaratildi: {what_all}, muddat {deadline_display}."
+        + f"\n\n✅ Yozildi! Buyurtma {order_label(guruh_id, tashqi_raqam)}: {what_all}, muddat {deadline_display}."
     )
     if shortage_text:
         final_text += shortage_text
     await query.edit_message_text(final_text)
+    await set_group_reaction(context, source_chat_id, source_message_id, "👍")
 
-    if source_chat_id and source_message_id:
+
+def close_already_written_pendings():
+    """Raqami botda allaqachon bor kutilayotgan guruh xabarlarini 'yozilgan' deb yopadi."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, raw_text, tashqi_raqam FROM pending_group_orders WHERE status = 'kutilmoqda'"
+    )
+    closed = 0
+    for pid, raw_text, raqam in cur.fetchall():
+        raqam = raqam or (parse_external_number_from_text(raw_text) if raw_text else None)
+        if existing_order_by_number(cur, raqam):
+            cur.execute("UPDATE pending_group_orders SET status = 'yozilgan' WHERE id = ?", (pid,))
+            closed += 1
+    conn.commit()
+    conn.close()
+    return closed
+
+
+def unwritten_pendings():
+    """(yangi, eski) - kutilayotgan guruh xabarlari id lari. Eski = muddati 3 kundan ko'p o'tgan
+    yoki muddatsiz va 10 kundan eski."""
+    today = date.today()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, deadline, created_at FROM pending_group_orders WHERE status = 'kutilmoqda' ORDER BY id"
+    )
+    fresh, old = [], []
+    for pid, deadline, created_at in cur.fetchall():
+        is_old = False
         try:
-            await context.bot.set_message_reaction(
-                chat_id=source_chat_id,
-                message_id=source_message_id,
-                reaction=[ReactionTypeEmoji("👍")],
+            if deadline:
+                is_old = date.fromisoformat(deadline[:10]) < today - timedelta(days=3)
+            elif created_at:
+                is_old = date.fromisoformat(created_at[:10]) < today - timedelta(days=10)
+        except ValueError:
+            pass
+        (old if is_old else fresh).append(pid)
+    conn.close()
+    return fresh, old
+
+
+async def send_unwritten_list(context, chat_id, quiet_if_empty=False):
+    closed = close_already_written_pendings()
+    fresh, old = unwritten_pendings()
+    if not fresh and not old:
+        if not quiet_if_empty:
+            msg = "✅ Guruhdagi hamma zakaz botga yozilgan."
+            if closed:
+                msg += f"\n({closed} tasi botda allaqachon bor ekan, yopildi.)"
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+        return
+    header = f"📋 Guruhdan kelgan, lekin botga yozilmagan zakazlar: {len(fresh)} ta"
+    if closed:
+        header += f"\n({closed} tasi botda allaqachon bor ekan - avtomatik yopildi.)"
+    await context.bot.send_message(chat_id=chat_id, text=header)
+    for pid in fresh[:15]:
+        text, kb = pending_card(pid)
+        if text:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    if len(fresh) > 15:
+        await context.bot.send_message(chat_id=chat_id, text=f"... yana {len(fresh) - 15} ta. /yozilmagan ni qayta yozing.")
+    if old:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🗂 Yana {len(old)} ta ESKI xabar bor (muddati o'tib ketgan). Ko'pchiligi odatda "
+                "qo'lda kiritilgan bo'ladi."
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ko'rsatish", callback_data="gold:show"),
+                InlineKeyboardButton("🧹 Hammasini yopish", callback_data="gold:close"),
+            ]]),
+        )
+
+
+async def yozilmagan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    await send_unwritten_list(context, update.effective_chat.id)
+
+
+async def gold_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Faqat ega uchun.", show_alert=True)
+        return
+    await query.answer()
+    _, old = unwritten_pendings()
+    if query.data == "gold:close":
+        if old:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE pending_group_orders SET status = 'eskirgan' WHERE id IN ({','.join('?' for _ in old)})",
+                old,
             )
-        except Exception:
-            pass  # Reaksiya qo'yib bo'lmasa ham (masalan xabar juda eski), asosiy oqim davom etadi.
+            conn.commit()
+            conn.close()
+        await query.edit_message_text(f"🧹 {len(old)} ta eski xabar yopildi.")
+        return
+    await query.edit_message_text(f"🗂 Eski xabarlar: {len(old)} ta")
+    for pid in old[:20]:
+        text, kb = pending_card(pid)
+        if text:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=kb)
+
+
+async def job_yozilmagan_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+    close_already_written_pendings()
+    fresh, _ = unwritten_pendings()
+    if not fresh:
+        return
+    await context.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Eslatma: {len(fresh)} ta zakaz hali botga yozilmagan.")
+    await send_unwritten_list(context, OWNER_ID, quiet_if_empty=True)
+
+
+async def ai_buyruq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = [a.lower() for a in context.args]
+    if args and args[0] in ("ha", "yoq", "yo'q"):
+        set_setting("ai_yoqilgan", "ha" if args[0] == "ha" else "yoq")
+    try:
+        stats = json.loads(get_setting("ai_stats") or "{}")
+    except ValueError:
+        stats = {}
+    cost = stats.get("in", 0) * 0.10 / 1_000_000 + stats.get("out", 0) * 0.50 / 1_000_000
+    lines = ["🤖 AI (guruhdagi zakazlarni tushunish)", ""]
+    lines.append("Kalit: " + ("✅ qo'yilgan" if ANTHROPIC_API_KEY else "❌ yo'q (Railway'da ANTHROPIC_API_KEY qo'ying)"))
+    lines.append("Holat: " + ("✅ yoqilgan" if ai_enabled() else "⛔ o'chirilgan"))
+    lines.append(f"Model: {AI_MODEL}")
+    if stats:
+        lines.append("")
+        lines.append(f"{stats.get('since', '?')} dan beri: {stats.get('calls', 0)} ta so'rov, xato: {stats.get('err', 0)}")
+        lines.append(f"Taxminiy xarajat: ${cost:.3f}")
+    lines += ["", "O'chirish: /ai yoq   ·   Yoqish: /ai ha"]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def buyurtma(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9177,6 +9636,9 @@ def main():
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
     app.add_handler(CallbackQueryHandler(sb_callback, pattern=r"^sb:"))
     app.add_handler(CallbackQueryHandler(gord_callback, pattern=r"^gord:"))
+    app.add_handler(CallbackQueryHandler(gold_callback, pattern=r"^gold:"))
+    app.add_handler(CommandHandler("yozilmagan", yozilmagan))
+    app.add_handler(CommandHandler("ai", ai_buyruq))
 
     if app.job_queue is not None:
         # Har kuni ertalab soat 9:00 (Toshkent vaqti) kam qolgan mahsulotlarni tekshiradi.
@@ -9213,6 +9675,10 @@ def main():
         # shu oyning eng ko'p sotilgan modellari haqida hisobot yuboradi.
         app.job_queue.run_daily(
             job_oylik_hisobot, time=time(hour=21, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni soat 18:00 da guruhdan kelgan, lekin botga yozilmagan zakazlarni eslatadi.
+        app.job_queue.run_daily(
+            job_yozilmagan_eslatma, time=time(hour=18, minute=0, tzinfo=TASHKENT_TZ)
         )
     else:
         logger.warning(
