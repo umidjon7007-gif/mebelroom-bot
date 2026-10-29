@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (24) | spinka qoldig'i: holat bo'yicha guruhlangan"
+BOT_VERSION = "2026-10-30 (25) | spinka ishi: avval/keyin + tayyor spinkalar"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -3984,7 +3984,7 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def spinka_qoldiq_lines():
-    """Har model bo'yicha tayyor spinka va ombordagi krovatni solishtirgan ro'yxat."""
+    """Spinkachi uchun oddiy ish varaqasi: avval buyurtmaga keraklisi, keyin qolgani, pastda zaxira."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -3993,51 +3993,54 @@ def spinka_qoldiq_lines():
     stock = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
     cur.execute("SELECT model, item, quantity FROM spinka_stock")
     raw_all = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
+    demand_all = compute_all_pending_demand(cur)
     conn.close()
-
-    by_model = {}
-    for key in set(stock) | set(raw_all):
-        on_hand = max(stock.get(key, 0), 0)
-        raw = raw_all.get(key, 0)
-        if on_hand == 0 and raw == 0:
-            continue
-        by_model.setdefault(key[0], []).append((key[1], raw, on_hand))
-
-    if not by_model:
-        return ["🔨 Spinka qoldig'i: hozircha hech narsa yo'q."]
+    demand = {}
+    for (m, i), q in demand_all.items():
+        if i.lower() in SPINKA_ITEMS:
+            demand[(m.lower(), i.lower())] = demand.get((m.lower(), i.lower()), 0) + q
 
     def label(model, item):
-        return model.capitalize() + (" 110" if item == "krovat110" else "")
+        return model.capitalize() + (" 110 lik krovat" if item == "krovat110" else " krovat")
 
-    need, zapas, full = [], [], []
-    for model, items in by_model.items():
-        for item, raw, on_hand in items:
-            if raw < on_hand:
-                need.append((on_hand - raw, label(model, item)))
-            elif raw > on_hand:
-                zapas.append((raw - on_hand, label(model, item)))
-            else:
-                full.append(label(model, item))
-    need.sort(key=lambda x: (-x[0], x[1]))
-    zapas.sort(key=lambda x: (-x[0], x[1]))
-    full.sort()
+    avval, keyin, zaxira = [], [], []
+    for key in set(stock) | set(raw_all) | set(demand):
+        on_hand = max(stock.get(key, 0), 0)
+        raw = raw_all.get(key, 0)
+        need_orders = demand.get(key, 0)
+        urgent = max(0, need_orders - raw)
+        later = max(0, (on_hand - raw) - urgent)
+        if urgent:
+            avval.append((urgent, label(*key)))
+        if later:
+            keyin.append((later, label(*key)))
+        if raw > on_hand:
+            zaxira.append((raw - on_hand, key[0].capitalize() + (" 110 lik" if key[1] == "krovat110" else "")))
+    for lst in (avval, keyin, zaxira):
+        lst.sort(key=lambda x: (-x[0], x[1]))
 
-    lines = ["🔨 Spinka qoldig'i"]
-    if need:
-        lines.append("")
-        lines.append(f"⚠️ Spinka kerak — {sum(n for n, _ in need)} ta krovat:")
-        for n, name in need:
-            lines.append(f"   {name} — {n} ta")
+    lines = ["🔨 SPINKA ISHI"]
+    n = 0
+    if avval:
+        lines += ["", "🔴 AVVAL SHULARNI QILING", "(mijoz buyurtmasi kutyapti):"]
+        for cnt, name in avval:
+            n += 1
+            lines.append(f"{n}. {name} — {cnt} ta")
+    if keyin:
+        lines += ["", "🟡 KEYIN, VAQT BO'LSA:"]
+        for cnt, name in keyin:
+            n += 1
+            lines.append(f"{n}. {name} — {cnt} ta")
+    total = sum(c for c, _ in avval) + sum(c for c, _ in keyin)
+    if total:
+        lines += ["", f"Jami qilish kerak: {total} ta spinka"]
     else:
-        lines.append("")
-        lines.append("✅ Ombordagi hamma krovatda spinka bor.")
-    if zapas:
-        lines.append("")
-        lines.append(f"📦 Zapas spinka — {sum(n for n, _ in zapas)} ta:")
-        lines.append("   " + " · ".join(f"{name} {n}" for n, name in zapas))
-    if full:
-        lines.append("")
-        lines.append("✅ To'liq: " + ", ".join(full))
+        lines += ["", "✅ Hozir spinka qilish kerak emas. Hamma krovatda spinka bor."]
+    if zaxira:
+        lines += ["", "📦 TAYYOR TURGAN SPINKALAR", "(krovati hali kelmagan):"]
+        for cnt, name in zaxira:
+            lines.append(f"   {name} — {cnt} ta")
+        lines.append(f"   Jami: {sum(c for c, _ in zaxira)} ta")
     return lines
 
 
