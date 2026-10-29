@@ -1801,7 +1801,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_demand = compute_all_pending_demand(cur)
         reserved = total_demand.get((model, item), 0)
         free = quantity - reserved
-        spinka_line = spinka_extra_line(cur, model, item, quantity, reserved)
+        spinka_line = None
         conn.close()
 
         lines = [f"{stock_indicator(quantity)} {name}: {quantity} ta (skladda)"]
@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-29 (20) | spinka: model ostida alohida bo'lim"
+BOT_VERSION = "2026-10-29 (21) | spinka: buyurtma olganda ogohlantirish, qoldiqdan olib tashlandi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -1928,7 +1928,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = cur.fetchall()
     total_demand = compute_all_pending_demand(cur)
-    spinka_block = spinka_section(cur, model, {i: q for i, q in rows})
+    spinka_block = []
     conn.close()
 
     if not rows:
@@ -7782,7 +7782,24 @@ def shortage_warning_for_new_order(cur, entries):
                 f"• {xomashyo}: kerak {need} ta, hozir bor {have} ta (yetishmaydi: {need - have} ta)"
             )
 
+    # Spinka yetarlimi (faqat krovat/krovat110): kerak bo'lgan krovat soni va spinkali (zapas bilan) son
+    spinka_lines = []
+    for model, item in sorted(my_items):
+        if item in SPINKA_ITEMS:
+            needed = total_demand.get((model, item), 0)
+            have = spinka_get(cur, model, item)
+            if have < needed:
+                spinka_lines.append(
+                    f"• {model} {item}: kerak {needed} ta, spinkali {have} ta "
+                    f"(spinka yetmaydi: {needed - have} ta)"
+                )
+
     text = ""
+    if spinka_lines:
+        text += (
+            "\n\n🔨 SPINKA OGOHLANTIRISHI — quyidagi krovatlar uchun spinka yetmaydi "
+            "(spinkachiga ayting):\n" + "\n".join(spinka_lines)
+        )
     if lines:
         text += (
             "\n\n⚠️ ZAXIRA OGOHLANTIRISHI — bu va boshqa kutilayotgan buyurtmalarni "
@@ -8658,7 +8675,7 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
     qty_by_model = {}
     for model, item, quantity in rows:
         qty_by_model.setdefault(model, {})[item] = quantity
-    spinka_blocks = {m: spinka_section(cur, m, q) for m, q in qty_by_model.items()}
+    spinka_blocks = {}
     conn.close()
 
     if not rows:
