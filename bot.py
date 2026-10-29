@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-29 (21) | spinka: buyurtma olganda ogohlantirish, qoldiqdan olib tashlandi"
+BOT_VERSION = "2026-10-30 (22) | /buyurtmamodel: buyurtma modelini almashtirish"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4558,6 +4558,115 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
     await update.message.reply_text(
         f"✅ №{guruh_id} buyurtmasiga qo'shildi: {mark}{model_display} {item_display} ({new_amount} ta)"
+    )
+
+
+async def buyurtmamodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kutilayotgan buyurtmadagi modelni (butunlay yoki bitta detalni) boshqa modelga o'tkazadi."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+
+    args = context.args
+    usage = (
+        "Kutilayotgan buyurtmadagi modelni almashtiradi (model xato yozilgan bo'lsa).\n\n"
+        "Foydalanish: /buyurtmamodel <buyurtma raqami> <eski model> <yangi model> [detal]\n"
+        "Misol (butun buyurtma): /buyurtmamodel 317 anna laura\n"
+        "Misol (faqat krovat): /buyurtmamodel 317 anna laura krovat\n\n"
+        "Buyurtma raqami - botdagi raqam (masalan 'bot raqami: 317')."
+    )
+    if len(args) < 3 or not args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+
+    guruh_id = int(args[0])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        await update.message.reply_text(f"№{guruh_id} buyurtma topilmadi.")
+        return
+    if row[0] != "kutilmoqda":
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} hozir 'kutilmoqda' holatida emas. Bajarilgan buyurtma uchun avval "
+            "/topshirilganibekor bilan qaytaring."
+        )
+        return
+
+    cur.execute("SELECT DISTINCT model FROM products")
+    known_models = {r[0].lower() for r in cur.fetchall()}
+    cur.execute("SELECT DISTINCT model FROM orders WHERE guruh_id = ?", (guruh_id,))
+    group_models = {r[0].lower() for r in cur.fetchall()}
+    all_names = sorted(known_models | group_models, key=lambda m: -len(m.split()))
+
+    def take_model(tokens):
+        for cand in all_names:
+            ct = cand.split()
+            if tokens[: len(ct)] == ct:
+                return cand, tokens[len(ct):]
+        return None, tokens
+
+    lowered = [a.lower() for a in args[1:]]
+    old_model, rest = take_model(lowered)
+    if old_model is None or not rest:
+        conn.close()
+        await update.message.reply_text(usage)
+        return
+    new_model, rest = take_model(rest)
+    if new_model is None:
+        conn.close()
+        await update.message.reply_text(f"Yangi model topilmadi. Mavjud modellar: {', '.join(sorted(known_models))}")
+        return
+    if new_model not in known_models:
+        conn.close()
+        await update.message.reply_text(
+            f"'{new_model}' ro'yxatda yo'q model. Mavjud modellar: {', '.join(sorted(known_models))}"
+        )
+        return
+    if old_model not in group_models:
+        conn.close()
+        await update.message.reply_text(
+            f"№{guruh_id} buyurtmada '{old_model}' modeli yo'q. Buyurtmadagi modellar: {', '.join(sorted(group_models))}"
+        )
+        return
+    if old_model == new_model:
+        conn.close()
+        await update.message.reply_text("Eski va yangi model bir xil.")
+        return
+
+    item_filter = " ".join(rest).strip() or None
+    cur.execute(
+        "SELECT id, item, amount, mod_type FROM orders WHERE guruh_id = ? AND model = ? COLLATE NOCASE",
+        (guruh_id, old_model),
+    )
+    rows = cur.fetchall()
+    if item_filter:
+        want_null = item_filter == "komplekt"
+        rows = [r for r in rows if (r[1] is None and want_null) or (r[1] and r[1].lower() == item_filter)]
+        if not rows:
+            conn.close()
+            await update.message.reply_text(f"№{guruh_id} buyurtmada {old_model} {item_filter} topilmadi.")
+            return
+
+    ids = [r[0] for r in rows]
+    cur.execute(
+        f"UPDATE orders SET model = ? WHERE id IN ({','.join('?' for _ in ids)})",
+        [new_model] + ids,
+    )
+    entries = [(new_model, r[1], r[2], r[3]) for r in rows]
+    shortage_text = shortage_warning_for_new_order(cur, entries) or ""
+    conn.commit()
+    conn.close()
+
+    parts = []
+    for _, item, amount, mod_type in rows:
+        mark = "➕" if mod_type == "+" else ("➖" if mod_type == "-" else "")
+        parts.append(f"{mark}{item or 'komplekt'} {amount} ta")
+    await update.message.reply_text(
+        f"✅ №{guruh_id}: {old_model} → {new_model} ({len(rows)} qator)\n• " + "\n• ".join(parts) + shortage_text
     )
 
 
@@ -8908,6 +9017,7 @@ def main():
     app.add_handler(CommandHandler("versiya", versiya))
     app.add_handler(CommandHandler("zaxiranusxa", zaxiranusxa))
     app.add_handler(CommandHandler("buyurtmasana", buyurtmasana))
+    app.add_handler(CommandHandler("buyurtmamodel", buyurtmamodel))
     app.add_handler(CommandHandler("buyurtmaqoshish", buyurtmaqoshish))
     app.add_handler(CommandHandler("komplektqilish", komplektqilish))
     app.add_handler(CommandHandler("modelstatistika", modelstatistika))
