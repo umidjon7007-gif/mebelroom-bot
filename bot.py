@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-29 (19) | /yetmaydi: spinka yetishmasligi"
+BOT_VERSION = "2026-10-29 (20) | spinka: model ostida alohida bo'lim"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -1928,10 +1928,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = cur.fetchall()
     total_demand = compute_all_pending_demand(cur)
-    spinka_lines = {
-        item: spinka_extra_line(cur, model, item, quantity, total_demand.get((model, item), 0))
-        for item, quantity in rows
-    }
+    spinka_block = spinka_section(cur, model, {i: q for i, q in rows})
     conn.close()
 
     if not rows:
@@ -1951,8 +1948,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
-        if spinka_lines.get(item):
-            lines.append(spinka_lines[item])
+    lines.extend(spinka_block)
     if any_reserved:
         lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
     await query.edit_message_text("\n".join(lines))
@@ -3266,6 +3262,27 @@ def spinka_extra_line(cur, model, item, quantity, reserved=0):
     if raw > on_hand:
         line += f"\n   📦 zapas spinka: {raw - on_hand} ta"
     return line
+
+
+def spinka_section(cur, model, qty_by_item):
+    """Model ro'yxati ostiga qo'yiladigan alohida "Spinka" bo'limi (qatorlar ro'yxati).
+    qty_by_item: {item: omborda soni}. Spinka ma'lumoti bo'lmasa bo'sh ro'yxat qaytaradi."""
+    lines = []
+    for item in SPINKA_ITEMS:
+        on_hand = max(qty_by_item.get(item, 0), 0)
+        raw = spinka_get(cur, model, item)
+        if on_hand == 0 and raw == 0:
+            continue
+        ready = min(raw, on_hand)
+        parts = [f"{ready} ta spinkali"]
+        if on_hand - ready:
+            parts.append(f"{on_hand - ready} tasi spinkasiz")
+        if raw > on_hand:
+            parts.append(f"{raw - on_hand} ta zapas spinka")
+        lines.append(f"   {item}: " + ", ".join(parts))
+    if not lines:
+        return []
+    return ["", "🔨 Spinka:"] + lines
 
 
 def log_spinka_work(worker, model_display, amount, item="krovat"):
@@ -8638,10 +8655,10 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT model, item, quantity FROM products ORDER BY model, item")
     rows = cur.fetchall()
     total_demand = compute_all_pending_demand(cur)
-    spinka_lines = {
-        (model, item): spinka_extra_line(cur, model, item, quantity, total_demand.get((model, item), 0))
-        for model, item, quantity in rows
-    }
+    qty_by_model = {}
+    for model, item, quantity in rows:
+        qty_by_model.setdefault(model, {})[item] = quantity
+    spinka_blocks = {m: spinka_section(cur, m, q) for m, q in qty_by_model.items()}
     conn.close()
 
     if not rows:
@@ -8652,6 +8669,8 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
     any_reserved = False
     for model, item, quantity in rows:
         if model != current_model:
+            if current_model is not None:
+                lines.extend(spinka_blocks.get(current_model, []))
             lines.append(f"\n🔹 {model.capitalize()}")
             current_model = model
         reserved = total_demand.get((model, item), 0)
@@ -8663,12 +8682,24 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             lines.append(f"{stock_indicator(quantity)} {item}: {quantity} ta")
-        if spinka_lines.get((model, item)):
-            lines.append(spinka_lines[(model, item)])
+    if current_model is not None:
+        lines.extend(spinka_blocks.get(current_model, []))
     if any_reserved:
         lines.append("\n📝 \"Band\" - hali 'kutilmoqda' bo'lgan buyurtmalarga ajratilgan miqdor.")
 
-    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
+    # Telegram 4096 belgi chegarasi: uzun hisobotni qismlarga bo'lib yuboramiz
+    text = "\n".join(lines)
+    while text:
+        if len(text) <= 3800:
+            chunk, text = text, ""
+        else:
+            cut = text.rfind("\n\n", 0, 3800)
+            if cut <= 0:
+                cut = text.rfind("\n", 0, 3800)
+            if cut <= 0:
+                cut = 3800
+            chunk, text = text[:cut], text[cut:].lstrip("\n")
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=chunk)
 
 
 async def job_kam_qoldi(context: ContextTypes.DEFAULT_TYPE):
