@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (23) | spinka qoldig'i: /spinkaqoldiq va Spinka menyusi"
+BOT_VERSION = "2026-10-30 (24) | spinka qoldig'i: holat bo'yicha guruhlangan"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4004,31 +4004,40 @@ def spinka_qoldiq_lines():
         by_model.setdefault(key[0], []).append((key[1], raw, on_hand))
 
     if not by_model:
-        return ["🔨 Spinka zaxirasi: hozircha hech narsa yo'q."]
+        return ["🔨 Spinka qoldig'i: hozircha hech narsa yo'q."]
 
-    lines = ["🔨 Spinka zaxirasi:"]
-    tot_raw = tot_unready = tot_zapas = 0
-    for model in sorted(by_model):
-        lines.append("")
-        lines.append(model.capitalize())
-        for item, raw, on_hand in sorted(by_model[model]):
-            tot_raw += raw
-            if raw == on_hand:
-                tail = " ✅"
+    def label(model, item):
+        return model.capitalize() + (" 110" if item == "krovat110" else "")
+
+    need, zapas, full = [], [], []
+    for model, items in by_model.items():
+        for item, raw, on_hand in items:
+            if raw < on_hand:
+                need.append((on_hand - raw, label(model, item)))
             elif raw > on_hand:
-                tail = f" → {raw - on_hand} tasi zapas"
-                tot_zapas += raw - on_hand
+                zapas.append((raw - on_hand, label(model, item)))
             else:
-                tail = f" → {on_hand - raw} tasi spinkasiz"
-                tot_unready += on_hand - raw
-            lines.append(f"   {item}: {raw} spinka · omborda {on_hand} krovat{tail}")
-    lines.append("")
-    summary = f"📊 Jami: {tot_raw} ta spinka tayyor"
-    if tot_zapas:
-        summary += f", {tot_zapas} tasi zapas"
-    if tot_unready:
-        summary += f", {tot_unready} ta krovat spinkasiz"
-    lines.append(summary)
+                full.append(label(model, item))
+    need.sort(key=lambda x: (-x[0], x[1]))
+    zapas.sort(key=lambda x: (-x[0], x[1]))
+    full.sort()
+
+    lines = ["🔨 Spinka qoldig'i"]
+    if need:
+        lines.append("")
+        lines.append(f"⚠️ Spinka kerak — {sum(n for n, _ in need)} ta krovat:")
+        for n, name in need:
+            lines.append(f"   {name} — {n} ta")
+    else:
+        lines.append("")
+        lines.append("✅ Ombordagi hamma krovatda spinka bor.")
+    if zapas:
+        lines.append("")
+        lines.append(f"📦 Zapas spinka — {sum(n for n, _ in zapas)} ta:")
+        lines.append("   " + " · ".join(f"{name} {n}" for n, name in zapas))
+    if full:
+        lines.append("")
+        lines.append("✅ To'liq: " + ", ".join(full))
     return lines
 
 
