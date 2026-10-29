@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (22) | /buyurtmamodel: buyurtma modelini almashtirish"
+BOT_VERSION = "2026-10-30 (23) | spinka qoldig'i: /spinkaqoldiq va Spinka menyusi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -3983,27 +3983,85 @@ async def oyna_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+def spinka_qoldiq_lines():
+    """Har model bo'yicha tayyor spinka va ombordagi krovatni solishtirgan ro'yxat."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT model, item, quantity FROM products WHERE item IN ('krovat', 'krovat110')"
+    )
+    stock = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
+    cur.execute("SELECT model, item, quantity FROM spinka_stock")
+    raw_all = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
+    conn.close()
+
+    by_model = {}
+    for key in set(stock) | set(raw_all):
+        on_hand = max(stock.get(key, 0), 0)
+        raw = raw_all.get(key, 0)
+        if on_hand == 0 and raw == 0:
+            continue
+        by_model.setdefault(key[0], []).append((key[1], raw, on_hand))
+
+    if not by_model:
+        return ["🔨 Spinka zaxirasi: hozircha hech narsa yo'q."]
+
+    lines = ["🔨 Spinka zaxirasi:"]
+    tot_raw = tot_unready = tot_zapas = 0
+    for model in sorted(by_model):
+        lines.append("")
+        lines.append(model.capitalize())
+        for item, raw, on_hand in sorted(by_model[model]):
+            tot_raw += raw
+            if raw == on_hand:
+                tail = " ✅"
+            elif raw > on_hand:
+                tail = f" → {raw - on_hand} tasi zapas"
+                tot_zapas += raw - on_hand
+            else:
+                tail = f" → {on_hand - raw} tasi spinkasiz"
+                tot_unready += on_hand - raw
+            lines.append(f"   {item}: {raw} spinka · omborda {on_hand} krovat{tail}")
+    lines.append("")
+    summary = f"📊 Jami: {tot_raw} ta spinka tayyor"
+    if tot_zapas:
+        summary += f", {tot_zapas} tasi zapas"
+    if tot_unready:
+        summary += f", {tot_unready} ta krovat spinkasiz"
+    lines.append(summary)
+    return lines
+
+
+async def spinkaqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_member(update):
         await deny_access(update)
         return
+    await send_chunked(update.effective_message, spinka_qoldiq_lines())
 
+
+def spinka_models_keyboard():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
-        await update.message.reply_text("Hozircha hech qanday model ro'yxatga olinmagan.")
-        return
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(model.capitalize(), callback_data=f"sp:model:{model}")] for (model,) in rows]
+    )
 
-    buttons = [
-        [InlineKeyboardButton(model.capitalize(), callback_data=f"sp:model:{model}")]
-        for (model,) in rows
-    ]
+
+async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_member(update):
+        await deny_access(update)
+        return
     await update.message.reply_text(
-        "🔨 Spinka qoqish — qaysi model?", reply_markup=InlineKeyboardMarkup(buttons)
+        "🔨 Spinka — nima qilamiz?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔨 Spinka qoqish", callback_data="sp:menu:qoqish")],
+            [InlineKeyboardButton("📦 Spinka qoldig'i", callback_data="sp:menu:qoldiq")],
+        ]),
     )
 
 
@@ -4021,6 +4079,34 @@ def sp_qty_keyboard():
 
 
 async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query.data == "sp:menu:qoldiq":
+        query = update.callback_query
+        if not is_member(update):
+            await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+            return
+        await query.answer()
+        lines = spinka_qoldiq_lines()
+        text = "\n".join(lines)
+        if len(text) <= 3800:
+            await query.edit_message_text(text)
+        else:
+            await query.edit_message_text("📦 Spinka qoldig'i:")
+            await send_chunked(query.message, lines)
+        return
+
+    if update.callback_query.data == "sp:menu:qoqish":
+        query = update.callback_query
+        if not can_kirim(update):
+            await query.answer("Sizda spinka yozish huquqi yo'q.", show_alert=True)
+            return
+        await query.answer()
+        kb = spinka_models_keyboard()
+        if kb is None:
+            await query.edit_message_text("Hozircha hech qanday model ro'yxatga olinmagan.")
+            return
+        await query.edit_message_text("🔨 Spinka qoqish — qaysi model?", reply_markup=kb)
+        return
+
     if not can_kirim(update):
         await update.callback_query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
@@ -9031,6 +9117,7 @@ def main():
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
     app.add_handler(CommandHandler("spinkasoni", spinkasoni))
     app.add_handler(CommandHandler("spinkatarix", spinkatarix))
+    app.add_handler(CommandHandler("spinkaqoldiq", spinkaqoldiq))
     app.add_handler(CommandHandler("yetmaydi", yetmaydi))
     app.add_handler(CommandHandler("kirimmodeltuzatish", kirimmodeltuzatish))
     app.add_handler(CommandHandler("kirimbekor", kirimbekor))
