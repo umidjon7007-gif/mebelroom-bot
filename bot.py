@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-25 (17) | kirim: noma'lum model/detalga tasdiq so'rash"
+BOT_VERSION = "2026-10-29 (18) | zapas spinka qatori"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -3264,7 +3264,7 @@ def spinka_extra_line(cur, model, item, quantity, reserved=0):
     if reserved:
         line += f" · tayyor erkin: {ready - reserved}"
     if raw > on_hand:
-        line += "\n   ⚠️ spinkali son krovatdan ko'p: krovat kirimi hali yozilmagan bo'lishi mumkin"
+        line += f"\n   📦 zapas spinka: {raw - on_hand} ta"
     return line
 
 
@@ -3674,7 +3674,7 @@ async def spinkasoni(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stock = prow[0] if prow else 0
         note = ""
         if qty_new > max(stock, 0):
-            note = " ⚠️ omborda krovat undan kam, kirimni tekshiring"
+            note = f" 📦 shundan {qty_new - max(stock, 0)} tasi zapas (krovatga hali qotirilmagan)"
         done.append(f"• {model} {item}: spinkali {qty_new} ta (omborda jami {stock} ta){note}")
     conn.commit()
     conn.close()
