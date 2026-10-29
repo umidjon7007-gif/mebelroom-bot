@@ -1818,7 +1818,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-29 (18) | zapas spinka qatori"
+BOT_VERSION = "2026-10-29 (19) | /yetmaydi: spinka yetishmasligi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -7661,6 +7661,21 @@ async def yetmaydi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if lab not in orders_for.setdefault(key, []):
                     orders_for[key].append(lab)
 
+    # Spinka: har bir kutilayotgan krovat uchun spinka kerak (zapas ham hisobga olinadi)
+    spinka_short = {}
+    for (model, item), need in demand.items():
+        if item in SPINKA_ITEMS:
+            miss = need - spinka_get(cur, model, item)
+            if miss > 0:
+                spinka_short[(model, item)] = (need, spinka_get(cur, model, item), miss)
+    spinka_orders = {}
+    for guruh_id, entries in by_guruh.items():
+        for key in explode_entries_to_items(cur, entries):
+            if key in spinka_short:
+                lab = f"№{labels[guruh_id]}"
+                if lab not in spinka_orders.setdefault(key, []):
+                    spinka_orders[key].append(lab)
+
     # Oynalar
     band = compute_xom_commitments(cur)
     cur.execute("SELECT name, quantity FROM xomashyo")
@@ -7675,7 +7690,7 @@ async def yetmaydi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     conn.close()
 
-    if not shortage and not oyna_lines:
+    if not shortage and not oyna_lines and not spinka_short:
         await update.message.reply_text("✅ Kutilayotgan buyurtmalarga hamma narsa yetarli.")
         return
 
@@ -7696,6 +7711,14 @@ async def yetmaydi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("")
     if totals:
         lines.append("📊 Jami kesishga: " + ", ".join(f"{i} {q}" for i, q in sorted(totals.items())))
+    if spinka_short:
+        lines.append("")
+        lines.append("🔨 Spinka yetishmasligi (krovat uchun):")
+        for (model, item) in sorted(spinka_short, key=lambda k: (k[0].lower(), k[1])):
+            need, have, miss = spinka_short[(model, item)]
+            nums = ", ".join(spinka_orders.get((model, item), []))
+            tail = f" — {nums}" if nums else ""
+            lines.append(f"  {model.capitalize()} {item}: {miss} ta spinka yetmaydi (kerak {need}, spinkali {have}){tail}")
     if oyna_lines:
         lines.append("")
         lines.append("🪟 Oyna yetishmasligi:")
