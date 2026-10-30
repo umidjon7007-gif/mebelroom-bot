@@ -652,7 +652,22 @@ def can_kirim(update: Update) -> bool:
     cur.execute("SELECT kirim_huquqi FROM worker_accounts WHERE telegram_id = ?", (user.id,))
     row = cur.fetchone()
     conn.close()
-    return bool(row and row[0])
+    return bool(row and row[0] == 1)
+
+
+def can_spinka(update: Update) -> bool:
+    """Spinka yozish huquqi: egasi, to'liq kirim huquqli ishchi yoki 'faqat spinka' ishchi (kirim_huquqi = 2)."""
+    if is_owner(update):
+        return True
+    user = update.effective_user
+    if not user:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT kirim_huquqi FROM worker_accounts WHERE telegram_id = ?", (user.id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0] in (1, 2))
 
 
 async def deny_access(update: Update):
@@ -1825,7 +1840,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (26) | AI: guruhdagi zakazlarni tushunish, /yozilmagan, kechki eslatma"
+BOT_VERSION = "2026-10-30 (27) | faqat spinka huquqi (/kirimhuquqi <ism> spinka)"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2763,19 +2778,30 @@ async def kirimhuquqi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["🔐 Bog'langan ishchilar huquqi:\n"]
         for name, h in rows:
-            lines.append(f"• {name}: " + ("kirim qila oladi ✅" if h else "faqat ko'rish va 'bajarildi' ⛔ (kirim yo'q)"))
-        lines.append("\nO'zgartirish: /kirimhuquqi <ishchi ismi> ha  yoki  yoq")
+            if h == 1:
+                state = "kirim qila oladi ✅"
+            elif h == 2:
+                state = "faqat spinka 🔨 (kirim yo'q)"
+            else:
+                state = "faqat ko'rish va 'bajarildi' ⛔ (kirim yo'q)"
+            lines.append(f"• {name}: {state}")
+        lines.append("\nO'zgartirish: /kirimhuquqi <ishchi ismi> ha | yoq | spinka")
         lines.append("Misol: /kirimhuquqi Hojiakbar yoq")
         await update.message.reply_text("\n".join(lines))
         return
 
-    if len(args) < 2 or args[-1].lower() not in ("ha", "yoq", "yo'q"):
+    if len(args) < 2 or args[-1].lower() not in ("ha", "yoq", "yo'q", "spinka"):
         conn.close()
-        await update.message.reply_text("Foydalanish: /kirimhuquqi <ishchi ismi> ha|yoq\nMisol: /kirimhuquqi Hojiakbar yoq")
+        await update.message.reply_text(
+            "Foydalanish: /kirimhuquqi <ishchi ismi> ha|yoq|spinka\n"
+            "Misol: /kirimhuquqi Hojiakbar yoq\n"
+            "Faqat spinka yozadigan ishchi: /kirimhuquqi Nodir spinka"
+        )
         return
 
     name = " ".join(args[:-1]).strip()
-    value = 1 if args[-1].lower() == "ha" else 0
+    choice = args[-1].lower()
+    value = 1 if choice == "ha" else (2 if choice == "spinka" else 0)
     cur.execute("UPDATE worker_accounts SET kirim_huquqi = ? WHERE worker_name = ?", (value, name))
     if cur.rowcount == 0:
         cur.execute("SELECT worker_name FROM worker_accounts ORDER BY worker_name")
@@ -2787,8 +2813,13 @@ async def kirimhuquqi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     conn.commit()
     conn.close()
-    if value:
+    if value == 1:
         await update.message.reply_text(f"✅ {name} endi kirim qila oladi.")
+    elif value == 2:
+        await update.message.reply_text(
+            f"🔨 {name} endi faqat spinka yoza oladi (/spinkaqoqildi, 🔨 Spinka tugmasi). "
+            "Kirim qila olmaydi, unga upakovka puli yozilmaydi."
+        )
     else:
         await update.message.reply_text(
             f"⛔ {name} endi kirim qila olmaydi. U faqat ko'ra oladi va buyurtmani 'bajarildi' deb belgilay oladi."
@@ -4115,7 +4146,7 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.callback_query.data == "sp:menu:qoqish":
         query = update.callback_query
-        if not can_kirim(update):
+        if not can_spinka(update):
             await query.answer("Sizda spinka yozish huquqi yo'q.", show_alert=True)
             return
         await query.answer()
@@ -4126,7 +4157,7 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔨 Spinka qoqish — qaysi model?", reply_markup=kb)
         return
 
-    if not can_kirim(update):
+    if not can_spinka(update):
         await update.callback_query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
         return
 
@@ -4273,7 +4304,7 @@ async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_kirim(update):
+    if not can_spinka(update):
         await deny_access(update)
         return
 
