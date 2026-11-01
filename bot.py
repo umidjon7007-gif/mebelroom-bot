@@ -1840,7 +1840,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-10-30 (27) | faqat spinka huquqi (/kirimhuquqi <ism> spinka)"
+BOT_VERSION = "2026-11-01 (28) | spinka: 110 lik krovat tugmasi va narxi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2279,8 +2279,9 @@ async def narxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\n{icon} {label}:")
             current_turi = turi
         currency = "usd" if turi in ("sotish", "sotishayirish", "dastavkanarxi", "farqnarxi") else "som"
+        shown_item = "spinka (110 lik krovat)" if item == "spinka110" else item
         if model:
-            lines.append(f"• {model} {item} (maxsus): {format_money(rate, currency)}")
+            lines.append(f"• {model} {shown_item} (maxsus): {format_money(rate, currency)}")
         else:
             lines.append(f"• {item}: {format_money(rate, currency)}")
     await update.message.reply_text("\n".join(lines))
@@ -3328,6 +3329,16 @@ def log_spinka_work(worker, model_display, amount, item="krovat"):
     conn = get_conn()
     cur = conn.cursor()
     rate = get_rate(cur, "spinka", model_display, "spinka")
+    note_110 = ""
+    if item == "krovat110":
+        rate_110 = get_rate(cur, "spinka", model_display, "spinka110")
+        if rate_110:
+            rate = rate_110
+        elif rate:
+            note_110 = (
+                f"\nℹ️ {model_display} 110 lik spinka narxi qo'yilmagan - oddiy narx olindi. "
+                f"Qo'yish: /spinkanarxlar110 {model_display} <summa>"
+            )
     total = amount * rate
     now = datetime.now(TASHKENT_TZ).isoformat()
     cur.execute(
@@ -3365,9 +3376,11 @@ def log_spinka_work(worker, model_display, amount, item="krovat"):
             f"Ish {worker} nomiga 0 so'm bilan yozib qo'yildi — narx belgilangach, "
             f"/maosh orqali tekshirib, kerak bo'lsa tuzating." + status_line
         )
+    kind = " 110 lik" if item == "krovat110" else ""
     return (
-        f"🔨 {worker} — spinka qoqish: {model_display} ({amount} ta) — "
-        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})." + status_line
+        f"🔨 {worker} — spinka qoqish: {model_display}{kind} ({amount} ta) — "
+        f"{format_money(total, 'som')} hisoblandi ({amount} x {format_money(rate, 'som')})."
+        + status_line + note_110
     )
 
 
@@ -4115,6 +4128,11 @@ async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def spinka_label(sp):
+    name = (sp.get("model") or "").capitalize()
+    return f"{name} 110 lik" if sp.get("item") == "krovat110" else name
+
+
 def sp_qty_keyboard():
     return InlineKeyboardMarkup(
         [
@@ -4169,9 +4187,36 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sp:model:"):
         model = data.split(":", 2)[2]
         sp["model"] = model
+        sp["item"] = "krovat"
+        sp["qty"] = 1
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM products WHERE model = ? COLLATE NOCASE AND item = 'krovat110' LIMIT 1", (model,)
+        )
+        has_110 = cur.fetchone() is not None
+        conn.close()
+        if has_110:
+            name = model.capitalize()
+            await query.edit_message_text(
+                f"🔨 {name} — qaysi krovat?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"🛏 {name}", callback_data="sp:kind:krovat")],
+                    [InlineKeyboardButton(f"🛏 {name} 110 lik", callback_data="sp:kind:krovat110")],
+                ]),
+            )
+            return
+        await query.edit_message_text(
+            f"🔨 {spinka_label(sp)} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
+            reply_markup=sp_qty_keyboard(),
+        )
+        return
+
+    if data.startswith("sp:kind:"):
+        sp["item"] = "krovat110" if data.endswith("krovat110") else "krovat"
         sp["qty"] = 1
         await query.edit_message_text(
-            f"🔨 {model.capitalize()} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
+            f"🔨 {spinka_label(sp)} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
             reply_markup=sp_qty_keyboard(),
         )
         return
@@ -4190,7 +4235,7 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             linked_worker = get_linked_worker(update)
             if linked_worker:
-                text = log_spinka_work(linked_worker, model, amount)
+                text = log_spinka_work(linked_worker, model, amount, sp.get("item", "krovat"))
                 context.user_data.pop("sp", None)
                 await query.edit_message_text(text)
                 return
@@ -4209,14 +4254,14 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(w, callback_data=f"sp:worker:{w}")] for w in worker_names
             ]
             await query.edit_message_text(
-                f"🔨 {model.capitalize()} ({amount} ta) — kim qoqdi?", reply_markup=InlineKeyboardMarkup(buttons)
+                f"🔨 {spinka_label(sp)} ({amount} ta) — kim qoqdi?", reply_markup=InlineKeyboardMarkup(buttons)
             )
             return
         step = 1 if action == "+1" else -1
         sp["qty"] = max(1, sp.get("qty", 1) + step)
         model = sp.get("model", "")
         await query.edit_message_text(
-            f"🔨 {model.capitalize()} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
+            f"🔨 {spinka_label(sp)} — nechta spinka?\n\nHozirgi son: {sp['qty']} ta",
             reply_markup=sp_qty_keyboard(),
         )
         return
@@ -4225,25 +4270,28 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker = data.split(":", 2)[2]
         model = sp.get("model")
         amount = sp.get("qty", 1)
+        item = sp.get("item", "krovat")
         context.user_data.pop("sp", None)
         if not model:
             await query.edit_message_text("Xatolik: model tanlanmagan. Qaytadan /spinka deb yozing.")
             return
-        text = log_spinka_work(worker, model, amount)
+        text = log_spinka_work(worker, model, amount, item)
         await query.edit_message_text(text)
         return
 
 
-async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _spinka_narx_set(update: Update, context: ContextTypes.DEFAULT_TYPE, item: str = "spinka"):
     if not is_owner(update):
         await deny_access(update)
         return
 
     args = context.args
+    cmd = "/spinkanarxlar110" if item == "spinka110" else "/spinkanarxlar"
+    what = "110 lik krovat spinkasi" if item == "spinka110" else "oddiy krovat spinkasi"
     usage = (
-        "Bir nechta modelga, har biriga BOSHQA-BOSHQA spinka narxini, BITTA buyruqda belgilaydi.\n\n"
-        "Foydalanish: /spinkanarxlar <model1> <narx1> <model2> <narx2> ...\n"
-        "Misol: /spinkanarxlar vena 15000 bella 20000 maya 18000"
+        f"Har modelga {what} narxini BITTA buyruqda belgilaydi.\n\n"
+        f"Foydalanish: {cmd} <model1> <narx1> <model2> <narx2> ...\n"
+        f"Misol: {cmd} vena 45000 laura 70000"
     )
     if len(args) < 2:
         await update.message.reply_text(usage)
@@ -4288,19 +4336,27 @@ async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for model, price in pairs:
         cur.execute(
-            "INSERT INTO narxlar (turi, model, item, rate) VALUES ('spinka', ?, 'spinka', ?) "
+            "INSERT INTO narxlar (turi, model, item, rate) VALUES ('spinka', ?, ?, ?) "
             "ON CONFLICT(turi, model, item) DO UPDATE SET rate = excluded.rate",
-            (model, price),
+            (model, item, price),
         )
     conn.commit()
     conn.close()
 
-    lines = ["✅ Spinka narxlari belgilandi:"]
+    lines = [f"✅ {what.capitalize()} narxlari belgilandi:"]
     for model, price in pairs:
         lines.append(f"• {model}: {format_money(price, 'som')}")
     if unmatched:
         lines.append(f"\n⚠️ Tushunilmadi: {', '.join(unmatched)}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def spinkanarxlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _spinka_narx_set(update, context, "spinka")
+
+
+async def spinkanarxlar110(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _spinka_narx_set(update, context, "spinka110")
 
 
 async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9612,6 +9668,7 @@ def main():
     app.add_handler(CommandHandler("buyurtmatarix", buyurtmatarix))
     app.add_handler(CommandHandler("spinkaqoqildi", spinkaqoqildi))
     app.add_handler(CommandHandler("spinkanarxlar", spinkanarxlar))
+    app.add_handler(CommandHandler("spinkanarxlar110", spinkanarxlar110))
     app.add_handler(CommandHandler("spinka", spinka_button))
     app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
     app.add_handler(CommandHandler("oyna", oyna_button))
