@@ -1840,7 +1840,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-01 (28) | spinka: 110 lik krovat tugmasi va narxi"
+BOT_VERSION = "2026-11-01 (29) | spinka qoqish: faqat krovatli modellar"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4105,7 +4105,9 @@ async def spinkaqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def spinka_models_keyboard():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    cur.execute(
+        "SELECT DISTINCT model FROM products WHERE item IN ('krovat', 'krovat110') ORDER BY model"
+    )
     rows = cur.fetchall()
     conn.close()
     if not rows:
