@@ -213,6 +213,10 @@ def init_db():
     if "izoh" not in orders_columns:
         # Buyurtmaga qo'lda yozilgan erkin izoh (masalan "krovat 110 lik, ruchkasi anta ruchkasidan")
         cur.execute("ALTER TABLE orders ADD COLUMN izoh TEXT")
+    if "chiqdi_at" not in orders_columns:
+        # Mebel ombordan chiqib ketgan vaqt ("📦 Ombordan chiqdi"). Bo'sh bo'lmasa, zaxira allaqachon
+        # ayrilgan - "bajarildi" paytida qayta ayrilmaydi.
+        cur.execute("ALTER TABLE orders ADD COLUMN chiqdi_at TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS komplekt_tarkibi (
@@ -1840,7 +1844,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-01 (29) | spinka qoqish: faqat krovatli modellar"
+BOT_VERSION = "2026-11-02 (30) | Ombordan chiqdi / Omborga qaytdi, /yolda"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -7805,7 +7809,7 @@ async def topshirilganibekor(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     cur.execute("DELETE FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
     cur.execute(
-        f"UPDATE orders SET status = 'kutilmoqda', bajarildi_at = NULL WHERE id IN ({placeholders})",
+        f"UPDATE orders SET status = 'kutilmoqda', bajarildi_at = NULL, chiqdi_at = NULL WHERE id IN ({placeholders})",
         order_ids,
     )
 
@@ -7859,7 +7863,9 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     placeholders = ",".join("?" for _ in order_ids)
 
     stock_restored_lines = []
-    if status == "bajarildi":
+    cur.execute("SELECT 1 FROM orders WHERE guruh_id = ? AND chiqdi_at IS NOT NULL LIMIT 1", (guruh_id,))
+    was_shipped = cur.fetchone() is not None
+    if status == "bajarildi" or was_shipped:
         # Qaysi detallar '-' bilan ayirilgan edi (ular hech qachon zaxiradan chiqmagan edi)
         excluded_by_model = {}
         for _, model, item, amount, mod_type, _ in rows:
@@ -8033,8 +8039,15 @@ def format_group_text(group):
     ]
     if group["customer"]:
         lines.append(f"Mijoz: {group['customer']}")
-    if group.get("izoh"):
+    if group.get("izoh"):  # kutilayotgan karta
         lines.append(f"📝 Izoh: {group['izoh']}")
+    if group.get("chiqdi_at"):
+        try:
+            shipped = datetime.fromisoformat(group["chiqdi_at"]).strftime("%d.%m %H:%M")
+        except ValueError:
+            shipped = group["chiqdi_at"][:16]
+        extra = " (qisman)" if group.get("not_shipped") else ""
+        lines.append(f"🚚 Yo'lda: ombordan chiqdi {shipped}{extra}")
     lines.append("")
     for _, model, item, amount, mod_type in group["items"]:
         what = f"{model} komplekt" if item is None else f"{model} {item}"
@@ -8058,7 +8071,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
         conditions.append("LOWER(customer) = LOWER(?)")
         params.append(customer_filter)
     cur.execute(
-        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam, izoh "
+        "SELECT id, guruh_id, model, item, amount, deadline, deadline_display, customer, mod_type, tashqi_raqam, izoh, chiqdi_at "
         "FROM orders WHERE " + " AND ".join(conditions) +
         " ORDER BY deadline ASC, guruh_id ASC, id ASC",
         params,
@@ -8068,7 +8081,7 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
 
     groups = {}
     order_of_groups = []
-    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, tashqi_raqam, izoh in rows:
+    for oid, guruh_id, model, item, amount, deadline_iso, deadline_display, customer, mod_type, tashqi_raqam, izoh, chiqdi_at in rows:
         gid = guruh_id if guruh_id is not None else oid
         if gid not in groups:
             groups[gid] = {
@@ -8079,9 +8092,15 @@ def fetch_pending_order_groups(model_filter=None, customer_filter=None):
                 "tashqi_raqam": tashqi_raqam,
                 "izoh": izoh,
                 "items": [],
+                "chiqdi_at": None,
+                "not_shipped": False,
             }
             order_of_groups.append(gid)
         groups[gid]["items"].append((oid, model, item, amount, mod_type))
+        if chiqdi_at:
+            groups[gid]["chiqdi_at"] = max(groups[gid]["chiqdi_at"] or "", chiqdi_at)
+        else:
+            groups[gid]["not_shipped"] = True
     return [groups[gid] for gid in order_of_groups]
 
 
@@ -8118,10 +8137,7 @@ async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(header)
     for group in groups:
         text = format_group_text(group)
-        button = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"✅ №{group.get('tashqi_raqam') or group['guruh_id']} topshirildi", callback_data=f"orddone:{group['guruh_id']}")]]
-        )
-        await update.message.reply_text(text, reply_markup=button)
+        await update.message.reply_text(text, reply_markup=order_group_keyboard(group))
 
 
 def get_order_customer(guruh_id: int):
@@ -8181,6 +8197,255 @@ async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_
         else:
             lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
     return "\n".join(lines)
+
+
+def order_group_keyboard(group):
+    """Buyurtma kartasi tugmalari: topshirildi + ombordan chiqdi / omborga qaytdi."""
+    label = group.get("tashqi_raqam") or group["guruh_id"]
+    gid = group["guruh_id"]
+    rows = [[InlineKeyboardButton(f"✅ №{label} topshirildi", callback_data=f"orddone:{gid}")]]
+    second = []
+    if group.get("not_shipped", True):
+        second.append(InlineKeyboardButton("📦 Ombordan chiqdi", callback_data=f"chiqdi:{gid}"))
+    if group.get("chiqdi_at"):
+        second.append(InlineKeyboardButton("↩️ Omborga qaytdi", callback_data=f"qaytdi:{gid}"))
+    if second:
+        rows.append(second)
+    return InlineKeyboardMarkup(rows)
+
+
+def chiqdi_allowed_names():
+    raw = get_setting("chiqdi_ruxsat")
+    if raw is None:
+        raw = "Abdulloh"
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def can_chiqdi(update: Update) -> bool:
+    """'Ombordan chiqdi' / 'Omborga qaytdi' huquqi: egasi va ruxsat berilgan ishchilar (standart: Abdulloh)."""
+    if is_owner(update):
+        return True
+    worker = get_linked_worker(update)
+    return bool(worker) and worker.lower() in {n.lower() for n in chiqdi_allowed_names()}
+
+
+def _group_targets(cur, rows):
+    """rows: [(id, model, item, amount, mod_type)] -> [(order_id, model, item, qty)] ombordagi haqiqiy detallar."""
+    excluded_by_model = {}
+    for _, model, item, amount, mod_type in rows:
+        if mod_type == "-" and item is not None:
+            excluded_by_model.setdefault(model, set()).add(item)
+    for extra_model, extra_items in upgrade_auto_exclusions(
+        [(model, item, amount, mod_type) for _, model, item, amount, mod_type in rows]
+    ).items():
+        excluded_by_model.setdefault(extra_model, set()).update(extra_items)
+    out = []
+    for oid, model, item, amount, mod_type in rows:
+        if mod_type == "-":
+            continue
+        if item is not None:
+            out.append((oid, model, item, amount))
+            continue
+        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ?", (model,))
+        per_item_qty = dict(cur.fetchall())
+        cur.execute("SELECT item FROM products WHERE model = ?", (model,))
+        all_items = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT item FROM qoshimcha_detallar WHERE model IN ('', ?)", (model,))
+        addon_only = {r[0] for r in cur.fetchall()}
+        excluded = excluded_by_model.get(model, set())
+        for it in all_items:
+            if it not in excluded and it not in addon_only:
+                out.append((oid, model, it, amount * per_item_qty.get(it, 1)))
+    return out
+
+
+def chiqdi_group_core(guruh_id: int, user) -> str:
+    """Buyurtma mebelini ombordan ayiradi (pul yozmaydi) va 'yo'lda' deb belgilaydi."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount, mod_type FROM orders "
+        "WHERE guruh_id = ? AND status = 'kutilmoqda' AND chiqdi_at IS NULL",
+        (guruh_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        cur.execute("SELECT status FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+        st = cur.fetchone()
+        conn.close()
+        if st is None:
+            return f"№{guruh_id} buyurtma topilmadi."
+        if st[0] != "kutilmoqda":
+            return f"№{guruh_id} allaqachon '{st[0]}' holatida."
+        return f"№{guruh_id} allaqachon ombordan chiqqan (🚚 yo'lda)."
+    user_name = user.full_name if user else "noma'lum"
+    user_id = user.id if user else None
+    now = datetime.now().isoformat(timespec="seconds")
+
+    excluded_by_model = {}
+    for _, model, item, amount, mod_type in rows:
+        if mod_type == "-" and item is not None:
+            excluded_by_model.setdefault(model, set()).add(item)
+    for extra_model, extra_items in upgrade_auto_exclusions(
+        [(model, item, amount, mod_type) for _, model, item, amount, mod_type in rows]
+    ).items():
+        excluded_by_model.setdefault(extra_model, set()).update(extra_items)
+
+    lines_out = []
+    for oid, model, item, amount, mod_type in rows:
+        excluded_items = excluded_by_model.get(model, set()) if item is None else None
+        result_lines, _, _ = fulfill_single_order(
+            cur, oid, model, item, amount, mod_type, None, user_name, user_id, now, excluded_items
+        )
+        lines_out.extend(result_lines)
+    ids = [r[0] for r in rows]
+    cur.execute(
+        f"UPDATE orders SET chiqdi_at = ? WHERE id IN ({','.join('?' for _ in ids)})",
+        [datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")] + ids,
+    )
+    cur.execute("SELECT tashqi_raqam FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    tr = cur.fetchone()
+    conn.commit()
+    conn.close()
+    return (
+        f"📦 {order_label(guruh_id, tr[0] if tr else None)} ombordan chiqdi ({user_name}).\n"
+        "Zaxiradan ayrildi:\n" + "\n".join(lines_out)
+        + "\n\n🚚 Endi 'yo'lda'. O'rnatilgach ustanovchi '✅ topshirildi' ni bosadi - "
+        "ombordan qayta ayrilmaydi, faqat ishchi puli va to'lov yoziladi."
+    )
+
+
+def qaytdi_group_core(guruh_id: int, user) -> str:
+    """'Ombordan chiqdi' ni bekor qiladi: mebelni omborga qaytaradi."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, model, item, amount, mod_type FROM orders "
+        "WHERE guruh_id = ? AND status = 'kutilmoqda' AND chiqdi_at IS NOT NULL",
+        (guruh_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        return f"№{guruh_id} ombordan chiqqan (yo'ldagi) buyurtma emas - hech narsa o'zgarmadi."
+    user_name = (user.full_name if user else "noma'lum") + " (omborga qaytdi)"
+    user_id = user.id if user else None
+    now = datetime.now().isoformat(timespec="seconds")
+    restored = []
+    for _, m, it, qty in _group_targets(cur, rows):
+        key = normalize_product_name(f"{m} {it}")
+        cur.execute("SELECT quantity FROM products WHERE name = ?", (key,))
+        prow = cur.fetchone()
+        if prow is None:
+            continue
+        cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (prow[0] + qty, key))
+        cur.execute(
+            "INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at) "
+            "VALUES (?, 'kirim', ?, ?, ?, ?)",
+            (key, qty, user_name, user_id, now),
+        )
+        restored.append(f"• {m} {it}: +{qty}")
+    ids = [r[0] for r in rows]
+    spinka_back = spinka_restore_orders(cur, ids)
+    cur.execute(f"UPDATE orders SET chiqdi_at = NULL WHERE id IN ({','.join('?' for _ in ids)})", ids)
+    conn.commit()
+    conn.close()
+    lines = [f"↩️ №{guruh_id} omborga qaytarildi, yana 'kutilmoqda'."]
+    if restored:
+        lines.append("Zaxiraga qaytdi:")
+        lines.extend(restored)
+    if spinka_back:
+        lines.append("🔨 Spinkali son qaytarildi: " + ", ".join(f"{m} {i} +{a}" for m, i, a in spinka_back))
+    return "\n".join(lines)
+
+
+async def chiqdi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_chiqdi(update):
+        await query.answer("'Ombordan chiqdi' ni faqat ega va ruxsat berilgan ishchi bosa oladi.", show_alert=True)
+        return
+    await query.answer()
+    guruh_id = int(query.data.split(":", 1)[1])
+    text = chiqdi_group_core(guruh_id, update.effective_user)
+    groups = [g for g in fetch_pending_order_groups() if g["guruh_id"] == guruh_id]
+    markup = order_group_keyboard(groups[0]) if groups else None
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+async def qaytdi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_chiqdi(update):
+        await query.answer("'Omborga qaytdi' ni faqat ega va ruxsat berilgan ishchi bosa oladi.", show_alert=True)
+        return
+    await query.answer()
+    guruh_id = int(query.data.split(":", 1)[1])
+    text = qaytdi_group_core(guruh_id, update.effective_user)
+    groups = [g for g in fetch_pending_order_groups() if g["guruh_id"] == guruh_id]
+    markup = order_group_keyboard(groups[0]) if groups else None
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+async def yolda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_member(update):
+        await deny_access(update)
+        return
+    groups = [g for g in fetch_pending_order_groups() if g.get("chiqdi_at")]
+    if not groups:
+        await update.message.reply_text("🚚 Yo'lda (ombordan chiqqan, topshirilmagan) buyurtma yo'q.")
+        return
+    await update.message.reply_text(f"🚚 Yo'ldagi buyurtmalar: {len(groups)} ta")
+    for group in groups:
+        await update.message.reply_text(format_group_text(group), reply_markup=order_group_keyboard(group))
+
+
+async def chiqdihuquqi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = context.args
+    names = chiqdi_allowed_names()
+    if len(args) >= 2 and args[-1].lower() in ("ha", "yoq", "yo'q"):
+        name = " ".join(args[:-1]).strip()
+        lowered = [n.lower() for n in names]
+        if args[-1].lower() == "ha" and name.lower() not in lowered:
+            names.append(name)
+        if args[-1].lower() != "ha":
+            names = [n for n in names if n.lower() != name.lower()]
+        set_setting("chiqdi_ruxsat", ",".join(names))
+    shown = ", ".join(names) if names else "hech kim"
+    await update.message.reply_text(
+        "📦 'Ombordan chiqdi' / 'Omborga qaytdi' ni bosa oladi: siz (ega) va " + shown + ".\n\n"
+        "O'zgartirish: /chiqdihuquqi <ism> ha  yoki  /chiqdihuquqi <ism> yoq"
+    )
+
+
+async def job_yolda_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+    now = datetime.now(TASHKENT_TZ)
+    old = []
+    for g in fetch_pending_order_groups():
+        if not g.get("chiqdi_at"):
+            continue
+        try:
+            shipped = datetime.fromisoformat(g["chiqdi_at"])
+            if shipped.tzinfo is None:
+                shipped = shipped.replace(tzinfo=TASHKENT_TZ)
+        except ValueError:
+            continue
+        days = (now - shipped).days
+        if days >= 2:
+            old.append((days, g))
+    if not old:
+        return
+    lines = [f"🚚 Eslatma: {len(old)} ta buyurtma ombordan chiqqan, lekin hali 'topshirildi' qilinmagan:"]
+    for days, g in sorted(old, key=lambda x: -x[0]):
+        what = ", ".join(
+            (f"{m} komplekt" if it is None else f"{m} {it}") for _, m, it, _, mt in g["items"] if mt != "-"
+        )
+        lines.append(f"• {order_label(g['guruh_id'], g.get('tashqi_raqam'))} — {what} · {days} kundan beri")
+    lines.append("\nRo'yxat tugmalar bilan: /yolda")
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
 
 
 async def orddone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8348,7 +8613,10 @@ def explode_entries_to_items(cur, entries):
 def compute_all_pending_demand(cur):
     """Barcha 'kutilmoqda' buyurtmalar bo'yicha har bir (model, detal) uchun
     zarur bo'lgan JAMI miqdorni hisoblaydi."""
-    cur.execute("SELECT id, guruh_id, model, item, amount, mod_type FROM orders WHERE status = 'kutilmoqda'")
+    cur.execute(
+        "SELECT id, guruh_id, model, item, amount, mod_type FROM orders "
+        "WHERE status = 'kutilmoqda' AND chiqdi_at IS NULL"
+    )
     rows = cur.fetchall()
 
     by_guruh = {}
@@ -8624,7 +8892,7 @@ def record_payment(guruh_id: int, customer: str, expected_value: int, received_a
     conn.close()
 
 
-def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, user_name, user_id, now, excluded_items=None):
+def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, user_name, user_id, now, excluded_items=None, skip_stock=False):
     """Bitta buyurtma qatorini zaxiradan chiqaradi va (agar worker berilgan bo'lsa)
     to'lovni hisoblab work_log ga yozadi. Natijani (result_lines, payment_total, payment_note) qaytaradi.
     mod_type == '-' bo'lsa (komplektdan ayirilgan detal) - zaxiradan hech narsa chiqarilmaydi,
@@ -8659,6 +8927,10 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
         per_item_qty = dict(cur.fetchall())
 
     result_lines = []
+    if skip_stock:
+        what = f"{model} komplekt" if item is None else f"{model} {item}"
+        result_lines.append(f"• {what}: ombordan oldin chiqarilgan (qayta ayrilmadi)")
+        targets = []
     for target_model, target_item in targets:
         deduct = amount * per_item_qty.get(target_item, 1) if item is None else amount
 
@@ -8734,6 +9006,8 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
     user_id = user.id if user else None
     now = datetime.now().isoformat(timespec="seconds")
     is_dastavka = any(d for _, _, _, _, _, d in rows)
+    cur.execute("SELECT id, chiqdi_at FROM orders WHERE guruh_id = ?", (guruh_id,))
+    chiqdi_map = {oid: ca for oid, ca in cur.fetchall()}
 
     # Ayirilgan ('-') detallarni model bo'yicha yig'amiz - komplekt (item=None) yoyilganda
     # bu detallar zaxiradan chiqarilmasligi kerak (mijoz ularni olmayapti).
@@ -8753,7 +9027,8 @@ async def bajarildi_group_core(guruh_id: int, user, worker: str = None) -> str:
         excluded_items = excluded_by_model.get(model, set()) if item is None else None
         effective_worker = None if dastavka else worker
         result_lines, payment_total, payment_note = fulfill_single_order(
-            cur, order_id, model, item, amount, mod_type, effective_worker, user_name, user_id, now, excluded_items
+            cur, order_id, model, item, amount, mod_type, effective_worker, user_name, user_id, now, excluded_items,
+            skip_stock=bool(chiqdi_map.get(order_id)),
         )
         all_result_lines.extend(result_lines)
         total_payment += payment_total
@@ -9721,6 +9996,10 @@ def main():
     app.add_handler(CallbackQueryHandler(mijoz_callback, pattern=r"^mij:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
+    app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
+    app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
+    app.add_handler(CommandHandler("yolda", yolda))
+    app.add_handler(CommandHandler("chiqdihuquqi", chiqdihuquqi))
     app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
     app.add_handler(CallbackQueryHandler(neww_callback, pattern=r"^neww:"))
     app.add_handler(CallbackQueryHandler(workerdone_callback, pattern=r"^workerdone:"))
@@ -9769,6 +10048,10 @@ def main():
         # Har kuni soat 18:00 da guruhdan kelgan, lekin botga yozilmagan zakazlarni eslatadi.
         app.job_queue.run_daily(
             job_yozilmagan_eslatma, time=time(hour=18, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni 9:05 da 2 kundan ko'p "yo'lda" turgan buyurtmalarni eslatadi.
+        app.job_queue.run_daily(
+            job_yolda_eslatma, time=time(hour=9, minute=5, tzinfo=TASHKENT_TZ)
         )
     else:
         logger.warning(
