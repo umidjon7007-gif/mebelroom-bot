@@ -1900,7 +1900,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (33) | takror kirim/spinka ogohlantirishi, hisobotda pul nazorati"
+BOT_VERSION = "2026-11-13 (34) | 8:20 da ishchilarga shaxsiy eslatma (upakovka/spinka)"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5211,6 +5211,152 @@ async def job_holat_hisobot(context: ContextTypes.DEFAULT_TYPE):
         chunk.append(ln)
     if chunk:
         await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(chunk))
+
+
+def order_needs_by_item():
+    """Kutilayotgan (ombordan chiqmagan) buyurtmalar bo'yicha har bir (model, detal) ga
+    kerak bo'lgan miqdor va shu detalni kutayotgan buyurtmalar ro'yxati (eng yaqin muddat birinchi)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT guruh_id, model, item, amount, mod_type, tashqi_raqam, deadline, deadline_display FROM orders "
+        "WHERE status = 'kutilmoqda' AND chiqdi_at IS NULL ORDER BY deadline, guruh_id"
+    )
+    groups = {}
+    meta = {}
+    for gid, model, item, amount, mod_type, tashqi, deadline, dd in cur.fetchall():
+        groups.setdefault(gid, []).append((model, item, amount, mod_type))
+        meta[gid] = (tashqi, deadline or "", dd or "")
+    need, who = {}, {}
+    for gid, entries in groups.items():
+        for key, qty in explode_entries_to_items(cur, entries).items():
+            need[key] = need.get(key, 0) + qty
+            who.setdefault(key, []).append(gid)
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {(m, i): q for m, i, q in cur.fetchall()}
+    conn.close()
+    return need, who, meta, stock
+
+
+def _order_short(gid, meta):
+    tashqi, _, dd = meta.get(gid, (None, "", ""))
+    return f"№{tashqi or gid}" + (f" · {dd}" if dd else "")
+
+
+def upakovka_eslatma_text(worker):
+    need, who, meta, stock = order_needs_by_item()
+    rows = []
+    for key, q in need.items():
+        miss = q - stock.get(key, 0)
+        if miss > 0:
+            first_deadline = min(meta[g][1] for g in who[key])
+            rows.append((first_deadline, key, miss, who[key]))
+    rows.sort()
+    lines = [f"🌅 Xayrli tong, {worker}!"]
+    if rows:
+        lines += ["", "📦 Buyurtmalar uchun yetishmayapti (tayyorlash kerak):"]
+        for n, (_, (m, it), miss, gids) in enumerate(rows[:12], 1):
+            orders = ", ".join(_order_short(g, meta) for g in gids[:3])
+            lines.append(f"{n}. {m.capitalize()} {it} — {miss} ta  ({orders})")
+        if len(rows) > 12:
+            lines.append(f"... yana {len(rows) - 12} ta")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT MAX(created_at) FROM work_log WHERE turi = 'upakovka' AND LOWER(worker) = LOWER(?)", (worker,)
+    )
+    last = cur.fetchone()[0]
+    conn.close()
+    days = None
+    if last:
+        try:
+            days = (datetime.now(TASHKENT_TZ).date() - date.fromisoformat(last[:10])).days
+        except ValueError:
+            days = None
+    if days is not None and days >= 2:
+        lines += ["", f"⏰ Siz {days} kundan beri kirim yozmadingiz. Yasagan mebellaringizni kirim qiling - "
+                  "kirim yozilmasa, pulingiz ham yozilmaydi."]
+    if len(lines) == 1:
+        return None
+    return "\n".join(lines)
+
+
+def spinka_eslatma_text(worker):
+    need, who, meta, _ = order_needs_by_item()
+    conn = get_conn()
+    cur = conn.cursor()
+    rows = []
+    for (m, it), q in need.items():
+        if it not in SPINKA_ITEMS:
+            continue
+        miss = q - spinka_get(cur, m, it)
+        if miss > 0:
+            rows.append((min(meta[g][1] for g in who[(m, it)]), m, it, miss, who[(m, it)]))
+    conn.close()
+    if not rows:
+        return None
+    rows.sort()
+    lines = [f"🌅 Xayrli tong, {worker}!", "", "🔨 Buyurtmalar uchun spinka kerak:"]
+    for n, (_, m, it, miss, gids) in enumerate(rows[:12], 1):
+        kind = " 110 lik" if it == "krovat110" else ""
+        orders = ", ".join(_order_short(g, meta) for g in gids[:3])
+        lines.append(f"{n}. {m.capitalize()}{kind} krovat — {miss} ta  ({orders})")
+    lines += ["", "Qoqqaningizni 🔨 Spinka tugmasi orqali yozing."]
+    return "\n".join(lines)
+
+
+async def job_ishchi_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    """Har kuni 8:20 da upakovkachi va spinkachilarga shaxsiy chatda ish eslatmasi."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT worker_name, telegram_id, kirim_huquqi FROM worker_accounts")
+    accounts = cur.fetchall()
+    cur.execute("SELECT name FROM upakovkachilar")
+    upak = {r[0].lower() for r in cur.fetchall()}
+    since = (datetime.now(TASHKENT_TZ) - timedelta(days=30)).isoformat()
+    cur.execute("SELECT DISTINCT LOWER(worker) FROM work_log WHERE turi = 'spinka' AND created_at >= ?", (since,))
+    spinkachi = {r[0] for r in cur.fetchall()}
+    conn.close()
+    for name, tg_id, huquq in accounts:
+        if not tg_id or (OWNER_ID and tg_id == OWNER_ID):
+            continue
+        texts = []
+        if name.lower() in upak and huquq == 1:
+            t = upakovka_eslatma_text(name)
+            if t:
+                texts.append(t)
+        if huquq == 2 or name.lower() in spinkachi:
+            t = spinka_eslatma_text(name)
+            if t:
+                if texts:
+                    t = t.split("\n", 2)[2]  # salomni takrorlamaslik
+                texts.append(t)
+        if not texts:
+            continue
+        try:
+            await context.bot.send_message(chat_id=tg_id, text="\n\n".join(texts))
+        except Exception as e:
+            logger.warning("Ishchi eslatmasi yuborilmadi (%s): %s", name, e)
+
+
+async def eslatmasinov(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ega uchun: ishchilarga ertalab nima borishini oldindan ko'rish."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM upakovkachilar ORDER BY name")
+    upak = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT worker_name FROM worker_accounts WHERE kirim_huquqi = 2 ORDER BY worker_name")
+    spk = [r[0] for r in cur.fetchall()]
+    conn.close()
+    out = []
+    for w in upak:
+        out.append(f"=== {w} (upakovka) ===\n" + (upakovka_eslatma_text(w) or "(xabar yuborilmaydi - ish yo'q)"))
+    for w in spk:
+        out.append(f"=== {w} (spinka) ===\n" + (spinka_eslatma_text(w) or "(xabar yuborilmaydi - ish yo'q)"))
+    await send_chunked(update.message, ("\n\n".join(out) or "Ishchilar topilmadi.").split("\n"))
 
 
 async def holat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10279,6 +10425,7 @@ def main():
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
     app.add_handler(CommandHandler("yolda", yolda))
     app.add_handler(CommandHandler("holat", holat))
+    app.add_handler(CommandHandler("eslatmasinov", eslatmasinov))
     app.add_handler(CommandHandler("chiqdihuquqi", chiqdihuquqi))
     app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
     app.add_handler(CallbackQueryHandler(neww_callback, pattern=r"^neww:"))
@@ -10328,6 +10475,10 @@ def main():
         # Har kuni soat 18:00 da guruhdan kelgan, lekin botga yozilmagan zakazlarni eslatadi.
         app.job_queue.run_daily(
             job_yozilmagan_eslatma, time=time(hour=18, minute=0, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni 8:20 da upakovkachi va spinkachilarga shaxsiy eslatma.
+        app.job_queue.run_daily(
+            job_ishchi_eslatma, time=time(hour=8, minute=20, tzinfo=TASHKENT_TZ)
         )
         # Har kuni 8:30 da holat hisoboti (manfiy qoldiq, muddati o'tgan, yo'lda, kirim yo'q, yozilmagan).
         app.job_queue.run_daily(
