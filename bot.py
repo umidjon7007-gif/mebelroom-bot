@@ -1844,7 +1844,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-02 (30) | Ombordan chiqdi / Omborga qaytdi, /yolda"
+BOT_VERSION = "2026-11-13 (31) | yaqinda o'tgan muddat keyingi yilga surilmaydi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -6590,7 +6590,9 @@ def compute_deadline(day: int, month: int):
         deadline = date(year, month, day)
     except ValueError:
         return None
-    if deadline < today:
+    # Yaqinda (60 kundan kam) o'tgan sana - kechikib yozilgan zakaz, shu yilda qoladi.
+    # Undan uzoqroq o'tgan sana - keyingi yilga tegishli (masalan dekabrda "5 yanvar").
+    if deadline < today and (today - deadline).days > 60:
         try:
             deadline = date(year + 1, month, day)
         except ValueError:
