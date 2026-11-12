@@ -1844,7 +1844,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (31) | yaqinda o'tgan muddat keyingi yilga surilmaydi"
+BOT_VERSION = "2026-11-13 (32) | kunlik holat hisoboti 8:30, kunlik zaxira 21:00, /holat"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4943,6 +4943,131 @@ async def zaxiranusxa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+async def job_kunlik_zaxira(context: ContextTypes.DEFAULT_TYPE):
+    """Har kuni kechqurun bazaning nusxasini egaga (shaxsiy chatga) yuboradi."""
+    if OWNER_ID is None:
+        return
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src_conn = sqlite3.connect(DB_PATH)
+        dst_conn = sqlite3.connect(tmp_path)
+        src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+        size = os.path.getsize(tmp_path)
+        if size > 49 * 1024 * 1024:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"⚠️ Kunlik zaxira: baza juda katta ({size // (1024 * 1024)} MB), yuborib bo'lmadi.",
+            )
+            return
+        today = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d")
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=OWNER_ID,
+                document=f,
+                filename=f"zaxira_{today}.db",
+                caption=f"💾 Kunlik zaxira nusxa ({today}, {size // 1024} KB). Saqlab qo'yish shart emas - shu chatda turadi.",
+                disable_notification=True,
+            )
+    except Exception as e:
+        logger.warning("Kunlik zaxira yuborilmadi: %s", e)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def build_holat_hisobot():
+    """Kunlik holat hisoboti matni (muammolar ro'yxati)."""
+    today = datetime.now(TASHKENT_TZ).date()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, quantity FROM products WHERE quantity < 0 ORDER BY quantity, model")
+    negatives = cur.fetchall()
+    cur.execute("SELECT MAX(created_at) FROM transactions WHERE change_type = 'kirim'")
+    last_kirim = cur.fetchone()[0]
+    conn.close()
+
+    close_already_written_pendings()
+    fresh, _ = unwritten_pendings()
+
+    overdue, yolda = [], []
+    for g in fetch_pending_order_groups():
+        label = order_label(g["guruh_id"], g.get("tashqi_raqam"))
+        if g.get("chiqdi_at"):
+            try:
+                shipped = datetime.fromisoformat(g["chiqdi_at"])
+                if shipped.tzinfo is None:
+                    shipped = shipped.replace(tzinfo=TASHKENT_TZ)
+                days = (datetime.now(TASHKENT_TZ) - shipped).days
+            except ValueError:
+                days = 0
+            if days >= 2:
+                yolda.append(f"   {label} — {days} kundan beri")
+            continue
+        try:
+            dl = date.fromisoformat(g["deadline"][:10])
+        except (TypeError, ValueError):
+            continue
+        if dl < today:
+            overdue.append(f"   {label} — {g['deadline_display']} ({(today - dl).days} kun o'tgan)")
+
+    kirim_days = None
+    if last_kirim:
+        try:
+            kirim_days = (today - date.fromisoformat(last_kirim[:10])).days
+        except ValueError:
+            kirim_days = None
+
+    lines = ["📋 Bugungi holat"]
+    problems = 0
+    if negatives:
+        problems += 1
+        lines += ["", f"⚠️ Manfiy qoldiq ({len(negatives)} ta):"]
+        lines.append("   " + ", ".join(f"{m} {i} {q}" for m, i, q in negatives))
+    if kirim_days is not None and kirim_days >= 3:
+        problems += 1
+        lines += ["", f"📭 {kirim_days} kundan beri birorta kirim yozilmagan! Upakovkachilar kirim qilyaptimi?"]
+    if overdue:
+        problems += 1
+        lines += ["", f"⏰ Muddati o'tgan buyurtmalar ({len(overdue)} ta):"] + overdue
+    if yolda:
+        problems += 1
+        lines += ["", f"🚚 Uzoq yo'lda, topshirilmagan ({len(yolda)} ta):"] + yolda
+    if fresh:
+        problems += 1
+        lines += ["", f"📋 Guruhdan kelgan, botga yozilmagan zakaz: {len(fresh)} ta (/yozilmagan)"]
+    if not problems:
+        lines += ["", "✅ Hammasi joyida."]
+    return "\n".join(lines)
+
+
+async def job_holat_hisobot(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID is None:
+        return
+    lines = build_holat_hisobot().split("\n")
+    chunk = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in chunk) + len(ln) > 3500:
+            await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(chunk))
+            chunk = []
+        chunk.append(ln)
+    if chunk:
+        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(chunk))
+
+
+async def holat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    await send_chunked(update.message, build_holat_hisobot().split("\n"))
 
 
 def _wrap_commands_for_logging(app):
@@ -10001,6 +10126,7 @@ def main():
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
     app.add_handler(CommandHandler("yolda", yolda))
+    app.add_handler(CommandHandler("holat", holat))
     app.add_handler(CommandHandler("chiqdihuquqi", chiqdihuquqi))
     app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
     app.add_handler(CallbackQueryHandler(neww_callback, pattern=r"^neww:"))
@@ -10051,9 +10177,13 @@ def main():
         app.job_queue.run_daily(
             job_yozilmagan_eslatma, time=time(hour=18, minute=0, tzinfo=TASHKENT_TZ)
         )
-        # Har kuni 9:05 da 2 kundan ko'p "yo'lda" turgan buyurtmalarni eslatadi.
+        # Har kuni 8:30 da holat hisoboti (manfiy qoldiq, muddati o'tgan, yo'lda, kirim yo'q, yozilmagan).
         app.job_queue.run_daily(
-            job_yolda_eslatma, time=time(hour=9, minute=5, tzinfo=TASHKENT_TZ)
+            job_holat_hisobot, time=time(hour=8, minute=30, tzinfo=TASHKENT_TZ)
+        )
+        # Har kuni 21:00 da bazaning zaxira nusxasini egaga yuboradi.
+        app.job_queue.run_daily(
+            job_kunlik_zaxira, time=time(hour=21, minute=0, tzinfo=TASHKENT_TZ)
         )
     else:
         logger.warning(
