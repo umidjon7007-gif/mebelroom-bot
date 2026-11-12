@@ -808,6 +808,35 @@ RESERVED_MODEL_WORDS = {
 }
 
 
+async def dk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Takror kirimni tasdiqlash tugmalari."""
+    query = update.callback_query
+    if not can_kirim(update):
+        await query.answer("Sizda kirim huquqi yo'q.", show_alert=True)
+        return
+    _, action, token = query.data.split(":", 2)
+    data = context.application.bot_data.get("dk_pending", {}).pop(token, None)
+    await query.answer()
+    if data is None:
+        try:
+            await query.edit_message_text("Bu so'rov eskirgan. Kerak bo'lsa buyruqni qayta yozing.")
+        except BadRequest:
+            pass
+        return
+    if action == "no":
+        try:
+            await query.edit_message_text("❌ Yozilmadi (takror deb belgilandi).")
+        except BadRequest:
+            pass
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    change_type, args = data
+    await change_stock_core(update, context, change_type, args, allow_new=True, allow_dup=True)
+
+
 async def nm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Noma'lum model/detalga kirim yozishni tasdiqlash tugmalari."""
     query = update.callback_query
@@ -860,7 +889,7 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
     await change_stock_core(update, context, change_type, context.args)
 
 
-async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args, allow_new: bool = False):
+async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args, allow_new: bool = False, allow_dup: bool = False):
     if change_type == "kirim" and not can_kirim(update):
         await deny_access(update)
         return
@@ -975,6 +1004,33 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
     else:
         current_qty = row[0]
+
+    if change_type == "kirim" and not allow_dup:
+        cutoff = (datetime.now() - timedelta(minutes=30)).isoformat(timespec="seconds")
+        cur.execute(
+            "SELECT created_at, user_name FROM transactions WHERE product = ? AND change_type = 'kirim' "
+            "AND amount = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+            (product_key, amount, cutoff),
+        )
+        dup = cur.fetchone()
+        if dup:
+            conn.close()
+            try:
+                mins = max(1, int((datetime.now() - datetime.fromisoformat(dup[0])).total_seconds() // 60))
+            except ValueError:
+                mins = "?"
+            pending = context.application.bot_data.setdefault("dk_pending", {})
+            token = uuid.uuid4().hex[:8]
+            pending[token] = (change_type, list(args))
+            await update.effective_message.reply_text(
+                f"⚠️ {mins} daqiqa oldin xuddi shu kirim yozilgan: {product_key} — {amount} ta ({dup[1]}).\n"
+                "Bu takror emasmi? Haqiqatan yana shuncha kelgan bo'lsa, '✅ Ha, yana yoz' ni bosing.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Ha, yana yoz", callback_data=f"dk:ok:{token}"),
+                    InlineKeyboardButton("❌ Yo'q, takror", callback_data=f"dk:no:{token}"),
+                ]]),
+            )
+            return
 
     if change_type == "kirim":
         new_qty = current_qty + amount
@@ -1844,7 +1900,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (32) | kunlik holat hisoboti 8:30, kunlik zaxira 21:00, /holat"
+BOT_VERSION = "2026-11-13 (33) | takror kirim/spinka ogohlantirishi, hisobotda pul nazorati"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -3388,6 +3444,66 @@ def log_spinka_work(worker, model_display, amount, item="krovat"):
     )
 
 
+def spinka_recent_dup(worker, model, item, amount, hours=24):
+    """Oxirgi `hours` soat ichida shu ishchi xuddi shu spinkani yozganmi. Qaytaradi: vaqt yoki None."""
+    cutoff = (datetime.now(TASHKENT_TZ) - timedelta(hours=hours)).isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT w.created_at FROM work_log w JOIN spinka_log s ON s.work_log_id = w.id "
+        "WHERE w.turi = 'spinka' AND LOWER(w.worker) = LOWER(?) AND LOWER(w.model) = LOWER(?) "
+        "AND s.item = ? AND w.amount = ? AND w.created_at >= ? ORDER BY w.created_at DESC LIMIT 1",
+        (worker, model, item, amount, cutoff),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+async def spinka_record(send, context, worker, model, amount, item, force=False):
+    """Spinka ishini yozadi; 24 soat ichida xuddi shunday yozuv bo'lsa, avval tasdiq so'raydi.
+    send(text, markup) - javob yuboradigan funksiya."""
+    if not force:
+        dup_at = spinka_recent_dup(worker, model, item, amount)
+        if dup_at:
+            try:
+                when = datetime.fromisoformat(dup_at).astimezone(TASHKENT_TZ).strftime("%d.%m %H:%M")
+            except ValueError:
+                when = dup_at[:16]
+            pending = context.application.bot_data.setdefault("sd_pending", {})
+            token = uuid.uuid4().hex[:8]
+            pending[token] = (worker, model, amount, item)
+            kind = " 110 lik" if item == "krovat110" else ""
+            await send(
+                f"⚠️ {worker} {when} da xuddi shu spinkani yozgan: {model}{kind} — {amount} ta.\n"
+                "Bu takror emasmi? Yana yangi spinka qoqilgan bo'lsa, '✅ Ha, yana yoz' ni bosing.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Ha, yana yoz", callback_data=f"sd:ok:{token}"),
+                    InlineKeyboardButton("❌ Yo'q, takror", callback_data=f"sd:no:{token}"),
+                ]]),
+            )
+            return
+    await send(log_spinka_work(worker, model, amount, item), None)
+
+
+async def sd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_spinka(update):
+        await query.answer("Sizda spinka yozish huquqi yo'q.", show_alert=True)
+        return
+    _, action, token = query.data.split(":", 2)
+    data = context.application.bot_data.get("sd_pending", {}).pop(token, None)
+    await query.answer()
+    if data is None:
+        await query.edit_message_text("Bu so'rov eskirgan. Kerak bo'lsa qayta yozing.")
+        return
+    if action == "no":
+        await query.edit_message_text("❌ Yozilmadi (takror deb belgilandi).")
+        return
+    worker, model, amount, item = data
+    await query.edit_message_text(log_spinka_work(worker, model, amount, item))
+
+
 async def kirimbekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -4241,9 +4357,13 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             linked_worker = get_linked_worker(update)
             if linked_worker:
-                text = log_spinka_work(linked_worker, model, amount, sp.get("item", "krovat"))
+                item = sp.get("item", "krovat")
                 context.user_data.pop("sp", None)
-                await query.edit_message_text(text)
+
+                async def send(text, markup):
+                    await query.edit_message_text(text, reply_markup=markup)
+
+                await spinka_record(send, context, linked_worker, model, amount, item)
                 return
             # Egasi — ishchini tanlashi kerak
             conn = get_conn()
@@ -4281,8 +4401,10 @@ async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not model:
             await query.edit_message_text("Xatolik: model tanlanmagan. Qaytadan /spinka deb yozing.")
             return
-        text = log_spinka_work(worker, model, amount, item)
-        await query.edit_message_text(text)
+        async def send(text, markup):
+            await query.edit_message_text(text, reply_markup=markup)
+
+        await spinka_record(send, context, worker, model, amount, item)
         return
 
 
@@ -4420,8 +4542,10 @@ async def spinkaqoqildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
 
-    text = log_spinka_work(worker, model_display, amount, spinka_item)
-    await update.message.reply_text(text)
+    async def send(text, markup):
+        await update.message.reply_text(text, reply_markup=markup)
+
+    await spinka_record(send, context, worker, model_display, amount, spinka_item)
 
 
 async def buyurtmatarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4995,6 +5119,23 @@ def build_holat_hisobot():
     last_kirim = cur.fetchone()[0]
     conn.close()
 
+    conn = get_conn()
+    cur = conn.cursor()
+    since = (today - timedelta(days=30)).isoformat()
+    cur.execute(
+        "SELECT t.guruh_id, t.expected_value, (SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = t.guruh_id LIMIT 1) "
+        "FROM mijoz_tolovlar t WHERE t.received_amount = 0 AND t.expected_value > 0 AND t.created_at >= ? "
+        "ORDER BY t.created_at",
+        (since,),
+    )
+    unpaid_orders = cur.fetchall()
+    cur.execute(
+        "SELECT MIN(customer), SUM(expected_value) - SUM(received_amount) FROM mijoz_tolovlar "
+        "GROUP BY LOWER(customer) HAVING SUM(expected_value) - SUM(received_amount) > 0 ORDER BY 2 DESC"
+    )
+    debts = cur.fetchall()
+    conn.close()
+
     close_already_written_pendings()
     fresh, _ = unwritten_pendings()
 
@@ -5044,6 +5185,15 @@ def build_holat_hisobot():
     if fresh:
         problems += 1
         lines += ["", f"📋 Guruhdan kelgan, botga yozilmagan zakaz: {len(fresh)} ta (/yozilmagan)"]
+    if unpaid_orders:
+        problems += 1
+        lines += ["", f"💵 Pul olinmay topshirilgan ({len(unpaid_orders)} ta):"]
+        for gid, expected, tashqi in unpaid_orders:
+            lines.append(f"   {order_label(gid, tashqi)} — {format_money(expected, 'usd')} (tuzatish: /tolovtuzatish {gid} <summa>)")
+    if debts:
+        lines += ["", "🏪 Do'konlar qarzi:"]
+        for cust, qarz in debts:
+            lines.append(f"   {cust} — {format_money(qarz, 'usd')}")
     if not problems:
         lines += ["", "✅ Hammasi joyida."]
     return "\n".join(lines)
@@ -10075,6 +10225,8 @@ def main():
     app.add_handler(CommandHandler("spinkanarxlar110", spinkanarxlar110))
     app.add_handler(CommandHandler("spinka", spinka_button))
     app.add_handler(CallbackQueryHandler(spinka_callback, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(sd_callback, pattern=r"^sd:"))
+    app.add_handler(CallbackQueryHandler(dk_callback, pattern=r"^dk:"))
     app.add_handler(CommandHandler("oyna", oyna_button))
     app.add_handler(CallbackQueryHandler(oyna_callback, pattern=r"^oy:"))
     app.add_handler(CommandHandler("spinkaochirish", spinkaochirish))
