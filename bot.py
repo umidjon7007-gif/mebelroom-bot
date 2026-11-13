@@ -1940,6 +1940,7 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             pending["expected_value"],
             received,
             cash=parse_cash(text) or ("usd", received),
+            bot=context.bot,
         )
         await update.message.reply_text(result_text)
         return
@@ -2025,7 +2026,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (40) | guruh Menu da /tayyor"
+BOT_VERSION = "2026-11-13 (41) | topshirildi xabari egaga"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -9159,7 +9160,42 @@ async def kassaoldim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_value: int, received: int, cash=None) -> str:
+async def notify_owner_topshirildi(bot, user, guruh_id, worker, cash, received):
+    """Ishchi (egadan boshqa) buyurtmani topshirsa - egaga shaxsiy xabar: kim, qaysi buyurtma, qancha pul oldi."""
+    if bot is None or OWNER_ID is None or (user and user.id == OWNER_ID):
+        return
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT model, item, amount, mod_type, tashqi_raqam, customer FROM orders WHERE guruh_id = ? ORDER BY id",
+            (guruh_id,),
+        )
+        rows = cur.fetchall()
+        bal = kassa_balance(cur, worker) if worker else None
+        conn.close()
+        tashqi = next((r[4] for r in rows if r[4]), None)
+        mijoz = next((r[5] for r in rows if r[5]), None)
+        kim = worker or (user.full_name if user else "?")
+        nom = "dastavka qildi" if not worker else "topshirdi"
+        lines = [f"✅ {kim} {order_label(guruh_id, tashqi)} ni {nom}"]
+        if mijoz:
+            lines.append(f"👤 Mijoz: {mijoz}")
+        for model, item, amount, mod_type, _, _ in rows:
+            lines.append("• " + describe_entry(model, item, amount, mod_type))
+        if cash[1] > 0:
+            shown = fmt_cash(*cash) if cash[0] == "som" else format_money(received, "usd")
+            lines.append(f"\n💵 Mijozdan olindi: {shown}")
+        else:
+            lines.append("\n⚠️ Pul olinmadi (0 yozildi)")
+        if bal is not None:
+            lines.append(f"💰 Hozir {worker}da: {kassa_balance_text(bal)}")
+        await bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+    except Exception as e:
+        logger.warning("Egaga topshirildi xabari yuborilmadi: %s", e)
+
+
+async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_value: int, received: int, cash=None, bot=None) -> str:
     result_text = await bajarildi_group_core(guruh_id, user, worker)
     record_payment(guruh_id, customer, expected_value, received)
 
@@ -9179,6 +9215,7 @@ async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_
             lines.append(f"🏪 {customer} — sizga {format_money(abs(qarz), 'usd')} ortiqcha to'lagan")
         else:
             lines.append(f"🏪 {customer} — hisob teng (qarzi yo'q)")
+    await notify_owner_topshirildi(bot, user, guruh_id, worker, cash, received)
     return "\n".join(lines)
 
 
@@ -9549,7 +9586,7 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         received = int(args[-1])
         customer = get_order_customer(guruh_id)
         expected_value = compute_order_sale_value(guruh_id)
-        text = await finalize_payment(update.effective_user, guruh_id, worker, customer, expected_value, received)
+        text = await finalize_payment(update.effective_user, guruh_id, worker, customer, expected_value, received, bot=context.bot)
         await update.message.reply_text(text)
         return
 
