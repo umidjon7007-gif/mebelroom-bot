@@ -2025,7 +2025,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (39) | /tayyor: do'konlar uchun tayyor komplektlar (ertalab guruhga ham)"
+BOT_VERSION = "2026-11-13 (40) | guruh Menu da /tayyor"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -10865,7 +10865,19 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(token).build()
+    async def _set_group_menu(application):
+        """Guruhlardagi "Menu" tugmasida /tayyor ko'rinsin (shaxsiy chat menyusiga tegmaydi)."""
+        try:
+            from telegram import BotCommand, BotCommandScopeAllGroupChats
+
+            await application.bot.set_my_commands(
+                [BotCommand("tayyor", "Hozir tayyor komplektlar")],
+                scope=BotCommandScopeAllGroupChats(),
+            )
+        except Exception as e:
+            logger.warning("Guruh menyusi o'rnatilmadi: %s", e)
+
+    app = Application.builder().token(token).post_init(_set_group_menu).build()
     app.add_handler(CommandHandler(["start", "yordam", "help"], start))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("buyurtmaguruhi", buyurtmaguruhi))
