@@ -2023,7 +2023,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (37) | 110 lik farqi 0 bo'lsa narx ogohlantirishi chiqmaydi"
+BOT_VERSION = "2026-11-13 (38) | Spinka: 📋 Hamma spinkalar tugmasi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -4338,6 +4338,33 @@ def spinka_qoldiq_lines():
     return lines
 
 
+def spinka_hammasi_lines():
+    """Nodir sanab tekshirishi uchun: har model bo'yicha jami bosh tomon (qotirilgan + alohida)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, quantity FROM spinka_stock WHERE quantity > 0")
+    raw_all = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
+    cur.execute("SELECT model, item, quantity FROM products WHERE item IN ('krovat', 'krovat110')")
+    stock = {(m.lower(), i.lower()): q for m, i, q in cur.fetchall()}
+    conn.close()
+    if not raw_all:
+        return ["📋 Hamma spinkalar: hozircha bosh tomon yo'q."]
+    lines = ["📋 HAMMA SPINKALAR (sanab tekshiring)", ""]
+    total = 0
+    for (m, it) in sorted(raw_all, key=lambda k: (k[0], k[1])):
+        raw = raw_all[(m, it)]
+        on_hand = max(stock.get((m, it), 0), 0)
+        attached = min(raw, on_hand)
+        loose = raw - attached
+        total += raw
+        name = m.capitalize() + (" 110 lik" if it == "krovat110" else "")
+        lines.append(f"{name} — {raw} ta")
+        lines.append(f"   krovatga qotirilgan: {attached} · alohida: {loose}")
+    lines += ["", f"Jami: {total} ta bosh tomon",
+              "Omborda sanang. Mos kelmasa, egaga ayting."]
+    return lines
+
+
 async def spinkaqoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_member(update):
         await deny_access(update)
@@ -4369,6 +4396,7 @@ async def spinka_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔨 Spinka qoqish", callback_data="sp:menu:qoqish")],
             [InlineKeyboardButton("📦 Spinka qoldig'i", callback_data="sp:menu:qoldiq")],
+            [InlineKeyboardButton("📋 Hamma spinkalar", callback_data="sp:menu:hammasi")],
         ]),
     )
 
@@ -4392,6 +4420,21 @@ def sp_qty_keyboard():
 
 
 async def spinka_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query.data == "sp:menu:hammasi":
+        query = update.callback_query
+        if not is_member(update):
+            await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+            return
+        await query.answer()
+        lines = spinka_hammasi_lines()
+        text = "\n".join(lines)
+        if len(text) <= 3800:
+            await query.edit_message_text(text)
+        else:
+            await query.edit_message_text("📋 Hamma spinkalar:")
+            await send_chunked(query.message, lines)
+        return
+
     if update.callback_query.data == "sp:menu:qoldiq":
         query = update.callback_query
         if not is_member(update):
