@@ -849,8 +849,9 @@ async def dk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    change_type, args = data
-    await change_stock_core(update, context, change_type, args, allow_new=True, allow_dup=True)
+    change_type, args = data[0], data[1]
+    fw = data[2] if len(data) > 2 else None
+    await change_stock_core(update, context, change_type, args, allow_new=True, allow_dup=True, force_worker=fw)
 
 
 async def nm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -879,17 +880,106 @@ async def nm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest:
             pass
         return
-    change_type, args = data
+    change_type, args = data[0], data[1]
+    fw = data[2] if len(data) > 2 else None
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    await change_stock_core(update, context, change_type, args, allow_new=True)
+    await change_stock_core(update, context, change_type, args, allow_new=True, force_worker=fw)
+
+
+def known_worker_names():
+    conn = get_conn()
+    cur = conn.cursor()
+    names = {}
+    for q in ("SELECT name FROM workers", "SELECT worker_name FROM worker_accounts", "SELECT name FROM upakovkachilar"):
+        try:
+            cur.execute(q)
+            for (n,) in cur.fetchall():
+                if n:
+                    names[n.lower()] = n
+        except sqlite3.Error:
+            pass
+    conn.close()
+    return names
+
+
+async def kirim_batch(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Ko'p qatorli kirim:
+    /kirim Ibrohim
+    laura shkaf 6
+    maya parta 5"""
+    lines = [ln.strip() for ln in text.split("\n")]
+    head = lines[0].split(None, 1)
+    first_rest = head[1].strip() if len(head) > 1 else ""
+    item_lines = [ln for ln in lines[1:] if ln]
+
+    worker = None
+    if first_rest:
+        if first_rest.split()[-1].isdigit():
+            item_lines.insert(0, first_rest)  # birinchi qatorning o'zi mahsulot
+        else:
+            names = known_worker_names()
+            worker = names.get(first_rest.lower())
+            if worker is None:
+                await update.message.reply_text(
+                    f"'{first_rest}' degan ishchi topilmadi.\nMa'lum ishchilar: {', '.join(sorted(names.values())) or 'yo`q'}"
+                )
+                return
+
+    linked = get_linked_worker(update)
+    if not is_owner(update):
+        if worker and linked and worker.lower() != linked.lower():
+            await update.message.reply_text("Siz faqat o'zingiz nomingizdan kirim yoza olasiz. Ismni yozmang.")
+            return
+        worker = linked or ""
+    elif worker is None:
+        worker = ""  # ega ism yozmasa - upakovka puli yozilmaydi
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(MAX(id), 0) FROM work_log")
+    start_id = cur.fetchone()[0]
+    conn.close()
+
+    collected = []
+    for ln in item_lines:
+        args = ln.replace(",", " ").split()
+        if len(args) < 3 or not args[-1].isdigit():
+            collected.append(f"❓ tushunilmadi: {ln}")
+            continue
+        await change_stock_core(update, context, "kirim", args, force_worker=worker, collect=collected)
+
+    total_qty = 0
+    for ln in item_lines:
+        t = ln.split()
+        if t and t[-1].isdigit():
+            total_qty += int(t[-1])
+    who = f" ({worker} nomiga)" if worker else " (upakovka puli yozilmadi)"
+    out = [f"📥 Ko'p qatorli kirim{who}: {len(item_lines)} ta qator, {total_qty} ta mebel", ""]
+    out += collected or ["(alohida savollar yuqorida yuborildi)"]
+    if worker:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(total), 0) FROM work_log WHERE worker = ? AND turi = 'upakovka' AND id > ?",
+            (worker, start_id),
+        )
+        tot = cur.fetchone()[0]
+        conn.close()
+        out += ["", f"💰 {worker} — shu kirimlar uchun upakovka: {format_money(tot, 'som')}"]
+    out.append("\nSavol (oyna, takror, noma'lum detal) chiqqan qatorlar alohida xabarda - ularga javob bering.")
+    await send_chunked(update.message, out)
 
 
 async def kirim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_kirim(update):
         await deny_access(update)
+        return
+    text = (update.message.text or "") if update.message else ""
+    if "\n" in text.strip():
+        await kirim_batch(update, context, text.strip())
         return
     await change_stock(update, context, "kirim")
 
@@ -905,7 +995,7 @@ async def change_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, chang
     await change_stock_core(update, context, change_type, context.args)
 
 
-async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args, allow_new: bool = False, allow_dup: bool = False):
+async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, change_type: str, args, allow_new: bool = False, allow_dup: bool = False, force_worker=None, collect=None):
     if change_type == "kirim" and not can_kirim(update):
         await deny_access(update)
         return
@@ -1003,7 +1093,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     what = f"'{item}' degan detal hech bir modelda uchramagan (imlo xatosi bo'lishi mumkin)"
                 pending = context.application.bot_data.setdefault("nm_pending", {})
                 token = uuid.uuid4().hex[:8]
-                pending[token] = (change_type, list(args))
+                pending[token] = (change_type, list(args), force_worker)
                 await update.effective_message.reply_text(
                     f"⚠️ {what}.\nShunga qaramay '{model} {item}' ga {amount} ta {change_type} yozaymi?\n"
                     "Xato yozgan bo'lsangiz ❌ ni bosing - hech narsa o'zgarmaydi.",
@@ -1037,7 +1127,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 mins = "?"
             pending = context.application.bot_data.setdefault("dk_pending", {})
             token = uuid.uuid4().hex[:8]
-            pending[token] = (change_type, list(args))
+            pending[token] = (change_type, list(args), force_worker)
             await update.effective_message.reply_text(
                 f"⚠️ {mins} daqiqa oldin xuddi shu kirim yozilgan: {product_key} — {amount} ta ({dup[1]}).\n"
                 "Bu takror emasmi? Haqiqatan yana shuncha kelgan bo'lsa, '✅ Ha, yana yoz' ni bosing.",
@@ -1086,6 +1176,8 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # deb hisoblab, avtomatik to'lovni yozib qo'yamiz.
         cur.execute("SELECT worker_name FROM worker_accounts WHERE telegram_id = ?", (user_id,))
         wrow = cur.fetchone()
+        if force_worker is not None:
+            wrow = (force_worker,) if force_worker else None
         if wrow:
             worker = wrow[0]
             rate = get_rate(cur, "upakovka", model, item)
@@ -1102,7 +1194,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 payment_line = f"\n📦 {worker} — upakovka narxi belgilanmagan ('{item}' uchun /narx upakovka {item} <summa> bilan belgilang)."
             else:
                 payment_line = f"\n📦 {worker} — upakovka: {total:,} so'm hisoblandi ({amount} x {rate:,}).".replace(",", " ")
-        else:
+        elif force_worker is None:
             # Ishchi o'zi emas (odatda ega kiritmoqda): upakovka puli kimga yozilishini so'raymiz.
             if upakovka_workers(cur):
                 cur.execute(
@@ -1141,6 +1233,16 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         text += spinka_unready_line
     if xom_line:
         text += xom_line
+    if collect is not None and pending_xom_id is None and pending_kim_id is None:
+        pay = ""
+        if payment_line and "hisoblandi" in payment_line:
+            pay = " · " + payment_line.strip().split("upakovka: ")[-1].split(" hisoblandi")[0]
+        elif payment_line:
+            pay = " · ⚠️ narx yo'q"
+        collect.append(f"✅ {product_display} +{amount} → {new_qty} ta{pay}{spinka_unready_line.strip() and ' ' + spinka_unready_line.strip()}")
+        return
+    if collect is not None:
+        collect.append(f"⏳ {product_display} +{amount} → {new_qty} ta (oyna savoli alohida xabarda)")
     markup = None
     if pending_xom_id is not None:
         markup = InlineKeyboardMarkup(
@@ -1921,7 +2023,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (35) | kassa: ustanovchidagi mijoz puli, ikki tomonlama tasdiq"
+BOT_VERSION = "2026-11-13 (36) | ko'p qatorli /kirim (ishchi nomi bilan)"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
