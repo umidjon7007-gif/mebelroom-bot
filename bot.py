@@ -2023,7 +2023,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (36) | ko'p qatorli /kirim (ishchi nomi bilan)"
+BOT_VERSION = "2026-11-13 (37) | 110 lik farqi 0 bo'lsa narx ogohlantirishi chiqmaydi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -9867,8 +9867,11 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
             variant_rate = get_rate(cur, "yigish", model, item)
             base_rate = get_rate(cur, "yigish", model, base_item)
             rate = max(0, variant_rate - base_rate)
+            # Variant narxi bor, faqat farq 0 bo'lsa - bu xato emas, ogohlantirish kerak emas.
+            rate_missing = variant_rate == 0
         else:
             rate = get_rate(cur, "yigish", model, rate_key)
+            rate_missing = rate == 0
         payment_total = amount * rate
 
         cur.execute("INSERT OR IGNORE INTO workers (name, created_at) VALUES (?, ?)", (worker, now))
@@ -9879,7 +9882,7 @@ def fulfill_single_order(cur, order_id, model, item, amount, mod_type, worker, u
             """,
             (worker, order_id, model, rate_key, amount, rate, payment_total, now),
         )
-        if rate == 0:
+        if rate_missing:
             payment_note = f"'{model} {rate_key}' uchun narx belgilanmagan"
 
     return result_lines, payment_total, payment_note
