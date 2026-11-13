@@ -511,6 +511,22 @@ def init_db():
         )
         """
     )
+    # Ustanovchi qo'lidagi mijoz puli: 'olindi' (mijozdan), 'berdi' (egaga), 'maosh' (o'z maoshiga).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kassa (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker TEXT NOT NULL COLLATE NOCASE,
+            currency TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            turi TEXT NOT NULL,
+            guruh_id INTEGER,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT
+        )
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -1789,6 +1805,10 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if awaiting in ("kassa_berdi", "kassa_maosh"):
+        await kassa_request(update, context, "berdi" if awaiting == "kassa_berdi" else "maosh", text)
+        return
+
     if awaiting == "amount_received_for_order":
         pending = context.user_data.get("pending_payment")
         if pending is None:
@@ -1815,6 +1835,7 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             pending["customer"],
             pending["expected_value"],
             received,
+            cash=parse_cash(text) or ("usd", received),
         )
         await update.message.reply_text(result_text)
         return
@@ -1900,7 +1921,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (34) | 8:20 da ishchilarga shaxsiy eslatma (upakovka/spinka)"
+BOT_VERSION = "2026-11-13 (35) | kassa: ustanovchidagi mijoz puli, ikki tomonlama tasdiq"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5190,6 +5211,11 @@ def build_holat_hisobot():
         lines += ["", f"💵 Pul olinmay topshirilgan ({len(unpaid_orders)} ta):"]
         for gid, expected, tashqi in unpaid_orders:
             lines.append(f"   {order_label(gid, tashqi)} — {format_money(expected, 'usd')} (tuzatish: /tolovtuzatish {gid} <summa>)")
+    conn = get_conn()
+    kassa_lines = kassa_summary_lines(conn.cursor())
+    conn.close()
+    if kassa_lines:
+        lines += ["", "💰 Ishchilardagi mijoz puli (/kassa):"] + kassa_lines
     if debts:
         lines += ["", "🏪 Do'konlar qarzi:"]
         for cust, qarz in debts:
@@ -5331,6 +5357,15 @@ async def job_ishchi_eslatma(context: ContextTypes.DEFAULT_TYPE):
                 if texts:
                     t = t.split("\n", 2)[2]  # salomni takrorlamaslik
                 texts.append(t)
+        conn = get_conn()
+        cur = conn.cursor()
+        bal = kassa_balance(cur, name)
+        kdays = kassa_oldest_days(cur, name)
+        conn.close()
+        if (bal["usd"] or bal["som"]) and kdays is not None and kdays >= 2:
+            note = (f"💰 Sizda {kassa_balance_text(bal)} mijoz puli turibdi ({kdays} kundan beri). "
+                    "Egaga berganingizda /kassa → 💵 Pulni egaga berdim.")
+            texts.append(note if texts else f"🌅 Xayrli tong, {name}!\n\n" + note)
         if not texts:
             continue
         try:
@@ -5804,6 +5839,11 @@ async def tolovtuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     expected_value, old_received, customer = row
     cur.execute("UPDATE mijoz_tolovlar SET received_amount = ? WHERE guruh_id = ?", (new_received, guruh_id))
+    _cash = parse_cash(args[1]) or ("usd", new_received)
+    cur.execute(
+        "UPDATE kassa SET currency = ?, amount = ? WHERE guruh_id = ? AND turi = 'olindi'",
+        (_cash[0], _cash[1], guruh_id),
+    )
     conn.commit()
     conn.close()
 
@@ -8231,6 +8271,7 @@ async def topshirilganibekor(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"DELETE FROM work_log WHERE order_id IN ({placeholders}) AND turi = 'yigish'", order_ids
     )
     cur.execute("DELETE FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    cur.execute("DELETE FROM kassa WHERE guruh_id = ? AND turi = 'olindi'", (guruh_id,))
     cur.execute(
         f"UPDATE orders SET status = 'kutilmoqda', bajarildi_at = NULL, chiqdi_at = NULL WHERE id IN ({placeholders})",
         order_ids,
@@ -8340,6 +8381,7 @@ async def buyurtmaochirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     cur.execute("DELETE FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+    cur.execute("DELETE FROM kassa WHERE guruh_id = ? AND turi = 'olindi'", (guruh_id,))
     cur.execute(f"DELETE FROM orders WHERE id IN ({placeholders})", order_ids)
 
     conn.commit()
@@ -8605,11 +8647,339 @@ def start_payment_prompt(context: ContextTypes.DEFAULT_TYPE, guruh_id: int, work
     return "\n".join(lines)
 
 
-async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_value: int, received: int) -> str:
+# ---------------------------------------------------------------------------
+# KASSA: ustanovchi qo'lidagi mijoz puli (olindi -> egaga berdi / maoshiga oldi)
+# ---------------------------------------------------------------------------
+
+def parse_cash(text: str):
+    """'500' -> ('usd', 500); '3000000som' -> ('som', 3000000). Tushunarsiz bo'lsa None."""
+    cleaned = (text or "").strip().lower().replace(" ", "").replace("$", "")
+    for marker in ("so'm", "so‘m", "som", "sum"):
+        if cleaned.endswith(marker):
+            num = cleaned[: -len(marker)]
+            return ("som", int(num)) if num.isdigit() else None
+    return ("usd", int(cleaned)) if cleaned.isdigit() else None
+
+
+def fmt_cash(currency, amount):
+    return format_money(amount, "usd" if currency == "usd" else "som")
+
+
+def kassa_balance(cur, worker):
+    """{'usd': x, 'som': y} - ishchi qo'lidagi tasdiqlangan qoldiq."""
+    out = {"usd": 0, "som": 0}
+    cur.execute(
+        "SELECT currency, turi, SUM(amount) FROM kassa WHERE LOWER(worker) = LOWER(?) AND status = 'tasdiqlandi' "
+        "GROUP BY currency, turi",
+        (worker,),
+    )
+    for currency, turi, total in cur.fetchall():
+        sign = 1 if turi == "olindi" else -1
+        out[currency] = out.get(currency, 0) + sign * (total or 0)
+    return out
+
+
+def kassa_balance_text(bal):
+    parts = [fmt_cash(c, a) for c, a in (("usd", bal.get("usd", 0)), ("som", bal.get("som", 0))) if a]
+    return " + ".join(parts) if parts else "0"
+
+
+def kassa_oldest_days(cur, worker):
+    """Qo'lidagi pul necha kundan beri turibdi (oxirgi topshirishdan keyingi birinchi olindi)."""
+    cur.execute(
+        "SELECT MAX(created_at) FROM kassa WHERE LOWER(worker) = LOWER(?) AND turi != 'olindi' AND status = 'tasdiqlandi'",
+        (worker,),
+    )
+    last_out = cur.fetchone()[0] or ""
+    cur.execute(
+        "SELECT MIN(created_at) FROM kassa WHERE LOWER(worker) = LOWER(?) AND turi = 'olindi' "
+        "AND status = 'tasdiqlandi' AND created_at > ?",
+        (worker, last_out),
+    )
+    first_in = cur.fetchone()[0]
+    if not first_in:
+        return None
+    try:
+        return (datetime.now(TASHKENT_TZ).date() - date.fromisoformat(first_in[:10])).days
+    except ValueError:
+        return None
+
+
+def kassa_add_olindi(worker, currency, amount, guruh_id):
+    if not worker or amount <= 0:
+        return None
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO kassa (worker, currency, amount, turi, guruh_id, status, created_at, confirmed_at) "
+        "VALUES (?, ?, ?, 'olindi', ?, 'tasdiqlandi', ?, ?)",
+        (worker, currency, amount, guruh_id, now, now),
+    )
+    bal = kassa_balance(cur, worker)
+    conn.commit()
+    conn.close()
+    return bal
+
+
+def kassa_workers(cur):
+    cur.execute("SELECT DISTINCT worker FROM kassa ORDER BY worker")
+    return [r[0] for r in cur.fetchall()]
+
+
+def kassa_summary_lines(cur):
+    """Hisobot va /kassa (ega) uchun: qo'lida puli bor ishchilar."""
+    lines = []
+    for w in kassa_workers(cur):
+        bal = kassa_balance(cur, w)
+        if not (bal["usd"] or bal["som"]):
+            continue
+        days = kassa_oldest_days(cur, w)
+        tail = ""
+        if days is not None:
+            tail = f" ({days} kundan beri)" + (" ⚠️" if days >= 3 else "")
+        lines.append(f"   {w} — {kassa_balance_text(bal)}{tail}")
+    return lines
+
+
+def worker_telegram_id(cur, worker):
+    cur.execute("SELECT telegram_id FROM worker_accounts WHERE LOWER(worker_name) = LOWER(?)", (worker,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+async def kassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_member(update):
+        await deny_access(update)
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    if is_owner(update):
+        lines = ["💰 Ishchilardagi mijoz puli:"]
+        summary = kassa_summary_lines(cur)
+        lines += summary if summary else ["   Hech kimda pul yo'q ✅"]
+        cur.execute(
+            "SELECT id, worker, currency, amount, turi FROM kassa WHERE status = 'kutilmoqda' ORDER BY id"
+        )
+        pend = cur.fetchall()
+        conn.close()
+        if pend:
+            lines += ["", "⏳ Tasdiqlashingizni kutayotganlar:"]
+            for _, w, c, a, t in pend:
+                what = "berdim" if t == "berdi" else "maoshimga oldim"
+                lines.append(f"   {w}: {fmt_cash(c, a)} {what}")
+        lines += ["", "Pulni o'zingiz olganingizni yozish: /kassaoldim <ism> <summa>",
+                  "Misol: /kassaoldim Hojiakbar 500   yoki   /kassaoldim Hojiakbar 3000000som"]
+        await update.message.reply_text("\n".join(lines))
+        if pend:
+            for pid, w, c, a, t in pend:
+                what = "berdim" if t == "berdi" else "maoshimga oldim (avans)"
+                await update.message.reply_text(
+                    f"💵 {w}: \"{fmt_cash(c, a)} {what}\"",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Oldim / tasdiqlayman", callback_data=f"kas:ok:{pid}"),
+                        InlineKeyboardButton("❌ Yo'q", callback_data=f"kas:no:{pid}"),
+                    ]]),
+                )
+        return
+
+    worker = get_linked_worker(update)
+    if not worker:
+        conn.close()
+        await update.message.reply_text("Siz botga ishchi sifatida bog'lanmagansiz.")
+        return
+    bal = kassa_balance(cur, worker)
+    cur.execute(
+        "SELECT k.guruh_id, k.currency, k.amount, substr(k.created_at, 1, 10), "
+        "(SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = k.guruh_id LIMIT 1) "
+        "FROM kassa k WHERE LOWER(k.worker) = LOWER(?) AND k.turi = 'olindi' AND k.status = 'tasdiqlandi' "
+        "ORDER BY k.id DESC LIMIT 8",
+        (worker,),
+    )
+    recent = cur.fetchall()
+    conn.close()
+    lines = [f"💰 {worker}, sizdagi mijoz puli: {kassa_balance_text(bal)}"]
+    if recent:
+        lines += ["", "Oxirgi olingan pullar:"]
+        for gid, c, a, d, tashqi in recent:
+            lines.append(f"   №{tashqi or gid} — {fmt_cash(c, a)} ({d})")
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💵 Pulni egaga berdim", callback_data="kas:berdi")],
+            [InlineKeyboardButton("🧾 Maoshimga oldim", callback_data="kas:maosh")],
+        ]),
+    )
+
+
+async def kassa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data in ("kas:berdi", "kas:maosh"):
+        worker = get_linked_worker(update)
+        if not worker:
+            await query.answer("Siz ishchi sifatida bog'lanmagansiz.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data["awaiting"] = "kassa_berdi" if data == "kas:berdi" else "kassa_maosh"
+        what = "egaga bergan" if data == "kas:berdi" else "maoshingizga olgan"
+        await query.message.reply_text(
+            f"✍️ Qancha {what} pulni yozing.\n"
+            "Dollar bo'lsa: 500\n"
+            "So'm bo'lsa oxiriga som qo'shing: 3000000som"
+        )
+        return
+
+    if not is_owner(update):
+        await query.answer("Faqat ega tasdiqlay oladi.", show_alert=True)
+        return
+    _, action, pid_str = data.split(":", 2)
+    pid = int(pid_str)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT worker, currency, amount, turi, status FROM kassa WHERE id = ?", (pid,))
+    row = cur.fetchone()
+    if row is None or row[4] != "kutilmoqda":
+        conn.close()
+        await query.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+    await query.answer()
+    worker, currency, amount, turi, _ = row
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    if action == "no":
+        cur.execute("UPDATE kassa SET status = 'rad', confirmed_at = ? WHERE id = ?", (now, pid))
+        conn.commit()
+        tg = worker_telegram_id(cur, worker)
+        conn.close()
+        await query.edit_message_text(f"❌ Rad etildi: {worker} — {fmt_cash(currency, amount)}")
+        if tg:
+            try:
+                await context.bot.send_message(
+                    chat_id=tg, text=f"❌ Egasi tasdiqlamadi: {fmt_cash(currency, amount)}. Egasi bilan gaplashing."
+                )
+            except Exception:
+                pass
+        return
+    cur.execute("UPDATE kassa SET status = 'tasdiqlandi', confirmed_at = ? WHERE id = ?", (now, pid))
+    extra = ""
+    if turi == "maosh":
+        som = amount if currency == "som" else amount * get_exchange_rate()
+        cur.execute(
+            "INSERT INTO avanslar (worker, amount, settled, created_at) VALUES (?, ?, 0, ?)",
+            (worker, som, datetime.now().isoformat(timespec="seconds")),
+        )
+        extra = f"\n🧾 Maoshiga avans yozildi: {format_money(som, 'som')}"
+    bal = kassa_balance(cur, worker)
+    tg = worker_telegram_id(cur, worker)
+    conn.commit()
+    conn.close()
+    what = "berdi" if turi == "berdi" else "maoshiga oldi"
+    await query.edit_message_text(
+        f"✅ Tasdiqlandi: {worker} {fmt_cash(currency, amount)} {what}.{extra}\n"
+        f"💰 {worker}da qoldi: {kassa_balance_text(bal)}"
+    )
+    if tg:
+        try:
+            await context.bot.send_message(
+                chat_id=tg,
+                text=f"✅ Egasi tasdiqladi: {fmt_cash(currency, amount)} {what}.{extra}\n"
+                f"💰 Sizda qoldi: {kassa_balance_text(bal)}",
+            )
+        except Exception:
+            pass
+
+
+async def kassa_request(update: Update, context: ContextTypes.DEFAULT_TYPE, turi: str, text: str):
+    """Ishchi yozgan summani egaga tasdiqlashga yuboradi."""
+    worker = get_linked_worker(update)
+    context.user_data["awaiting"] = None
+    if not worker:
+        await update.message.reply_text("Siz ishchi sifatida bog'lanmagansiz.")
+        return
+    parsed = parse_cash(text)
+    if parsed is None or parsed[1] <= 0:
+        context.user_data["awaiting"] = "kassa_berdi" if turi == "berdi" else "kassa_maosh"
+        await update.message.reply_text("Faqat son yozing: 500 yoki 3000000som")
+        return
+    currency, amount = parsed
+    conn = get_conn()
+    cur = conn.cursor()
+    bal = kassa_balance(cur, worker)
+    if amount > bal.get(currency, 0):
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ Sizda bu valyutada faqat {fmt_cash(currency, bal.get(currency, 0))} bor. "
+            "Summani tekshirib, qaytadan 💰 /kassa orqali yuboring."
+        )
+        return
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO kassa (worker, currency, amount, turi, guruh_id, status, created_at) "
+        "VALUES (?, ?, ?, ?, NULL, 'kutilmoqda', ?)",
+        (worker, currency, amount, turi, now),
+    )
+    pid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    what = "berdim" if turi == "berdi" else "maoshimga oldim (avans)"
+    await update.message.reply_text(f"⏳ Yuborildi: \"{fmt_cash(currency, amount)} {what}\". Egasi tasdiqlashini kuting.")
+    if OWNER_ID:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"💵 {worker}: \"{fmt_cash(currency, amount)} {what}\"\n"
+            f"Hozir unda: {kassa_balance_text(bal)}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Oldim / tasdiqlayman", callback_data=f"kas:ok:{pid}"),
+                InlineKeyboardButton("❌ Yo'q", callback_data=f"kas:no:{pid}"),
+            ]]),
+        )
+
+
+async def kassaoldim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ega o'zi yozadi: ishchidan pulni oldim (darrov tasdiqlangan)."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Foydalanish: /kassaoldim <ishchi ismi> <summa>\n"
+            "Misol: /kassaoldim Hojiakbar 500   yoki   /kassaoldim Hojiakbar 3000000som"
+        )
+        return
+    parsed = parse_cash(args[-1])
+    worker = " ".join(args[:-1]).strip()
+    if parsed is None or parsed[1] <= 0:
+        await update.message.reply_text("Summani tushunmadim. Misol: 500 yoki 3000000som")
+        return
+    currency, amount = parsed
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO kassa (worker, currency, amount, turi, guruh_id, status, created_at, confirmed_at) "
+        "VALUES (?, ?, ?, 'berdi', NULL, 'tasdiqlandi', ?, ?)",
+        (worker, currency, amount, now, now),
+    )
+    bal = kassa_balance(cur, worker)
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ Yozildi: {worker}dan {fmt_cash(currency, amount)} oldingiz.\n💰 {worker}da qoldi: {kassa_balance_text(bal)}"
+    )
+
+
+async def finalize_payment(user, guruh_id: int, worker: str, customer, expected_value: int, received: int, cash=None) -> str:
     result_text = await bajarildi_group_core(guruh_id, user, worker)
     record_payment(guruh_id, customer, expected_value, received)
 
-    lines = [result_text, f"\n💵 Mijozdan olindi: {format_money(received, 'usd')}"]
+    cash = cash or ("usd", received)
+    shown = fmt_cash(*cash) if cash[0] == "som" else format_money(received, "usd")
+    lines = [result_text, f"\n💵 Mijozdan olindi: {shown}"]
+    if worker and cash[1] > 0:
+        bal = kassa_add_olindi(worker, cash[0], cash[1], guruh_id)
+        if bal is not None:
+            lines.append(f"💰 {worker}da hozir mijoz puli: {kassa_balance_text(bal)} (egaga berganda: /kassa)")
     if customer:
         total_expected, total_received = get_customer_totals(customer)
         qarz = total_expected - total_received
@@ -10425,6 +10795,9 @@ def main():
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
     app.add_handler(CommandHandler("yolda", yolda))
     app.add_handler(CommandHandler("holat", holat))
+    app.add_handler(CommandHandler("kassa", kassa))
+    app.add_handler(CommandHandler("kassaoldim", kassaoldim))
+    app.add_handler(CallbackQueryHandler(kassa_callback, pattern=r"^kas:"))
     app.add_handler(CommandHandler("eslatmasinov", eslatmasinov))
     app.add_handler(CommandHandler("chiqdihuquqi", chiqdihuquqi))
     app.add_handler(CallbackQueryHandler(markdastavka_callback, pattern=r"^markdastavka:"))
