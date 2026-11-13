@@ -713,6 +713,7 @@ MENU_BUTTONS = {
     "yangi_buyurtma": "🆕 Buyurtma",
     "mijozlar": "🏪 Mijozlar",
     "spinka": "🔨 Spinka",
+    "tayyor_modellar": "✅ Tayyor modellar",
     "oyna": "🪟 Oyna",
 }
 
@@ -722,7 +723,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
         [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
         [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["spinka"]],
-        [MENU_BUTTONS["oyna"], MENU_BUTTONS["yordam"]],
+        [MENU_BUTTONS["oyna"], MENU_BUTTONS["tayyor_modellar"]],
+        [MENU_BUTTONS["yordam"]],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -2023,7 +2025,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (38) | Spinka: 📋 Hamma spinkalar tugmasi"
+BOT_VERSION = "2026-11-13 (39) | /tayyor: do'konlar uchun tayyor komplektlar (ertalab guruhga ham)"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2091,6 +2093,49 @@ async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\n📝 Komplekt = {' + '.join(KOMPLEKT_ITEMS)}. Eng kam bo'lgan detal soni komplekt sonini belgilaydi."
     )
     await update.message.reply_text("\n".join(lines))
+
+
+def tayyor_modellar_text():
+    """Do'konlar uchun: hozir sotish mumkin bo'lgan (band qilinmagan, krovati boshli) to'liq komplektlar."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {}
+    for m, i, q in cur.fetchall():
+        stock[(m.lower(), i.lower())] = q
+    demand = {(m.lower(), i.lower()): q for (m, i), q in compute_all_pending_demand(cur).items()}
+    models = sorted({m for m, _ in stock})
+    ready = []
+    for model in models:
+        if any((model, it) not in stock for it in KOMPLEKT_ITEMS):
+            continue
+        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ? COLLATE NOCASE", (model,))
+        per_item = {i.lower(): (s or 1) for i, s in cur.fetchall()}
+        counts = []
+        for it in KOMPLEKT_ITEMS:
+            have = max(stock.get((model, it), 0), 0)
+            if it == "krovat":
+                have = min(have, spinka_get(cur, model, "krovat"))
+            free = have - demand.get((model, it), 0)
+            counts.append(max(free, 0) // max(per_item.get(it, 1), 1))
+        n = min(counts)
+        if n > 0:
+            ready.append((n, model))
+    conn.close()
+    ready.sort(key=lambda x: (-x[0], x[1]))
+    when = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y, %H:%M")
+    if not ready:
+        return f"✅ HOZIR TAYYOR KOMPLEKTLAR\n\nHozircha tayyor komplekt yo'q.\n\n📅 {when} holatiga"
+    lines = ["✅ HOZIR TAYYOR KOMPLEKTLAR", ""]
+    for n, model in ready:
+        lines.append(f"🛏 {model.capitalize()} — {n} ta komplekt")
+    lines += ["", f"📅 {when} holatiga"]
+    return "\n".join(lines)
+
+
+async def tayyor_modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tayyor - guruhda hamma (do'kon egalari ham), shaxsiy chatda hamma ko'ra oladi."""
+    await update.effective_message.reply_text(tayyor_modellar_text())
 
 
 async def modellar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10688,6 +10733,10 @@ async def job_kunlik_qoldiq(context: ContextTypes.DEFAULT_TYPE):
                 cut = 3800
             chunk, text = text[:cut], text[cut:].lstrip("\n")
         await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=chunk)
+    try:
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=tayyor_modellar_text())
+    except Exception as e:
+        logger.warning("Tayyor modellar guruhga yuborilmadi: %s", e)
 
 
 async def job_kam_qoldi(context: ContextTypes.DEFAULT_TYPE):
@@ -10830,6 +10879,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['yangi_buyurtma']}$"), buyurtma_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['spinka']}$"), spinka_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['oyna']}$"), oyna_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['tayyor_modellar']}$"), tayyor_modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
@@ -10943,6 +10993,7 @@ def main():
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
     app.add_handler(CommandHandler("yolda", yolda))
     app.add_handler(CommandHandler("holat", holat))
+    app.add_handler(CommandHandler("tayyor", tayyor_modellar))
     app.add_handler(CommandHandler("kassa", kassa))
     app.add_handler(CommandHandler("kassaoldim", kassaoldim))
     app.add_handler(CallbackQueryHandler(kassa_callback, pattern=r"^kas:"))
