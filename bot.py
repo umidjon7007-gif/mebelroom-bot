@@ -716,6 +716,7 @@ MENU_BUTTONS = {
     "tayyor_modellar": "✅ Tayyor modellar",
     "oyna": "🪟 Oyna",
     "ishchilar": "👷 Ishchilar",
+    "mijoz_puli": "💰 Mijoz puli",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -746,12 +747,45 @@ OWNER_MENU = ReplyKeyboardMarkup(
 )
 
 
+USTANOVCHI_MENU = ReplyKeyboardMarkup(
+    [
+        [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
+        [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
+        [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
+        [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["spinka"]],
+        [MENU_BUTTONS["oyna"], MENU_BUTTONS["tayyor_modellar"]],
+        [MENU_BUTTONS["mijoz_puli"], MENU_BUTTONS["yordam"]],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def is_ustanovchi(worker) -> bool:
+    """Mijozdan pul oladigan ishchi: kassada yozuvi yoki yig'ish (o'rnatish) ishi bor."""
+    if not worker:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM kassa WHERE LOWER(worker) = LOWER(?) LIMIT 1", (worker,))
+    found = cur.fetchone()
+    if not found:
+        cur.execute("SELECT 1 FROM work_log WHERE worker = ? AND turi = 'yigish' LIMIT 1", (worker,))
+        found = cur.fetchone()
+    conn.close()
+    return bool(found)
+
+
 def menu_for(update) -> ReplyKeyboardMarkup:
-    """Egaga '👷 Ishchilar' tugmasi bor menyu, boshqalarga oddiy menyu."""
+    """Egaga '👷 Ishchilar' tugmali menyu, ustanovchiga '💰 Mijoz puli' tugmali, boshqalarga oddiy menyu."""
     try:
-        return OWNER_MENU if (OWNER_ID is not None and update.effective_user and update.effective_user.id == OWNER_ID) else MAIN_MENU
+        if OWNER_ID is not None and update.effective_user and update.effective_user.id == OWNER_ID:
+            return OWNER_MENU
+        if is_ustanovchi(get_linked_worker(update)):
+            return USTANOVCHI_MENU
     except Exception:
-        return MAIN_MENU
+        pass
+    return MAIN_MENU
 
 
 FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True, is_persistent=True)
@@ -1969,7 +2003,8 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             cash=parse_cash(text) or ("usd", received),
             bot=context.bot,
         )
-        await update.message.reply_text(result_text)
+        private = bool(update.effective_chat and update.effective_chat.type == "private")
+        await update.message.reply_text(result_text, reply_markup=menu_for(update) if private else None)
         return
 
     args = text.split()
@@ -2053,7 +2088,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-14 (42) | 👷 Ishchilar menyusi"
+BOT_VERSION = "2026-11-14 (43) | 💰 Mijoz puli tugmasi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8966,6 +9001,58 @@ def worker_telegram_id(cur, worker):
     return row[0] if row else None
 
 
+def mijoz_puli_lines(cur, worker, header):
+    """Ishchi qo'lidagi mijoz puli va oxirgi olingan pullar ro'yxati."""
+    bal = kassa_balance(cur, worker)
+    cur.execute(
+        "SELECT k.guruh_id, k.currency, k.amount, substr(k.created_at, 1, 10), "
+        "(SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = k.guruh_id LIMIT 1) "
+        "FROM kassa k WHERE LOWER(k.worker) = LOWER(?) AND k.turi = 'olindi' AND k.status = 'tasdiqlandi' "
+        "ORDER BY k.id DESC LIMIT 10",
+        (worker,),
+    )
+    recent = cur.fetchall()
+    cur.execute(
+        "SELECT turi, currency, amount, substr(created_at, 1, 10) FROM kassa WHERE LOWER(worker) = LOWER(?) "
+        "AND turi IN ('berdi', 'maosh') AND status = 'tasdiqlandi' ORDER BY id DESC LIMIT 5",
+        (worker,),
+    )
+    given = cur.fetchall()
+    cur.execute(
+        "SELECT turi, currency, amount FROM kassa WHERE LOWER(worker) = LOWER(?) AND status = 'kutilmoqda'",
+        (worker,),
+    )
+    pend = cur.fetchall()
+
+    def dm(d):
+        p = (d or "").split("-")
+        return f"{p[2]}.{p[1]}" if len(p) == 3 else d
+
+    lines = [f"{header} {kassa_balance_text(bal)}"]
+    if recent:
+        lines += ["", "📥 Mijozlardan olingan (oxirgilari):"]
+        for gid, c, a, d, tashqi in recent:
+            lines.append(f"   №{tashqi or gid} — {fmt_cash(c, a)} ({dm(d)})")
+    if given:
+        lines += ["", "📤 Berilgan (oxirgilari):"]
+        for t, c, a, d in given:
+            what = "egaga berdi" if t == "berdi" else "maoshiga oldi"
+            lines.append(f"   {fmt_cash(c, a)} — {what} ({dm(d)})")
+    if pend:
+        lines += ["", "⏳ Tasdiq kutilmoqda:"]
+        for t, c, a in pend:
+            what = "egaga berdim" if t == "berdi" else "maoshimga oldim"
+            lines.append(f"   {fmt_cash(c, a)} — {what}")
+    if not recent and not given:
+        lines += ["", "Hali mijozdan pul olinmagan."]
+    return lines
+
+
+async def mijoz_puli_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting"] = None
+    await kassa(update, context)
+
+
 async def kassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_member(update):
         await deny_access(update)
@@ -9006,21 +9093,8 @@ async def kassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         await update.message.reply_text("Siz botga ishchi sifatida bog'lanmagansiz.")
         return
-    bal = kassa_balance(cur, worker)
-    cur.execute(
-        "SELECT k.guruh_id, k.currency, k.amount, substr(k.created_at, 1, 10), "
-        "(SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = k.guruh_id LIMIT 1) "
-        "FROM kassa k WHERE LOWER(k.worker) = LOWER(?) AND k.turi = 'olindi' AND k.status = 'tasdiqlandi' "
-        "ORDER BY k.id DESC LIMIT 8",
-        (worker,),
-    )
-    recent = cur.fetchall()
+    lines = mijoz_puli_lines(cur, worker, f"💰 {worker}, sizdagi mijoz puli:")
     conn.close()
-    lines = [f"💰 {worker}, sizdagi mijoz puli: {kassa_balance_text(bal)}"]
-    if recent:
-        lines += ["", "Oxirgi olingan pullar:"]
-        for gid, c, a, d, tashqi in recent:
-            lines.append(f"   №{tashqi or gid} — {fmt_cash(c, a)} ({d})")
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([
@@ -10432,7 +10506,8 @@ def wk_keyboard(wid):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔨 Qilgan ishlari", callback_data=f"wk:ish:{wid}"),
          InlineKeyboardButton("💵 Avans berish", callback_data=f"wk:avans:{wid}")],
-        [InlineKeyboardButton("📜 Avanslar tarixi", callback_data=f"wk:tarix:{wid}")],
+        [InlineKeyboardButton("📜 Avanslar tarixi", callback_data=f"wk:tarix:{wid}"),
+         InlineKeyboardButton("💰 Mijoz puli", callback_data=f"wk:kassa:{wid}")],
         [InlineKeyboardButton("⬅️ Ishchilar", callback_data="wk:list")],
     ])
 
@@ -10507,6 +10582,13 @@ async def wk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"🔨 {worker} — ishlari uzun, alohida xabarlarda:")
             await send_chunked(query.message, out)
             await query.message.reply_text(f"💰 Jami: {format_money(total, 'som')}", reply_markup=back)
+        return
+    if action == "kassa":
+        conn = get_conn()
+        cur = conn.cursor()
+        lines = mijoz_puli_lines(cur, worker, f"💰 {worker}dagi mijoz puli:")
+        conn.close()
+        await query.edit_message_text("\n".join(lines), reply_markup=back)
         return
     if action == "tarix":
         conn = get_conn()
@@ -11119,6 +11201,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['oyna']}$"), oyna_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['tayyor_modellar']}$"), tayyor_modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['ishchilar']}$"), ishchilar_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['mijoz_puli']}$"), mijoz_puli_button))
     app.add_handler(CallbackQueryHandler(wk_callback, pattern=r"^wk:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
