@@ -514,6 +514,22 @@ def init_db():
     # Ustanovchi qo'lidagi mijoz puli: 'olindi' (mijozdan), 'berdi' (egaga), 'maosh' (o'z maoshiga).
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS sanoq (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL COLLATE NOCASE,
+            item TEXT NOT NULL COLLATE NOCASE,
+            kutilgan INTEGER NOT NULL,
+            haqiqiy INTEGER,
+            status TEXT NOT NULL DEFAULT 'kutilmoqda',  -- kutilmoqda/togri/farq/tuzatildi/qoldirildi
+            guruh_id INTEGER,
+            user_name TEXT,
+            created_at TEXT NOT NULL,
+            answered_at TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS kassa (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             worker TEXT NOT NULL COLLATE NOCASE,
@@ -2088,7 +2104,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-14 (43) | 💰 Mijoz puli tugmasi"
+BOT_VERSION = "2026-11-14 (44) | ombordan chiqdida sanoq savoli"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -9480,6 +9496,206 @@ def qaytdi_group_core(guruh_id: int, user) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# SANOQ: 'Ombordan chiqdi' bosilganda 1-2 ta detal omborda haqiqatan qancha qolganini so'raydi
+# ---------------------------------------------------------------------------
+SANOQ_PER_ORDER = 2
+
+
+def sanoq_pick(guruh_id):
+    """Shu buyurtmada chiqqan detallardan eng uzoq tekshirilmagan 1-2 tasini tanlaydi -> [(model, item, qty)]."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, model, item, amount, mod_type FROM orders WHERE guruh_id = ?", (guruh_id,))
+    rows = cur.fetchall()
+    seen = []
+    for _, model, item, _ in _group_targets(cur, rows):
+        key = (model.lower(), item.lower())
+        if key not in [(m.lower(), i.lower()) for m, i in seen]:
+            seen.append((model, item))
+    scored = []
+    for model, item in seen:
+        cur.execute(
+            "SELECT quantity FROM products WHERE model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE",
+            (model, item),
+        )
+        q = cur.fetchone()
+        if q is None:
+            continue
+        cur.execute(
+            "SELECT MAX(answered_at) FROM sanoq WHERE model = ? AND item = ? AND status != 'kutilmoqda'",
+            (model, item),
+        )
+        last = cur.fetchone()[0] or ""
+        scored.append((last, model, item, q[0]))
+    conn.close()
+    scored.sort(key=lambda x: x[0])
+    return [(m, i, q) for _, m, i, q in scored[:SANOQ_PER_ORDER]]
+
+
+def sanoq_keyboard(sid, expected):
+    nums = list(range(max(0, expected - 5), expected + 3))
+    buttons = [
+        InlineKeyboardButton(f"✅ {n}" if n == expected else str(n), callback_data=f"sq:{sid}:{n}") for n in nums
+    ]
+    return InlineKeyboardMarkup([buttons[i:i + 4] for i in range(0, len(buttons), 4)])
+
+
+async def sanoq_ask(message, guruh_id, user):
+    try:
+        picks = sanoq_pick(guruh_id)
+    except Exception as e:
+        logger.warning("sanoq_pick xato: %s", e)
+        return
+    for model, item, qty in picks:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sanoq (model, item, kutilgan, guruh_id, user_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (model, item, qty, guruh_id, user.full_name if user else None, datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")),
+        )
+        sid = cur.lastrowid
+        conn.commit()
+        conn.close()
+        await message.reply_text(
+            f"🔢 Tekshiruv: {model.capitalize()} {item}\n"
+            f"Botda hozir omborda {qty} ta qolgan bo'lishi kerak.\n"
+            f"Omborda haqiqatan nechta turibdi? (sanab, raqamni bosing)",
+            reply_markup=sanoq_keyboard(sid, qty),
+        )
+
+
+def sanoq_order_label(guruh_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT tashqi_raqam FROM orders WHERE guruh_id = ? LIMIT 1", (guruh_id,))
+    r = cur.fetchone()
+    conn.close()
+    return order_label(guruh_id, r[0] if r else None)
+
+
+async def sanoq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not can_chiqdi(update):
+        await query.answer("Buni faqat ega va ombordan chiqaruvchi ishchi belgilaydi.", show_alert=True)
+        return
+    await query.answer()
+    _, sid, n = query.data.split(":")
+    sid, n = int(sid), int(n)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, kutilgan, status, guruh_id FROM sanoq WHERE id = ?", (sid,))
+    row = cur.fetchone()
+    if not row or row[3] != "kutilmoqda":
+        conn.close()
+        await query.edit_message_text("Bu tekshiruv allaqachon belgilangan.")
+        return
+    model, item, kutilgan, _, guruh_id = row
+    status = "togri" if n == kutilgan else "farq"
+    cur.execute(
+        "UPDATE sanoq SET haqiqiy = ?, status = ?, answered_at = ? WHERE id = ?",
+        (n, status, datetime.now(TASHKENT_TZ).isoformat(timespec="seconds"), sid),
+    )
+    conn.commit()
+    conn.close()
+    name = f"{model.capitalize()} {item}"
+    if status == "togri":
+        await query.edit_message_text(f"✅ {name}: {n} ta — bot bilan to'g'ri keldi. Rahmat!")
+        return
+    farq = n - kutilgan
+    farq_text = f"{abs(farq)} ta {'kam' if farq < 0 else 'ortiqcha'}"
+    await query.edit_message_text(f"⚠️ {name}: omborda {n} ta, botda {kutilgan} ta ({farq_text}). Egaga xabar berildi.")
+    if OWNER_ID is not None:
+        who = update.effective_user.full_name if update.effective_user else "?"
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"⚠️ Sanoqda farq chiqdi ({who}, {sanoq_order_label(guruh_id)} chiqqanda):\n"
+                    f"{name}: botda {kutilgan} ta, omborda {n} ta — {farq_text}.\n\n"
+                    "Botdagi sonni ombordagiga tenglashtiraymi?"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"🔧 Ha, botda {n} ta qil", callback_data=f"sqf:fix:{sid}"),
+                    InlineKeyboardButton("⏸ Yo'q, o'zim tekshiraman", callback_data=f"sqf:keep:{sid}"),
+                ]]),
+            )
+        except Exception as e:
+            logger.warning("Sanoq farqi egaga yuborilmadi: %s", e)
+
+
+async def sanoq_fix_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    _, action, sid = query.data.split(":")
+    sid = int(sid)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, kutilgan, haqiqiy, status FROM sanoq WHERE id = ?", (sid,))
+    row = cur.fetchone()
+    if not row or row[4] != "farq":
+        conn.close()
+        await query.edit_message_text("Bu farq allaqachon hal qilingan.")
+        return
+    model, item, kutilgan, haqiqiy, _ = row
+    name = f"{model.capitalize()} {item}"
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    if action == "keep":
+        cur.execute("UPDATE sanoq SET status = 'qoldirildi' WHERE id = ?", (sid,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(f"⏸ {name}: botdagi son o'zgartirilmadi (botda {kutilgan}, omborda {haqiqiy} deyilgan).")
+        return
+    farq = haqiqiy - kutilgan
+    cur.execute(
+        "SELECT name, quantity FROM products WHERE model = ? COLLATE NOCASE AND item = ? COLLATE NOCASE",
+        (model, item),
+    )
+    prod = cur.fetchone()
+    if not prod:
+        conn.close()
+        await query.edit_message_text(f"{name} mahsuloti topilmadi.")
+        return
+    new_qty = max(0, prod[1] + farq)
+    cur.execute("UPDATE products SET quantity = ? WHERE name = ?", (new_qty, prod[0]))
+    cur.execute(
+        "INSERT INTO transactions (product, change_type, amount, user_name, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (prod[0], "kirim" if farq > 0 else "chiqim", abs(farq), "sanoq tuzatish", update.effective_user.id, datetime.now().isoformat(timespec="seconds")),
+    )
+    cur.execute("UPDATE sanoq SET status = 'tuzatildi' WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text(f"🔧 {name}: botda {prod[1]} → {new_qty} ta qilindi (sanoq bo'yicha).")
+
+
+async def sanoq_tarix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT model, item, kutilgan, haqiqiy, status, substr(created_at, 1, 10), guruh_id FROM sanoq "
+        "ORDER BY id DESC LIMIT 20"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("🔢 Hali sanoq tekshiruvi bo'lmagan.")
+        return
+    icon = {"togri": "✅", "farq": "⚠️", "tuzatildi": "🔧", "qoldirildi": "⏸", "kutilmoqda": "⏳"}
+    lines = ["🔢 Oxirgi sanoq tekshiruvlari:", ""]
+    for model, item, k, h, st, d, gid in rows:
+        p = d.split("-")
+        dd = f"{p[2]}.{p[1]}" if len(p) == 3 else d
+        h_txt = "javob yo'q" if h is None else f"omborda {h}"
+        lines.append(f"{icon.get(st, '•')} {dd} {model} {item}: botda {k}, {h_txt}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def chiqdi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not can_chiqdi(update):
@@ -9491,6 +9707,8 @@ async def chiqdi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = [g for g in fetch_pending_order_groups() if g["guruh_id"] == guruh_id]
     markup = order_group_keyboard(groups[0]) if groups else None
     await query.edit_message_text(text, reply_markup=markup)
+    if text.startswith("📦"):
+        await sanoq_ask(query.message, guruh_id, update.effective_user)
 
 
 async def qaytdi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11313,6 +11531,9 @@ def main():
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
+    app.add_handler(CallbackQueryHandler(sanoq_callback, pattern=r"^sq:"))
+    app.add_handler(CallbackQueryHandler(sanoq_fix_callback, pattern=r"^sqf:"))
+    app.add_handler(CommandHandler("sanoq", sanoq_tarix))
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
     app.add_handler(CommandHandler("yolda", yolda))
     app.add_handler(CommandHandler("holat", holat))
