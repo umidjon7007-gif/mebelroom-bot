@@ -715,6 +715,7 @@ MENU_BUTTONS = {
     "spinka": "🔨 Spinka",
     "tayyor_modellar": "✅ Tayyor modellar",
     "oyna": "🪟 Oyna",
+    "ishchilar": "👷 Ishchilar",
 }
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -731,6 +732,28 @@ MAIN_MENU = ReplyKeyboardMarkup(
 )
 
 FINISH_BUTTON = "✅ Tayyor"
+OWNER_MENU = ReplyKeyboardMarkup(
+    [
+        [MENU_BUTTONS["kirim"], MENU_BUTTONS["chiqim"]],
+        [MENU_BUTTONS["qoldiq"], MENU_BUTTONS["modellar"]],
+        [MENU_BUTTONS["yangi_buyurtma"], MENU_BUTTONS["buyurtmalar"]],
+        [MENU_BUTTONS["mijozlar"], MENU_BUTTONS["spinka"]],
+        [MENU_BUTTONS["oyna"], MENU_BUTTONS["tayyor_modellar"]],
+        [MENU_BUTTONS["ishchilar"], MENU_BUTTONS["yordam"]],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def menu_for(update) -> ReplyKeyboardMarkup:
+    """Egaga '👷 Ishchilar' tugmasi bor menyu, boshqalarga oddiy menyu."""
+    try:
+        return OWNER_MENU if (OWNER_ID is not None and update.effective_user and update.effective_user.id == OWNER_ID) else MAIN_MENU
+    except Exception:
+        return MAIN_MENU
+
+
 FINISH_MENU = ReplyKeyboardMarkup([[FINISH_BUTTON]], resize_keyboard=True, is_persistent=True)
 
 
@@ -817,7 +840,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kirim laura tumba 5\n"
         "/chiqim vena shkaf 2"
     )
-    await update.message.reply_text(text, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, reply_markup=menu_for(update))
 
 
 RESERVED_MODEL_WORDS = {
@@ -1604,7 +1627,7 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["ob"] = None
     context.user_data["awaiting"] = None
-    await reply_target.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
+    await reply_target.reply_text("\n".join(lines), reply_markup=menu_for(update))
 
 
 async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1792,7 +1815,7 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tayyor_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting"] = None
     context.user_data["ob"] = None
-    await update.message.reply_text("Tayyor. Bosh menyuga qaytdik.", reply_markup=MAIN_MENU)
+    await update.message.reply_text("Tayyor. Bosh menyuga qaytdik.", reply_markup=menu_for(update))
 
 
 async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1907,6 +1930,10 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             f"Yangi ishchi: '{text}' — shu nom to'g'rimi?", reply_markup=buttons
         )
+        return
+
+    if awaiting == "wk_avans":
+        await wk_avans_amount(update, context, text)
         return
 
     if awaiting in ("kassa_berdi", "kassa_maosh"):
@@ -2026,7 +2053,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-13 (41) | topshirildi xabari egaga"
+BOT_VERSION = "2026-11-14 (42) | 👷 Ishchilar menyusi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -10378,6 +10405,168 @@ async def send_chunked(message_obj, lines, limit=3500):
         await message_obj.reply_text("\n".join(chunk))
 
 
+# ---------------------------------------------------------------------------
+# 👷 ISHCHILAR menyusi (faqat egasi): ishchi -> hisob, qilgan ishlari, avans berish, avans tarixi
+# ---------------------------------------------------------------------------
+
+def wk_summary(worker):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(total),0) FROM work_log WHERE worker = ? AND paid = 0", (worker,))
+    ishlagan = cur.fetchone()[0]
+    avans_sum = get_avans_total(cur, worker)
+    conn.close()
+    qolgan = ishlagan - avans_sum
+    lines = [f"👷 {worker}", "", f"📊 Ishlagan (to'lanmagan): {format_money(ishlagan, 'som')}",
+             f"💵 Olgan avanslari: {format_money(avans_sum, 'som')}"]
+    if qolgan > 0:
+        lines.append(f"❗ Qolgan qarz: {format_money(qolgan, 'som')}")
+    elif qolgan < 0:
+        lines.append(f"⚠️ Ishlaganidan {format_money(abs(qolgan), 'som')} ko'p avans olgan")
+    else:
+        lines.append("✅ Hisob teng")
+    return "\n".join(lines)
+
+
+def wk_keyboard(wid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔨 Qilgan ishlari", callback_data=f"wk:ish:{wid}"),
+         InlineKeyboardButton("💵 Avans berish", callback_data=f"wk:avans:{wid}")],
+        [InlineKeyboardButton("📜 Avanslar tarixi", callback_data=f"wk:tarix:{wid}")],
+        [InlineKeyboardButton("⬅️ Ishchilar", callback_data="wk:list")],
+    ])
+
+
+def wk_list_keyboard():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT rowid, name FROM workers ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+    buttons = [InlineKeyboardButton(name, callback_data=f"wk:w:{wid}") for wid, name in rows]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]) if buttons else None
+
+
+def wk_name(wid):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM workers WHERE rowid = ?", (wid,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+async def ishchilar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    context.user_data["awaiting"] = None
+    kb = wk_list_keyboard()
+    if kb is None:
+        await update.message.reply_text("Hali ishchilar yo'q.")
+        return
+    await update.message.reply_text("👷 Ishchini tanlang:", reply_markup=kb)
+
+
+async def wk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "list":
+        context.user_data["awaiting"] = None
+        await query.edit_message_text("👷 Ishchini tanlang:", reply_markup=wk_list_keyboard())
+        return
+    wid = int(parts[2])
+    worker = wk_name(wid)
+    if not worker:
+        await query.edit_message_text("Bu ishchi topilmadi.")
+        return
+    if action == "w":
+        context.user_data["awaiting"] = None
+        await query.edit_message_text(wk_summary(worker), reply_markup=wk_keyboard(wid))
+        return
+    back = InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {worker}", callback_data=f"wk:w:{wid}")]])
+    if action == "ish":
+        conn = get_conn()
+        cur = conn.cursor()
+        lines, total, turi_totals = build_worker_maosh_lines(cur, worker)
+        conn.close()
+        if not lines:
+            await query.edit_message_text(f"🔨 {worker} — to'lanmagan ish yo'q.", reply_markup=back)
+            return
+        out = [f"🔨 {worker} — to'lanmagan ishlari:", ""] + lines + [""] + format_turi_totals(turi_totals)
+        out.append(f"💰 Jami: {format_money(total, 'som')}")
+        text = "\n".join(out)
+        if len(text) <= 3900:
+            await query.edit_message_text(text, reply_markup=back)
+        else:
+            await query.edit_message_text(f"🔨 {worker} — ishlari uzun, alohida xabarlarda:")
+            await send_chunked(query.message, out)
+            await query.message.reply_text(f"💰 Jami: {format_money(total, 'som')}", reply_markup=back)
+        return
+    if action == "tarix":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT amount, settled, created_at FROM avanslar WHERE worker = ? COLLATE NOCASE "
+            "ORDER BY created_at DESC LIMIT 20",
+            (worker,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text(f"📜 {worker} — avans hali berilmagan.", reply_markup=back)
+            return
+        out = [f"📜 {worker} — avanslar (oxirgi {len(rows)} ta):", ""]
+        for amount, settled, created_at in rows:
+            d = created_at[:10].split("-")
+            date = f"{d[2]}.{d[1]}.{d[0]}" if len(d) == 3 else created_at[:10]
+            mark = "✔️ hisoblangan" if settled else "⏳ hisoblanmagan"
+            out.append(f"{date} — {format_money(amount, 'som')}  ({mark})")
+        await query.edit_message_text("\n".join(out), reply_markup=back)
+        return
+    if action == "avans":
+        context.user_data["awaiting"] = "wk_avans"
+        context.user_data["wk_worker"] = worker
+        context.user_data["wk_wid"] = wid
+        await query.edit_message_text(
+            f"💵 {worker}ga qancha avans berdingiz?\n\nFaqat summani yozing (so'mda), masalan: 500000",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor", callback_data=f"wk:w:{wid}")]]),
+        )
+        return
+
+
+async def wk_avans_amount(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    worker = context.user_data.get("wk_worker")
+    wid = context.user_data.get("wk_wid")
+    cleaned = text.replace(" ", "").replace(",", "").replace(".", "").lower()
+    for marker in ("so'm", "som", "sum"):
+        if cleaned.endswith(marker):
+            cleaned = cleaned[: -len(marker)]
+    if not worker or not cleaned.isdigit() or int(cleaned) <= 0:
+        await update.message.reply_text("Faqat summani raqam bilan yozing, masalan: 500000")
+        return
+    amount = int(cleaned)
+    context.user_data["awaiting"] = None
+    context.user_data["wk_worker"] = None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO avanslar (worker, amount, settled, created_at) VALUES (?, ?, 0, ?)",
+        (worker, amount, datetime.now(TASHKENT_TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ {worker} — avans {format_money(amount, 'som')} yozildi\n\n" + wk_summary(worker).split("\n", 2)[2],
+        reply_markup=wk_keyboard(wid),
+    )
+
+
 def get_avans_total(cur, worker):
     cur.execute("SELECT SUM(amount) FROM avanslar WHERE worker = ? AND settled = 0", (worker,))
     return cur.fetchone()[0] or 0
@@ -10929,6 +11118,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['spinka']}$"), spinka_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['oyna']}$"), oyna_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['tayyor_modellar']}$"), tayyor_modellar))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['ishchilar']}$"), ishchilar_button))
+    app.add_handler(CallbackQueryHandler(wk_callback, pattern=r"^wk:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{FINISH_BUTTON}$"), tayyor_button))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO) & filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
