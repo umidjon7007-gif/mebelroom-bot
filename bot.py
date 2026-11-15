@@ -1982,6 +1982,10 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if awaiting == "ko_summa":
+        await kassa_olindi_amount(update, context, text)
+        return
+
     if awaiting == "wk_avans":
         await wk_avans_amount(update, context, text)
         return
@@ -2104,7 +2108,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-14 (44) | ombordan chiqdida sanoq savoli"
+BOT_VERSION = "2026-11-15 (45) | hisobotda ✅ ishchidan olindi tugmasi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5506,6 +5510,9 @@ async def job_holat_hisobot(context: ContextTypes.DEFAULT_TYPE):
         chunk.append(ln)
     if chunk:
         await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(chunk))
+    kb = kassa_olindi_keyboard()
+    if kb:
+        await context.bot.send_message(chat_id=OWNER_ID, text="💰 Ishchidan mijoz pulini oldingizmi?", reply_markup=kb)
 
 
 def order_needs_by_item():
@@ -5668,6 +5675,9 @@ async def holat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny_access(update)
         return
     await send_chunked(update.message, build_holat_hisobot().split("\n"))
+    kb = kassa_olindi_keyboard()
+    if kb:
+        await update.message.reply_text("💰 Ishchidan mijoz pulini oldingizmi?", reply_markup=kb)
 
 
 def _wrap_commands_for_logging(app):
@@ -9091,7 +9101,7 @@ async def kassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"   {w}: {fmt_cash(c, a)} {what}")
         lines += ["", "Pulni o'zingiz olganingizni yozish: /kassaoldim <ism> <summa>",
                   "Misol: /kassaoldim Hojiakbar 500   yoki   /kassaoldim Hojiakbar 3000000som"]
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines), reply_markup=kassa_olindi_keyboard())
         if pend:
             for pid, w, c, a, t in pend:
                 what = "berdim" if t == "berdi" else "maoshimga oldim (avans)"
@@ -9241,6 +9251,116 @@ async def kassa_request(update: Update, context: ContextTypes.DEFAULT_TYPE, turi
                 InlineKeyboardButton("❌ Yo'q", callback_data=f"kas:no:{pid}"),
             ]]),
         )
+
+
+def kassa_olindi_keyboard():
+    """Qo'lida mijoz puli bor har bir ishchi uchun '✅ ...dan olindi' tugmasi (yo'q bo'lsa None)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    names = [w for w in kassa_workers(cur) if any(kassa_balance(cur, w).values())]
+    conn.close()
+    rows = [[InlineKeyboardButton(f"✅ {w}dan olindi", callback_data=f"ko:w:{w}"[:64])] for w in names]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def kassa_owner_take(worker, currency, amount):
+    now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO kassa (worker, currency, amount, turi, guruh_id, status, created_at, confirmed_at) "
+        "VALUES (?, ?, ?, 'berdi', NULL, 'tasdiqlandi', ?, ?)",
+        (worker, currency, amount, now, now),
+    )
+    bal = kassa_balance(cur, worker)
+    tg = worker_telegram_id(cur, worker)
+    conn.commit()
+    conn.close()
+    return bal, tg
+
+
+async def kassa_take_done(bot, worker, taken, bal, tg):
+    """taken: [(currency, amount)]. Ishchiga ham xabar beradi."""
+    taken_txt = " + ".join(fmt_cash(c, a) for c, a in taken)
+    text = f"✅ {worker}dan {taken_txt} olindi\n💰 Hozir {worker}da: {kassa_balance_text(bal)}"
+    if tg:
+        try:
+            await bot.send_message(
+                chat_id=tg,
+                text=f"💵 Ega sizdan {taken_txt} mijoz pulini oldi deb yozdi.\n💰 Sizda qoldi: {kassa_balance_text(bal)}",
+            )
+        except Exception as e:
+            logger.warning("Ishchiga kassa xabari yuborilmadi: %s", e)
+    return text
+
+
+async def kassa_olindi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    _, action, worker = query.data.split(":", 2)
+    conn = get_conn()
+    cur = conn.cursor()
+    bal = kassa_balance(cur, worker)
+    cur.execute(
+        "SELECT id, currency, amount FROM kassa WHERE LOWER(worker) = LOWER(?) AND turi = 'berdi' AND status = 'kutilmoqda'",
+        (worker,),
+    )
+    pend = cur.fetchall()
+    conn.close()
+    if action == "w":
+        if not any(bal.values()):
+            await query.edit_message_text(f"💰 {worker}da hozir mijoz puli yo'q ✅")
+            return
+        lines = [f"💰 {worker}da: {kassa_balance_text(bal)}", "", "Hammasini oldingizmi?"]
+        buttons = [
+            [InlineKeyboardButton(f"✅ Hammasi — {kassa_balance_text(bal)}", callback_data=f"ko:all:{worker}"[:64])],
+            [InlineKeyboardButton("✏️ Boshqa summa", callback_data=f"ko:sum:{worker}"[:64]),
+             InlineKeyboardButton("❌ Bekor", callback_data=f"ko:x:{worker}"[:64])],
+        ]
+        if pend:
+            lines += ["", f"⚠️ {worker} o'zi 'egaga berdim' deb yuborgan, tasdiqingizni kutyapti:"]
+            for pid, c, a in pend:
+                lines.append(f"   {fmt_cash(c, a)}")
+                buttons.insert(0, [InlineKeyboardButton(f"✅ Shu {fmt_cash(c, a)} ni tasdiqlash", callback_data=f"kas:ok:{pid}")])
+            lines.append("Shuni olgan bo'lsangiz, tasdiqlash tugmasini bosing (ikki marta yozilmasin).")
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if action == "x":
+        context.user_data["awaiting"] = None
+        await query.edit_message_text("Bekor qilindi.")
+        return
+    if action == "all":
+        taken = [(c, a) for c, a in (("usd", bal.get("usd", 0)), ("som", bal.get("som", 0))) if a > 0]
+        if not taken:
+            await query.edit_message_text(f"💰 {worker}da hozir mijoz puli yo'q ✅")
+            return
+        new_bal, tg = bal, None
+        for c, a in taken:
+            new_bal, tg = kassa_owner_take(worker, c, a)
+        await query.edit_message_text(await kassa_take_done(context.bot, worker, taken, new_bal, tg))
+        return
+    if action == "sum":
+        context.user_data["awaiting"] = "ko_summa"
+        context.user_data["ko_worker"] = worker
+        await query.edit_message_text(
+            f"💰 {worker}da: {kassa_balance_text(bal)}\n\nQancha oldingiz? Masalan: 200  yoki  3000000som",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor", callback_data=f"ko:x:{worker}"[:64])]]),
+        )
+
+
+async def kassa_olindi_amount(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    worker = context.user_data.get("ko_worker")
+    parsed = parse_cash(text)
+    if not worker or parsed is None or parsed[1] <= 0:
+        await update.message.reply_text("Summani tushunmadim. Masalan: 200  yoki  3000000som")
+        return
+    context.user_data["awaiting"] = None
+    context.user_data["ko_worker"] = None
+    bal, tg = kassa_owner_take(worker, parsed[0], parsed[1])
+    await update.message.reply_text(await kassa_take_done(context.bot, worker, [parsed], bal, tg))
 
 
 async def kassaoldim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11532,6 +11652,7 @@ def main():
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
     app.add_handler(CallbackQueryHandler(sanoq_callback, pattern=r"^sq:"))
+    app.add_handler(CallbackQueryHandler(kassa_olindi_callback, pattern=r"^ko:"))
     app.add_handler(CallbackQueryHandler(sanoq_fix_callback, pattern=r"^sqf:"))
     app.add_handler(CommandHandler("sanoq", sanoq_tarix))
     app.add_handler(CallbackQueryHandler(qaytdi_callback, pattern=r"^qaytdi:"))
