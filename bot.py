@@ -2108,7 +2108,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-15 (45) | hisobotda ✅ ishchidan olindi tugmasi"
+BOT_VERSION = "2026-11-22 (46) | zakaz kartasida ✍️ Qo'lda yozdim"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -7819,10 +7819,13 @@ def pending_card(pid):
     if deadline and entries:
         buttons.append(InlineKeyboardButton("✅ Yozish", callback_data=f"gord:{pid}:yes"))
     buttons.append(InlineKeyboardButton("✏️ Tuzatish", callback_data=f"gord:{pid}:edit"))
-    buttons.append(InlineKeyboardButton("❌ Kerak emas", callback_data=f"gord:{pid}:no"))
     if not deadline:
         lines.append("\n⚠️ Muddat topilmadi - '✏️ Tuzatish' orqali qo'lda kiriting.")
-    return "\n".join(lines), InlineKeyboardMarkup([buttons])
+    return "\n".join(lines), InlineKeyboardMarkup([
+        buttons,
+        [InlineKeyboardButton("✍️ Qo'lda yozdim", callback_data=f"gord:{pid}:qolda")],
+        [InlineKeyboardButton("❌ Kerak emas", callback_data=f"gord:{pid}:no")],
+    ])
 
 
 async def set_group_reaction(context, chat_id, message_id, emoji):
@@ -7984,6 +7987,26 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.edit_message_text(query.message.text + "\n\n❌ Kerak emas deb belgilandi.")
         await set_group_reaction(context, source_chat_id, source_message_id, None)
+        return
+
+    if action == "qolda":
+        found = existing_order_by_number(cur, tashqi_raqam)
+        cur.execute("UPDATE pending_group_orders SET status = 'yozilgan' WHERE id = ?", (pending_id,))
+        conn.commit()
+        conn.close()
+        await query.answer()
+        if found:
+            note = f"✍️ Qo'lda yozilgan. ✅ №{tashqi_raqam} botda bor (bot raqami: {found[0]})."
+        elif tashqi_raqam:
+            note = (f"✍️ Qo'lda yozildi deb belgilandi.\n⚠️ Lekin №{tashqi_raqam} raqamli buyurtma botda topilmadi — "
+                    "raqamsiz yozgan bo'lsangiz mayli, yozishni unutgan bo'lsangiz /buyurtmalar dan tekshiring.")
+        else:
+            note = "✍️ Qo'lda yozildi deb belgilandi (xabarda raqam yo'q, tekshirib bo'lmadi)."
+        try:
+            await query.edit_message_text(query.message.text + "\n\n" + note)
+        except BadRequest:
+            pass
+        await set_group_reaction(context, source_chat_id, source_message_id, "👍")
         return
 
     if action == "edit":
