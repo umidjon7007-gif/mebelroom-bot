@@ -2217,7 +2217,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-22 (47) | kirim/chiqim: ➖➕ bitta ekranda"
+BOT_VERSION = "2026-11-22 (48) | buyurtma kartasida narx (faqat egaga)"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -9011,8 +9011,11 @@ async def buyurtmalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if customer_filter:
         header += f" — mijoz: {customer_filter}"
     await update.message.reply_text(header)
+    show_price = owner_private(update)
     for group in groups:
         text = format_group_text(group)
+        if show_price:
+            text += order_price_line(group["guruh_id"])
         await update.message.reply_text(text, reply_markup=order_group_keyboard(group))
 
 
@@ -9986,7 +9989,10 @@ async def yolda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"🚚 Yo'ldagi buyurtmalar: {len(groups)} ta")
     for group in groups:
-        await update.message.reply_text(format_group_text(group), reply_markup=order_group_keyboard(group))
+        text = format_group_text(group)
+        if owner_private(update):
+            text += order_price_line(group["guruh_id"])
+        await update.message.reply_text(text, reply_markup=order_group_keyboard(group))
 
 
 async def chiqdihuquqi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10429,6 +10435,11 @@ def shortage_warning_for_new_order(cur, entries):
 
 
 def compute_order_sale_value(guruh_id: int) -> int:
+    return compute_order_sale_detail(guruh_id)[0]
+
+
+def compute_order_sale_detail(guruh_id: int):
+    """(jami, narxi belgilanmagan qatorlar soni)."""
     """Guruhdagi barcha qatorlar uchun kutilayotgan umumiy summani hisoblaydi
     (mijozga qancha sotilishi kerak).
     mod_type == '+' (qo'shilgan) - avval 'farqnarxi' (agar belgilangan bo'lsa, masalan
@@ -10444,11 +10455,13 @@ def compute_order_sale_value(guruh_id: int) -> int:
     cur.execute("SELECT model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ?", (guruh_id,))
     rows = cur.fetchall()
     total = 0
+    missing = 0
     for model, item, amount, mod_type, dastavka in rows:
         rate_key = item if item is not None else "komplekt"
         if mod_type == "-":
             rate = get_rate(cur, "sotishayirish", model, rate_key)
             total -= rate * amount
+            continue
         elif mod_type == "+":
             farq_rate = get_rate(cur, "farqnarxi", model, rate_key)
             if farq_rate:
@@ -10464,8 +10477,26 @@ def compute_order_sale_value(guruh_id: int) -> int:
         else:
             rate = get_rate(cur, "sotish", model, rate_key)
             total += rate * amount
+        if not rate and mod_type != "+":
+            missing += 1
     conn.close()
-    return total
+    return total, missing
+
+
+def order_price_line(guruh_id):
+    """Egaga ko'rsatiladigan narx qatori."""
+    try:
+        total, missing = compute_order_sale_detail(guruh_id)
+    except Exception:
+        return ""
+    line = f"\n💰 Narxi: {format_money(total, 'usd')}"
+    if missing:
+        line += f"\n⚠️ {missing} ta qatorga sotish narxi belgilanmagan (0 deb olindi)"
+    return line
+
+
+def owner_private(update) -> bool:
+    return is_owner(update) and bool(update.effective_chat and update.effective_chat.type == "private")
 
 
 def record_payment(guruh_id: int, customer: str, expected_value: int, received_amount: int):
