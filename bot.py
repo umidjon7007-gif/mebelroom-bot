@@ -2217,7 +2217,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-22 (48) | buyurtma kartasida narx (faqat egaga)"
+BOT_VERSION = "2026-11-22 (49) | /tolandi <ism> <sana>"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -11369,7 +11369,15 @@ async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if not args:
-        await update.message.reply_text("Foydalanish: /tolandi <ishchi ismi>\nMisol: /tolandi Hojiakbar")
+        await update.message.reply_text(
+            "Foydalanish: /tolandi <ishchi ismi>\nMisol: /tolandi Hojiakbar\n\n"
+            "Faqat ma'lum sanagacha bo'lgan ishlarni to'lash: /tolandi <ism> <kun.oy>\n"
+            "Misol: /tolandi Ibrohim 01.11  (1-noyabr ham kiradi)"
+        )
+        return
+
+    if len(args) >= 2 and re.fullmatch(r"\d{1,2}[./]\d{1,2}([./]\d{2,4})?", args[-1]):
+        await tolandi_sanagacha(update, context, " ".join(args[:-1]).strip(), args[-1])
         return
 
     worker = " ".join(args)
@@ -11397,6 +11405,112 @@ async def tolandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"💵 Bundan avval berilgan avans ({format_money(avans_total, 'som')}) hisobga olindi.")
         lines.append(f"➡️ Qo'shimcha to'lash kerak bo'lgan summa: {format_money(qoldiq, 'som')}")
     await update.message.reply_text("\n".join(lines))
+
+
+def parse_kun_oy(text):
+    parts = re.split(r"[./]", text)
+    d, m = int(parts[0]), int(parts[1])
+    today = date.today()
+    if len(parts) > 2 and parts[2]:
+        y = int(parts[2])
+        y = y + 2000 if y < 100 else y
+    else:
+        y = today.year if (m, d) <= (today.month, today.day) else today.year - 1
+    return date(y, m, d)
+
+
+def tolandi_sanagacha_hisob(worker, cutoff):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(total),0), COUNT(*) FROM work_log WHERE worker = ? AND paid = 0 AND substr(created_at,1,10) <= ?",
+        (worker, cutoff.isoformat()),
+    )
+    ish, count = cur.fetchone()
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0), COUNT(*) FROM avanslar WHERE worker = ? AND settled = 0 AND substr(created_at,1,10) <= ?",
+        (worker, cutoff.isoformat()),
+    )
+    avans, avans_n = cur.fetchone()
+    cur.execute(
+        "SELECT COALESCE(SUM(total),0) FROM work_log WHERE worker = ? AND paid = 0 AND substr(created_at,1,10) > ?",
+        (worker, cutoff.isoformat()),
+    )
+    keyin = cur.fetchone()[0]
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM avanslar WHERE worker = ? AND settled = 0 AND substr(created_at,1,10) > ?",
+        (worker, cutoff.isoformat()),
+    )
+    keyin_avans = cur.fetchone()[0]
+    conn.close()
+    return ish, count, avans, avans_n, keyin, keyin_avans
+
+
+async def tolandi_sanagacha(update, context, worker, sana_text):
+    try:
+        cutoff = parse_kun_oy(sana_text)
+    except (ValueError, IndexError):
+        await update.message.reply_text("Sanani tushunmadim. Misol: /tolandi Ibrohim 01.11")
+        return
+    names = known_worker_names()
+    worker = names.get(worker.lower(), worker)
+    ish, count, avans, avans_n, keyin, keyin_avans = tolandi_sanagacha_hisob(worker, cutoff)
+    if not count and not avans_n:
+        await update.message.reply_text(f"👷 {worker} — {cutoff:%d.%m.%Y} gacha to'lanmagan ish ham, avans ham yo'q.")
+        return
+    sana = cutoff.strftime("%d.%m.%Y")
+    lines = [
+        f"👷 {worker} — {sana} gacha (shu kun ham kiradi):",
+        f"📊 Ishlagan: {format_money(ish, 'som')} ({count} ta yozuv)",
+        f"💵 Shu davrdagi avanslar: {format_money(avans, 'som')}",
+        f"➡️ Shu davr uchun qolgan to'lov: {format_money(ish - avans, 'som')}",
+        "",
+        f"📌 {sana} dan keyingi to'lanmagan ishlari: {format_money(keyin, 'som')}"
+        + (f" (avans {format_money(keyin_avans, 'som')})" if keyin_avans else "")
+        + " — bular qarz bo'lib qoladi.",
+        "",
+        "Shu davrni 'to'landi' deb belgilaymi?",
+    ]
+    context.user_data["tolandi_sana"] = (worker, cutoff.isoformat())
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Ha, to'landi", callback_data="tls:ok"),
+            InlineKeyboardButton("❌ Bekor", callback_data="tls:no"),
+        ]]),
+    )
+
+
+async def tolandi_sana_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    pending = context.user_data.pop("tolandi_sana", None)
+    if query.data == "tls:no" or not pending:
+        await query.edit_message_text("Bekor qilindi." if query.data == "tls:no" else "Bu so'rov eskirgan, qaytadan yozing.")
+        return
+    worker, cutoff_iso = pending
+    ish, count, avans, avans_n, keyin, keyin_avans = tolandi_sanagacha_hisob(worker, date.fromisoformat(cutoff_iso))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE work_log SET paid = 1 WHERE worker = ? AND paid = 0 AND substr(created_at,1,10) <= ?",
+        (worker, cutoff_iso),
+    )
+    cur.execute(
+        "UPDATE avanslar SET settled = 1 WHERE worker = ? AND settled = 0 AND substr(created_at,1,10) <= ?",
+        (worker, cutoff_iso),
+    )
+    conn.commit()
+    conn.close()
+    sana = date.fromisoformat(cutoff_iso).strftime("%d.%m.%Y")
+    await query.edit_message_text(
+        f"✅ {worker} — {sana} gacha bo'lgan ishlar to'landi deb belgilandi.\n"
+        f"📊 Ishlagan: {format_money(ish, 'som')}, avans: {format_money(avans, 'som')}\n\n"
+        f"📌 Qolgan qarz ({sana} dan keyin): {format_money(keyin - keyin_avans, 'som')}"
+    )
 
 
 async def job_oylik_hisobot(context: ContextTypes.DEFAULT_TYPE):
@@ -11815,6 +11929,7 @@ def main():
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
     app.add_handler(CallbackQueryHandler(sanoq_callback, pattern=r"^sq:"))
+    app.add_handler(CallbackQueryHandler(tolandi_sana_callback, pattern=r"^tls:"))
     app.add_handler(CallbackQueryHandler(kassa_olindi_callback, pattern=r"^ko:"))
     app.add_handler(CallbackQueryHandler(sanoq_fix_callback, pattern=r"^sqf:"))
     app.add_handler(CommandHandler("sanoq", sanoq_tarix))
