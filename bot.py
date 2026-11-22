@@ -1314,7 +1314,7 @@ async def change_stock_core(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             pay = " · " + payment_line.strip().split("upakovka: ")[-1].split(" hisoblandi")[0]
         elif payment_line:
             pay = " · ⚠️ narx yo'q"
-        collect.append(f"✅ {product_display} +{amount} → {new_qty} ta{pay}{spinka_unready_line.strip() and ' ' + spinka_unready_line.strip()}")
+        collect.append(f"✅ {product_display} {'+' if change_type == 'kirim' else '-'}{amount} → {new_qty} ta{pay}{spinka_unready_line.strip() and ' ' + spinka_unready_line.strip()}")
         return
     if collect is not None:
         collect.append(f"⏳ {product_display} +{amount} → {new_qty} ta (oyna savoli alohida xabarda)")
@@ -1362,6 +1362,70 @@ async def kirim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def chiqim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sb_start(update, context, "chiqim")
+
+
+def sb_title(sb):
+    return "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
+
+
+def sb_grid_text(sb):
+    counts = sb.get("counts", {})
+    lines = [f"{sb_title(sb)} — {sb['model'].capitalize()}", "", "➕ / ➖ bilan sonini tering, keyin '✅ Saqlash' bosing."]
+    chosen = [(it, counts[it]) for it in sb["item_list"] if counts.get(it)]
+    if chosen:
+        lines += ["", "Tanlandi:"] + [f"• {it}: {q} ta" for it, q in chosen]
+    return "\n".join(lines)
+
+
+def sb_grid_keyboard(sb):
+    counts = sb.get("counts", {})
+    rows = []
+    for i, it in enumerate(sb["item_list"]):
+        q = counts.get(it, 0)
+        rows.append([
+            InlineKeyboardButton("➖", callback_data=f"sb:m:{i}"),
+            InlineKeyboardButton(f"{'✅ ' if q else ''}{it}: {q}", callback_data=f"sb:p:{i}"),
+            InlineKeyboardButton("➕", callback_data=f"sb:p:{i}"),
+        ])
+    rows.append([InlineKeyboardButton("✅ Saqlash", callback_data="sb:save")])
+    rows.append([
+        InlineKeyboardButton("🔁 Boshqa model", callback_data="sb:restart"),
+        InlineKeyboardButton("❌ Bekor", callback_data="sb:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def sb_edit(query, text, markup):
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def sb_do_save(update, context, query, sb, force_worker=None):
+    counts = {it: q for it, q in sb.get("counts", {}).items() if q > 0}
+    collected = []
+    for it in sb["item_list"]:
+        if it in counts:
+            await change_stock_core(
+                update, context, sb["mode"], [sb["model"], it, str(counts[it])],
+                force_worker=force_worker, collect=collected,
+            )
+    who = ""
+    if sb["mode"] == "kirim":
+        if force_worker:
+            who = f" ({force_worker} nomiga upakovka)"
+        elif force_worker == "":
+            who = " (upakovka puli yozilmadi)"
+    head = f"{'✅ Kirim yozildi' if sb['mode'] == 'kirim' else '✅ Chiqim yozildi'} — {sb['model'].capitalize()}{who}:"
+    out = [head] + (collected or ["⚠️ Hech narsa yozilmadi yoki savol bor — yuqoridagi xabarni ko'ring."])
+    sb["counts"] = {}
+    await sb_edit(query, "\n".join(out), InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ Yana {sb['model'].capitalize()}", callback_data=f"sb:model:{sb['model']}")],
+        [InlineKeyboardButton("🔁 Boshqa model", callback_data="sb:restart"),
+         InlineKeyboardButton("✅ Tugatish", callback_data="sb:done")],
+    ]))
 
 
 def sb_item_keyboard(sb):
@@ -1438,10 +1502,55 @@ async def sb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         sb["model"] = model
         sb["item_list"] = item_list
-        title = "📥 Kirim" if sb["mode"] == "kirim" else "📤 Chiqim"
-        await query.edit_message_text(
-            f"{title} — {model.capitalize()} — detalni tanlang:", reply_markup=sb_item_keyboard(sb)
-        )
+        sb["counts"] = {}
+        await sb_edit(query, sb_grid_text(sb), sb_grid_keyboard(sb))
+        return
+
+    if data.startswith("sb:p:") or data.startswith("sb:m:"):
+        if "model" not in sb:
+            await query.edit_message_text("Sessiya tugagan. Qaytadan tugmani bosing.")
+            return
+        idx = int(data.split(":")[2])
+        it = sb["item_list"][idx]
+        counts = sb.setdefault("counts", {})
+        counts[it] = max(0, counts.get(it, 0) + (1 if data.startswith("sb:p:") else -1))
+        await sb_edit(query, sb_grid_text(sb), sb_grid_keyboard(sb))
+        return
+
+    if data == "sb:back":
+        await sb_edit(query, sb_grid_text(sb), sb_grid_keyboard(sb))
+        return
+
+    if data == "sb:save":
+        if not any(q > 0 for q in sb.get("counts", {}).values()):
+            await sb_edit(query, sb_grid_text(sb) + "\n\n⚠️ Hali hech narsa tanlanmadi — ➕ bilan son tering.", sb_grid_keyboard(sb))
+            return
+        if sb["mode"] == "kirim" and is_owner(update) and not get_linked_worker(update):
+            conn = get_conn()
+            cur = conn.cursor()
+            workers = upakovka_workers(cur)
+            conn.close()
+            if workers:
+                rows = [[InlineKeyboardButton(name, callback_data=f"sb:w:{rid}")] for rid, name in workers]
+                rows.append([InlineKeyboardButton("🚫 Pul yozilmasin", callback_data="sb:w:0")])
+                rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="sb:back")])
+                await sb_edit(query, sb_grid_text(sb) + "\n\n👷 Upakovkani kim qildi? (pul o'shanga yoziladi)",
+                              InlineKeyboardMarkup(rows))
+                return
+        await sb_do_save(update, context, query, sb)
+        return
+
+    if data.startswith("sb:w:"):
+        rid = int(data.split(":")[2])
+        worker = ""
+        if rid:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM workers WHERE rowid = ?", (rid,))
+            r = cur.fetchone()
+            conn.close()
+            worker = r[0] if r else ""
+        await sb_do_save(update, context, query, sb, force_worker=worker)
         return
 
     if data.startswith("sb:item:"):
@@ -2108,7 +2217,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-22 (46) | zakaz kartasida ✍️ Qo'lda yozdim"
+BOT_VERSION = "2026-11-22 (47) | kirim/chiqim: ➖➕ bitta ekranda"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
