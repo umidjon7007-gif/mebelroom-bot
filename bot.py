@@ -2120,6 +2120,31 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(
                 f"💱 So'm deb tanildi, kursga ko'ra (~{get_exchange_rate():,} so'm/$) ${received} deb hisoblanadi.".replace(",", " ")
             )
+        expected = pending["expected_value"] or 0
+        cash = parse_cash(text) or ("usd", received)
+        if received > 0 and (expected == 0 or received > expected * 1.3 + 20):
+            pending["received"] = received
+            pending["cash"] = cash
+            context.user_data["awaiting"] = None
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(dastavka) FROM orders WHERE guruh_id = ?", (pending["guruh_id"],))
+            dr = cur.fetchone()
+            conn.close()
+            sabab = []
+            if dr and dr[0]:
+                sabab.append("• buyurtma 'dastavka' (o'rnatishsiz) deb belgilangan — dastavka narxi bo'yicha hisoblandi")
+            sabab.append("• ba'zi detallarga sotish narxi yozilmagan")
+            sabab.append("• buyurtma tarkibi noto'g'ri (masalan komplekt detallarga bo'lib yozilgan)")
+            await update.message.reply_text(
+                f"⚠️ Kutilgan narx: {format_money(expected, 'usd')}, siz yozdingiz: {format_money(received, 'usd')}.\n"
+                "Farq juda katta. Ehtimol:\n" + "\n".join(sabab) + "\n\nShunday yozaveraymi?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ To'g'ri, yozaver", callback_data="pc:ok"),
+                    InlineKeyboardButton("❌ Bekor, tekshiraman", callback_data="pc:no"),
+                ]]),
+            )
+            return
         context.user_data["awaiting"] = None
         context.user_data["pending_payment"] = None
         result_text = await finalize_payment(
@@ -2129,7 +2154,7 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
             pending["customer"],
             pending["expected_value"],
             received,
-            cash=parse_cash(text) or ("usd", received),
+            cash=cash,
             bot=context.bot,
         )
         private = bool(update.effective_chat and update.effective_chat.type == "private")
@@ -2217,7 +2242,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-22 (49) | /tolandi <ism> <sana>"
+BOT_VERSION = "2026-11-23 (50) | yo'ldagi buyurtmani o'zgartirish himoyasi + katta farq ogohlantirishi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5198,6 +5223,8 @@ async def buyurtmaqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
         return
+    if await shipped_guard(update, context, "buyurtmaqoshish"):
+        return
 
     args = context.args
     usage = (
@@ -5290,6 +5317,8 @@ async def buyurtmamodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kutilayotgan buyurtmadagi modelni (butunlay yoki bitta detalni) boshqa modelga o'tkazadi."""
     if not is_owner(update):
         await deny_access(update)
+        return
+    if await shipped_guard(update, context, "buyurtmamodel"):
         return
 
     args = context.args
@@ -6026,6 +6055,8 @@ async def muddattuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buyurtmatuzatish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
+        return
+    if await shipped_guard(update, context, "buyurtmatuzatish"):
         return
 
     args = context.args
@@ -9707,6 +9738,107 @@ def chiqdi_group_core(guruh_id: int, user) -> str:
     )
 
 
+def order_is_shipped(guruh_id) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM orders WHERE guruh_id = ? AND status = 'kutilmoqda' AND chiqdi_at IS NOT NULL LIMIT 1",
+        (guruh_id,),
+    )
+    r = cur.fetchone()
+    conn.close()
+    return bool(r)
+
+
+async def shipped_guard(update, context, cmd) -> bool:
+    """Yo'ldagi buyurtmani o'zgartirishdan oldin to'xtatadi. True - to'xtatildi."""
+    if context.user_data.pop("_bq_replay", False):
+        return False
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        return False
+    gid = int(args[0])
+    if not order_is_shipped(gid):
+        return False
+    context.user_data["bq_pending"] = (cmd, list(args))
+    await update.message.reply_text(
+        f"⚠️ {sanoq_order_label(gid)} hozir yo'lda (ombordan chiqqan).\n"
+        "O'zgartirishdan oldin omborga qaytarish kerak, aks holda ombordan ikki marta ayriladi.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ Omborga qaytar va davom et", callback_data="bq:ok"),
+            InlineKeyboardButton("❌ Bekor", callback_data="bq:no"),
+        ]]),
+    )
+    return True
+
+
+class _ReplayUpdate:
+    """Tugma bosilgandan keyin buyruqni qayta bajarish uchun (javob shu chatga yoziladi)."""
+    def __init__(self, upd):
+        self.effective_user = upd.effective_user
+        self.effective_chat = upd.effective_chat
+        self.message = upd.callback_query.message
+        self.effective_message = self.message
+        self.callback_query = None
+
+
+async def pc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Topshirishda katta farq ogohlantirishi: yozaver / bekor."""
+    query = update.callback_query
+    if not is_member(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo'q.", show_alert=True)
+        return
+    await query.answer()
+    pending = context.user_data.get("pending_payment")
+    if not pending or "received" not in pending:
+        await query.edit_message_text("Bu so'rov eskirgan. Buyurtmani qaytadan '✅ topshirildi' qiling.")
+        return
+    context.user_data["pending_payment"] = None
+    if query.data == "pc:no":
+        await query.edit_message_text(
+            "❌ Yozilmadi. Buyurtma hali topshirilmagan holatda turibdi.\n"
+            "Narx yoki tarkibni tekshirib, keyin qaytadan '✅ topshirildi' bosing."
+        )
+        return
+    result_text = await finalize_payment(
+        update.effective_user,
+        pending["guruh_id"],
+        pending["worker"],
+        pending["customer"],
+        pending["expected_value"],
+        pending["received"],
+        cash=pending["cash"],
+        bot=context.bot,
+    )
+    await query.edit_message_text(result_text)
+
+
+async def bq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    pending = context.user_data.pop("bq_pending", None)
+    if query.data == "bq:no" or not pending:
+        await query.edit_message_text("Bekor qilindi." if query.data == "bq:no" else "Bu so'rov eskirgan, buyruqni qayta yozing.")
+        return
+    cmd, args = pending
+    gid = int(args[0])
+    text = qaytdi_group_core(gid, update.effective_user)
+    await query.edit_message_text(text)
+    handlers = {"buyurtmaqoshish": buyurtmaqoshish, "buyurtmamodel": buyurtmamodel, "buyurtmatuzatish": buyurtmatuzatish}
+    context.args = args
+    context.user_data["_bq_replay"] = True
+    await handlers[cmd](_ReplayUpdate(update), context)
+    context.user_data.pop("_bq_replay", None)
+    await query.message.reply_text(
+        "✅ O'zgartirildi. Yana boshqa o'zgarish bo'lsa, buyruqni yozavering.\n"
+        "Mebel jo'natilganda pastdagi tugmani bosing:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Ombordan chiqdi", callback_data=f"chiqdi:{gid}")]]),
+    )
+
+
 def qaytdi_group_core(guruh_id: int, user) -> str:
     """'Ombordan chiqdi' ni bekor qiladi: mebelni omborga qaytaradi."""
     conn = get_conn()
@@ -11929,6 +12061,8 @@ def main():
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
     app.add_handler(CallbackQueryHandler(sanoq_callback, pattern=r"^sq:"))
+    app.add_handler(CallbackQueryHandler(bq_callback, pattern=r"^bq:"))
+    app.add_handler(CallbackQueryHandler(pc_callback, pattern=r"^pc:"))
     app.add_handler(CallbackQueryHandler(tolandi_sana_callback, pattern=r"^tls:"))
     app.add_handler(CallbackQueryHandler(kassa_olindi_callback, pattern=r"^ko:"))
     app.add_handler(CallbackQueryHandler(sanoq_fix_callback, pattern=r"^sqf:"))
