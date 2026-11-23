@@ -2319,7 +2319,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-23 (51) | 🆕 Buyurtma: komplektda krovat110/shkaf4eshik almashtirish"
+BOT_VERSION = "2026-11-23 (52) | AI zakaz kartasida narx"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8025,6 +8025,18 @@ def pending_card(pid):
     for e in entries:
         lines.append("• " + describe_entry(*e))
     lines.append(f"Muddat: {deadline_display}" if deadline else "Muddat: ❗ topilmadi")
+    if entries:
+        try:
+            pconn = get_conn()
+            total, missing = compute_rows_sale(
+                pconn.cursor(), [(m, i, a, mt, 1 if dastavka else 0) for m, i, a, mt in entries]
+            )
+            pconn.close()
+            lines.append(f"💰 Narxi: {format_money(total, 'usd')}" + (" (dastavka narxi)" if dastavka else ""))
+            if missing:
+                lines.append(f"⚠️ {missing} ta qatorga narx belgilanmagan (0 deb olindi)")
+        except Exception as e:
+            logger.warning("Karta narxi hisoblanmadi: %s", e)
     if izoh:
         lines.append(f"📝 Izoh: {izoh}")
     if dastavka:
@@ -10663,6 +10675,13 @@ def compute_order_sale_detail(guruh_id: int):
     cur = conn.cursor()
     cur.execute("SELECT model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ?", (guruh_id,))
     rows = cur.fetchall()
+    result = compute_rows_sale(cur, rows)
+    conn.close()
+    return result
+
+
+def compute_rows_sale(cur, rows):
+    """rows: [(model, item_or_None, amount, mod_type, dastavka)] -> (jami, narxsiz qatorlar soni)."""
     total = 0
     missing = 0
     for model, item, amount, mod_type, dastavka in rows:
@@ -10688,7 +10707,6 @@ def compute_order_sale_detail(guruh_id: int):
             total += rate * amount
         if not rate and mod_type != "+":
             missing += 1
-    conn.close()
     return total, missing
 
 
