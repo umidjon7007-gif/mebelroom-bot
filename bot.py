@@ -1587,8 +1587,10 @@ def ob_item_menu_text(ob):
     lines = [f"🆕 Buyurtma — {ob['model'].capitalize()}\n", "Detallarni tanlang (bir nechtasini tanlashingiz mumkin):"]
     if ob["komplekt"]:
         lines.append(f"\n✅ Komplekt: {ob['komplekt_qty']} ta")
+        for variant, q in ob.get("swaps", {}).items():
+            lines.append(f"   🔄 {UPGRADE_BASE_ITEM[variant]} o'rniga {variant}: {q} ta")
     if ob["items"]:
-        lines.append("\nTanlanganlar:")
+        lines.append("\nQo'shimcha detallar:" if ob["komplekt"] else "\nTanlanganlar:")
         for it, qty in ob["items"].items():
             lines.append(f"✅ {it}: {qty} ta")
     if ob.get("extra_items"):
@@ -1605,11 +1607,51 @@ def ob_item_keyboard(ob):
         label = f"✅ {it} ({ob['items'][it]})" if it in ob["items"] else it
         buttons.append([InlineKeyboardButton(label, callback_data=f"ob:item:{it}")])
     buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:komplekt")])
+    if ob["komplekt"] and ob_swap_variants(ob):
+        buttons.append([InlineKeyboardButton("🔄 Komplektda almashtirish", callback_data="ob:swap:menu")])
     buttons.append([InlineKeyboardButton("🔁 Boshqa modeldan qo'shish", callback_data="ob:othermodel")])
     if ob["items"] or ob.get("extra_items") or ob["komplekt"]:
         buttons.append([InlineKeyboardButton("➡️ Davom etish", callback_data="ob:items:done")])
     buttons.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="ob:cancel")])
     return InlineKeyboardMarkup(buttons)
+
+
+def ob_swap_variants(ob):
+    """Shu modelda bor almashtirish variantlari: ['krovat110', 'shkaf4eshik']."""
+    items = {i.lower() for i in ob.get("item_list", [])}
+    return [v for v, base in UPGRADE_BASE_ITEM.items() if v in items and base in items]
+
+
+def ob_swap_text(ob):
+    lines = [
+        f"🆕 Buyurtma — {ob['model'].capitalize()}",
+        f"📦 Komplekt: {ob['komplekt_qty']} ta",
+        "",
+        "Komplekt ichida almashtirish bormi?",
+        "(masalan oddiy krovat o'rniga 110 lik krovat)",
+    ]
+    for variant, q in ob.get("swaps", {}).items():
+        lines.append(f"✅ {UPGRADE_BASE_ITEM[variant]} o'rniga {variant}: {q} ta")
+    return "\n".join(lines)
+
+
+def ob_swap_keyboard(ob):
+    swaps = ob.get("swaps", {})
+    rows = []
+    for variant in ob_swap_variants(ob):
+        base = UPGRADE_BASE_ITEM[variant]
+        q = swaps.get(variant, 0)
+        if q:
+            rows.append([
+                InlineKeyboardButton("➖", callback_data=f"ob:swap:-:{variant}"),
+                InlineKeyboardButton(f"✅ {base} → {variant}: {q}", callback_data=f"ob:swap:+:{variant}"),
+                InlineKeyboardButton("➕", callback_data=f"ob:swap:+:{variant}"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(f"🔄 {base} o'rniga {variant}", callback_data=f"ob:swap:+:{variant}")])
+    rows.append([InlineKeyboardButton(
+        "✅ Tayyor" if swaps else "✅ Yo'q, oddiy komplekt", callback_data="ob:swap:done")])
+    return InlineKeyboardMarkup(rows)
 
 
 def ob_qty_keyboard():
@@ -1729,33 +1771,35 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = ob["model"]
     customer = ob["customer"]
 
-    entries = []  # (model, item_or_None, amount)
+    entries = []  # (model, item_or_None, amount, mod_type)
     if ob["komplekt"]:
-        entries.append((model, None, ob["komplekt_qty"]))
-    else:
-        for item, qty in ob["items"].items():
-            entries.append((model, item, qty))
+        entries.append((model, None, ob["komplekt_qty"], None))
+        for variant, qty in ob.get("swaps", {}).items():
+            if qty > 0:
+                entries.append((model, variant, qty, "+"))
+    for item, qty in ob["items"].items():
+        entries.append((model, item, qty, None))
     for (other_model, item), qty in ob.get("extra_items", {}).items():
-        entries.append((other_model, item, qty))
+        entries.append((other_model, item, qty, None))
 
     conn = get_conn()
     cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
     created = []
-    for entry_model, item, amount in entries:
+    for entry_model, item, amount, mod_type in entries:
         cur.execute(
             """
-            INSERT INTO orders (model, item, amount, deadline, deadline_display, customer, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
+            INSERT INTO orders (model, item, amount, mod_type, deadline, deadline_display, customer, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'kutilmoqda', ?)
             """,
-            (entry_model, item, amount, deadline.isoformat(), deadline_display, customer, now),
+            (entry_model, item, amount, mod_type, deadline.isoformat(), deadline_display, customer, now),
         )
-        created.append((cur.lastrowid, entry_model, item, amount))
+        created.append((cur.lastrowid, entry_model, item, amount, mod_type))
 
     guruh_id = created[0][0]
     cur.execute(
         f"UPDATE orders SET guruh_id = ? WHERE id IN ({','.join('?' for _ in created)})",
-        [guruh_id] + [oid for oid, _, _, _ in created],
+        [guruh_id] + [oid for oid, _, _, _, _ in created],
     )
     raqam = ob.get("raqam")
     if raqam:
@@ -1764,15 +1808,19 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if izoh:
         cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (izoh, guruh_id))
 
-    entries_4 = [(m, i, a, None) for m, i, a in entries]
+    entries_4 = list(entries)
     shortage_text = shortage_warning_for_new_order(cur, entries_4)
 
     conn.commit()
     conn.close()
 
-    what_all = ", ".join(
-        (f"{entry_model} komplekt" if item is None else f"{entry_model} {item} ({amount} ta)")
-        for _, entry_model, item, amount in created
+    what_all = "\n".join(
+        "• " + (
+            f"{entry_model} komplekt ({amount} ta)" if item is None
+            else f"🔄 {UPGRADE_BASE_ITEM.get(item, '')} o'rniga {item} ({amount} ta)" if mod_type == "+"
+            else f"{entry_model} {item} ({amount} ta)"
+        )
+        for _, entry_model, item, amount, mod_type in created
     )
     lines = [f"📝 Yangi buyurtma qabul qilindi — {order_label(guruh_id, raqam)}:", what_all]
     lines.append(f"Muddat: {deadline_display}")
@@ -1781,6 +1829,8 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if izoh:
         lines.append(f"📝 Izoh: {izoh}")
     lines.append("Holati: Kutilmoqda")
+    if is_owner(update):
+        lines.append(order_price_line(guruh_id).strip())
     if shortage_text:
         lines.append(shortage_text)
 
@@ -1915,19 +1965,46 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ob_show_item_menu(query, ob)
         return
 
+    if data == "ob:swap:menu":
+        await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
+        return
+
+    if data.startswith("ob:swap:+:") or data.startswith("ob:swap:-:"):
+        variant = data.split(":", 3)[3]
+        swaps = ob.setdefault("swaps", {})
+        q = swaps.get(variant, 0) + (1 if data.startswith("ob:swap:+:") else -1)
+        q = max(0, min(q, ob.get("komplekt_qty", 1)))
+        if q:
+            swaps[variant] = q
+        else:
+            swaps.pop(variant, None)
+        try:
+            await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
+        except BadRequest:
+            pass
+        return
+
+    if data == "ob:swap:done":
+        await ob_show_item_menu(query, ob)
+        return
+
     if data == "ob:qty:confirm":
         if ob["qty_mode"] == "komplekt":
             ob["komplekt"] = True
             ob["komplekt_qty"] = ob["qty_value"]
-            ob["items"] = {}
-            await ob_show_item_menu(query, ob)
+            swaps = ob.setdefault("swaps", {})
+            for v in list(swaps):
+                swaps[v] = min(swaps[v], ob["komplekt_qty"])
+            if ob_swap_variants(ob):
+                await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
+            else:
+                await ob_show_item_menu(query, ob)
         elif ob["qty_mode"] == "other_item":
             key = (ob["qty_other_model"], ob["qty_item"])
             ob["extra_items"][key] = ob["qty_value"]
             await ob_show_item_menu(query, ob)
         else:
             ob["items"][ob["qty_item"]] = ob["qty_value"]
-            ob["komplekt"] = False
             await ob_show_item_menu(query, ob)
         return
 
@@ -2242,7 +2319,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-23 (50) | yo'ldagi buyurtmani o'zgartirish himoyasi + katta farq ogohlantirishi"
+BOT_VERSION = "2026-11-23 (51) | 🆕 Buyurtma: komplektda krovat110/shkaf4eshik almashtirish"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
