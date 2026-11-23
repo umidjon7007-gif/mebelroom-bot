@@ -8410,7 +8410,9 @@ async def yozilmagan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
         return
-    await send_unwritten_list(context, update.effective_chat.id)
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("📋 Ro'yxatni shaxsiy chatga yubordim (unda narxlar bor).")
+    await send_unwritten_list(context, update.effective_user.id)
 
 
 async def gold_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
