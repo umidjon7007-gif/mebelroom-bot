@@ -1603,6 +1603,8 @@ def ob_item_menu_text(ob):
         lines.append(f"\n✅ Komplekt: {ob['komplekt_qty']} ta")
         for variant, q in ob.get("swaps", {}).items():
             lines.append(f"   🔄 {UPGRADE_BASE_ITEM[variant]} o'rniga {variant}: {q} ta")
+        for r in ob.get("removes", []):
+            lines.append(f"   ➖ {r}siz")
     if ob["items"]:
         lines.append("\nQo'shimcha detallar:" if ob["komplekt"] else "\nTanlanganlar:")
         for it, qty in ob["items"].items():
@@ -1621,8 +1623,8 @@ def ob_item_keyboard(ob):
         label = f"✅ {it} ({ob['items'][it]})" if it in ob["items"] else it
         buttons.append([InlineKeyboardButton(label, callback_data=f"ob:item:{it}")])
     buttons.append([InlineKeyboardButton("📦 Komplekt (barchasi)", callback_data="ob:komplekt")])
-    if ob["komplekt"] and ob_swap_variants(ob):
-        buttons.append([InlineKeyboardButton("🔄 Komplektda almashtirish", callback_data="ob:swap:menu")])
+    if ob["komplekt"]:
+        buttons.append([InlineKeyboardButton("🔄 Komplektda almashtirish / olib tashlash", callback_data="ob:swap:menu")])
     buttons.append([InlineKeyboardButton("🔁 Boshqa modeldan qo'shish", callback_data="ob:othermodel")])
     if ob["items"] or ob.get("extra_items") or ob["komplekt"]:
         buttons.append([InlineKeyboardButton("➡️ Davom etish", callback_data="ob:items:done")])
@@ -1641,11 +1643,13 @@ def ob_swap_text(ob):
         f"🆕 Buyurtma — {ob['model'].capitalize()}",
         f"📦 Komplekt: {ob['komplekt_qty']} ta",
         "",
-        "Komplekt ichida almashtirish bormi?",
-        "(masalan oddiy krovat o'rniga 110 lik krovat)",
+        "Komplekt ichida almashtirish yoki olib tashlash bormi?",
+        "(masalan oddiy krovat o'rniga 110 lik krovat, yoki kamodsiz)",
     ]
     for variant, q in ob.get("swaps", {}).items():
         lines.append(f"✅ {UPGRADE_BASE_ITEM[variant]} o'rniga {variant}: {q} ta")
+    for r in ob.get("removes", []):
+        lines.append(f"➖ {r}siz (hamma komplektdan)")
     return "\n".join(lines)
 
 
@@ -1663,8 +1667,13 @@ def ob_swap_keyboard(ob):
             ])
         else:
             rows.append([InlineKeyboardButton(f"🔄 {base} o'rniga {variant}", callback_data=f"ob:swap:+:{variant}")])
+    removes = ob.get("removes", [])
+    low = {i.lower() for i in ob.get("item_list", [])}
+    rm_btns = [InlineKeyboardButton(("✅ " if it in removes else "➖ ") + f"{it}siz", callback_data=f"ob:rm:{it}")
+               for it in KOMPLEKT_ITEMS if it in low]
+    rows += [rm_btns[i:i + 3] for i in range(0, len(rm_btns), 3)]
     rows.append([InlineKeyboardButton(
-        "✅ Tayyor" if swaps else "✅ Yo'q, oddiy komplekt", callback_data="ob:swap:done")])
+        "✅ Tayyor" if (swaps or removes) else "✅ Yo'q, oddiy komplekt", callback_data="ob:swap:done")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1798,6 +1807,8 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for variant, qty in ob.get("swaps", {}).items():
             if qty > 0:
                 entries.append((model, variant, qty, "+"))
+        for r in ob.get("removes", []):
+            entries.append((model, r, ob["komplekt_qty"], "-"))
     for item, qty in ob["items"].items():
         entries.append((model, item, qty, None))
     for (other_model, item), qty in ob.get("extra_items", {}).items():
@@ -1841,6 +1852,7 @@ async def ob_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• " + (
             f"{entry_model} komplekt ({amount} ta)" if item is None
             else f"🔄 {UPGRADE_BASE_ITEM.get(item, '')} o'rniga {item} ({amount} ta)" if mod_type == "+"
+            else f"➖ {item}siz" if mod_type == "-"
             else f"{entry_model} {item} ({amount} ta)"
         )
         for _, entry_model, item, amount, mod_type in created
@@ -2009,6 +2021,19 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    if data.startswith("ob:rm:"):
+        it = data[6:]
+        removes = ob.setdefault("removes", [])
+        if it in removes:
+            removes.remove(it)
+        elif it in KOMPLEKT_ITEMS:
+            removes.append(it)
+        try:
+            await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
+        except BadRequest:
+            pass
+        return
+
     if data == "ob:swap:done":
         await ob_show_item_menu(query, ob)
         return
@@ -2020,10 +2045,7 @@ async def ob_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             swaps = ob.setdefault("swaps", {})
             for v in list(swaps):
                 swaps[v] = min(swaps[v], ob["komplekt_qty"])
-            if ob_swap_variants(ob):
-                await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
-            else:
-                await ob_show_item_menu(query, ob)
+            await query.edit_message_text(ob_swap_text(ob), reply_markup=ob_swap_keyboard(ob))
         elif ob["qty_mode"] == "other_item":
             key = (ob["qty_other_model"], ob["qty_item"])
             ob["extra_items"][key] = ob["qty_value"]
@@ -2356,7 +2378,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-24 (58) | zakaz: bitta ekran, har qatorda ➕"
+BOT_VERSION = "2026-11-24 (59) | komplektdan olib tashlash; mijoz pulida buyurtma tarkibi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8449,6 +8471,8 @@ def zk_cart_lines(zk):
         if c["k"]:
             full = [ZK_SWAP_LABEL.get(v, v) for v, q in c["sw"].items() if q and q == c["k"]]
             lines.append(f"• {name} komplekt — {c['k']} ta" + (f" ({', '.join(full)} bilan)" if full else ""))
+            for r in c.get("rm", []):
+                lines.append(f"   ➖ {r}siz")
             for v, q in c["sw"].items():
                 if q and q != c["k"]:
                     lines.append(f"   ↳ shundan {q} tasi {ZK_SWAP_LABEL.get(v, v)} bilan")
@@ -8466,6 +8490,8 @@ def zk_entries(zk):
             for v, q in c["sw"].items():
                 if q:
                     out.append((model, v, q, "+"))
+            for r in c.get("rm", []):
+                out.append((model, r, c["k"], "-"))
         for it, q in c["it"].items():
             if q:
                 out.append((model, it, q, None))
@@ -8557,6 +8583,8 @@ def zk_grid_view(zk, note=None):
             rows.append([InlineKeyboardButton(f"📦 Komplekt (110 lik krovat bilan) — {sk} ta  ➕", callback_data="zk:a:k:k")])
         if "shkaf4eshik" in have:
             rows.append([InlineKeyboardButton(f"📦 Komplekt (4 eshikli shkaf bilan) — {ss} ta  ➕", callback_data="zk:a:k:s")])
+        if c["k"]:
+            rows.append([InlineKeyboardButton("➖ Komplektdan olib tashlash", callback_data="zk:rm")])
     items = zk["items"][model]
     order = sorted(range(len(items)), key=lambda i: (ZK_ITEM_ORDER.index(items[i]) if items[i] in ZK_ITEM_ORDER else 99, items[i]))
     for idx in order:
@@ -8570,6 +8598,20 @@ def zk_grid_view(zk, note=None):
         InlineKeyboardButton("🛏 Boshqa model", callback_data="zk:models"),
         InlineKeyboardButton("➡️ Tayyor", callback_data="zk:next"),
     ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def zk_rm_view(zk):
+    model = zk["model"]
+    c = zk["cart"][model]
+    rm = c.setdefault("rm", [])
+    lines = [f"➖ {model.capitalize()} komplektidan qaysi detal kerak emas?",
+             f"({c['k']} ta komplektning hammasidan olib tashlanadi; bosish — yoqish/o'chirish)"]
+    lines += zk_cart_block(zk)
+    rows = []
+    for it in KOMPLEKT_ITEMS:
+        rows.append([InlineKeyboardButton(("✅ " if it in rm else "") + f"{it}siz", callback_data=f"zk:r:{it}")])
+    rows.append([InlineKeyboardButton("✅ Tayyor", callback_data="zk:more")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
@@ -8887,6 +8929,19 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zk.setdefault("hist", []).append(("d", model, 1, it))
         await zk_edit(query, zk_grid_view(zk))
         return
+    if data == "zk:rm" and zk.get("model"):
+        await zk_edit(query, zk_rm_view(zk))
+        return
+    if data.startswith("zk:r:") and zk.get("model"):
+        it = data[5:]
+        c = zk["cart"].setdefault(zk["model"], {"k": 0, "sw": {}, "it": {}})
+        rm = c.setdefault("rm", [])
+        if it in rm:
+            rm.remove(it)
+        elif it in KOMPLEKT_ITEMS:
+            rm.append(it)
+        await zk_edit(query, zk_rm_view(zk))
+        return
     if data == "zk:clear":
         zk["cart"] = {}
         zk["hist"] = []
@@ -8934,6 +8989,8 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if c:
                 if kind == "k":
                     c["k"] = max(0, c["k"] - n)
+                    if not c["k"]:
+                        c["rm"] = []
                     for v, q in extra.items():
                         c["sw"][v] = max(0, c["sw"].get(v, 0) - q)
                 else:
@@ -10045,6 +10102,35 @@ def worker_telegram_id(cur, worker):
     return row[0] if row else None
 
 
+def order_short_desc(cur, guruh_id):
+    """Buyurtma tarkibi bir qatorda: 'Maya komplekt ×2 (110 lik krovat), Maya krovat 110 lik ×2'."""
+    if guruh_id is None:
+        return ""
+    cur.execute(
+        "SELECT model, item, amount, mod_type, customer FROM orders WHERE guruh_id = ? ORDER BY id", (guruh_id,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return ""
+    parts, extras = [], {}
+    for model, item, amount, mod_type, _ in rows:
+        if mod_type == "+":
+            extras.setdefault(model, []).append(ZK_SWAP_LABEL.get(item, item))
+        elif mod_type == "-":
+            extras.setdefault(model, []).append(f"{item}siz")
+    for model, item, amount, mod_type, _ in rows:
+        if mod_type in ("+", "-"):
+            continue
+        name = model.capitalize()
+        if item is None:
+            ex = extras.get(model)
+            parts.append(f"{name} komplekt ×{amount}" + (f" ({', '.join(ex)})" if ex else ""))
+        else:
+            parts.append(f"{name} {ZK_PRETTY.get(item, item)} ×{amount}")
+    cust = rows[0][4]
+    return ("🏪 " + cust + ": " if cust else "") + ", ".join(parts)
+
+
 def mijoz_puli_lines(cur, worker, header):
     """Ishchi qo'lidagi mijoz puli va oxirgi olingan pullar ro'yxati."""
     bal = kassa_balance(cur, worker)
@@ -10077,6 +10163,9 @@ def mijoz_puli_lines(cur, worker, header):
         lines += ["", "📥 Mijozlardan olingan (oxirgilari):"]
         for gid, c, a, d, tashqi in recent:
             lines.append(f"   №{tashqi or gid} — {fmt_cash(c, a)} ({dm(d)})")
+            what = order_short_desc(cur, gid)
+            if what:
+                lines.append(f"      {what}")
     if given:
         lines += ["", "📤 Berilgan (oxirgilari):"]
         for t, c, a, d in given:
