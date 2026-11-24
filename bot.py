@@ -860,6 +860,9 @@ async def buyurtmaguruhi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0] == "zakaz":
+        await zk_start(update, context)
+        return
     text = (
         "Assalomu alaykum! Men zaxira botiman.\n\n"
         "Pastdagi tugmalardan foydalanishingiz mumkin, yoki buyruqlarni "
@@ -2090,6 +2093,10 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = (update.message.text or "").strip()
 
+    if awaiting in ("zk_izoh", "zk_sana"):
+        await zk_text(update, context, awaiting, text)
+        return
+
     if awaiting == "buyurtma_customer":
         ob = context.user_data.get("ob")
         if ob is None:
@@ -2349,7 +2356,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-23 (53) | viloyat narxi = sotish − chegirma ($), 🆕 Buyurtmada viloyat savoli"
+BOT_VERSION = "2026-11-24 (54) | do'kon uchun 🆕 Zakaz berish tugmasi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -2421,31 +2428,7 @@ async def komplektlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def tayyor_modellar_text():
     """Do'konlar uchun: hozir sotish mumkin bo'lgan (band qilinmagan, krovati boshli) to'liq komplektlar."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT model, item, quantity FROM products")
-    stock = {}
-    for m, i, q in cur.fetchall():
-        stock[(m.lower(), i.lower())] = q
-    demand = {(m.lower(), i.lower()): q for (m, i), q in compute_all_pending_demand(cur).items()}
-    models = sorted({m for m, _ in stock})
-    ready = []
-    for model in models:
-        if any((model, it) not in stock for it in KOMPLEKT_ITEMS):
-            continue
-        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ? COLLATE NOCASE", (model,))
-        per_item = {i.lower(): (s or 1) for i, s in cur.fetchall()}
-        counts = []
-        for it in KOMPLEKT_ITEMS:
-            have = max(stock.get((model, it), 0), 0)
-            if it == "krovat":
-                have = min(have, spinka_get(cur, model, "krovat"))
-            free = have - demand.get((model, it), 0)
-            counts.append(max(free, 0) // max(per_item.get(it, 1), 1))
-        n = min(counts)
-        if n > 0:
-            ready.append((n, model))
-    conn.close()
+    ready = [(n, model) for model, n in tayyor_counts().items() if n > 0]
     ready.sort(key=lambda x: (-x[0], x[1]))
     when = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y, %H:%M")
     if not ready:
@@ -8360,6 +8343,530 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_group_reaction(context, source_chat_id, source_message_id, "👍")
 
 
+# ---------------------------------------------------------------------------
+# 🆕 DO'KON ZAKAZI: guruhdagi tugma -> shaxsiy chatda tugmalar bilan zakaz -> guruhga matn + egaga tasdiq
+# ---------------------------------------------------------------------------
+ZK_WEEKDAYS = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+ZK_OYLAR = {v: k for k, v in MONTH_NAMES.items()}
+
+
+def zk_store_name():
+    return (get_setting("order_intake_customer") or "").strip() or "Mebel For Home"
+
+
+def zk_group_id():
+    raw = get_setting("order_intake_group_id")
+    if raw and raw.lstrip("-").isdigit():
+        return int(raw)
+    return GROUP_CHAT_ID
+
+
+def _zk_num(raqam):
+    r = (raqam or "").strip()
+    if r.isdigit() and not r.startswith("0") and len(r) <= 5:
+        return int(r)
+    return None
+
+
+def zk_next_number(cur, reserve=False):
+    """Do'kon zakazlarining navbatdagi raqami (0 bilan boshlanadigan shaxsiy raqamlar hisobga olinmaydi)."""
+    store = zk_store_name()
+    nums = []
+    cur.execute(
+        "SELECT DISTINCT tashqi_raqam FROM orders WHERE tashqi_raqam IS NOT NULL AND LOWER(customer) = LOWER(?)",
+        (store,),
+    )
+    nums += [n for n in (_zk_num(r[0]) for r in cur.fetchall()) if n]
+    cur.execute(
+        "SELECT DISTINCT tashqi_raqam FROM pending_group_orders WHERE tashqi_raqam IS NOT NULL "
+        "AND (customer IS NULL OR customer = '' OR LOWER(customer) = LOWER(?))",
+        (store,),
+    )
+    nums += [n for n in (_zk_num(r[0]) for r in cur.fetchall()) if n]
+    cur.execute("SELECT value FROM settings WHERE key = 'zakaz_raqam_keyingi'")
+    row = cur.fetchone()
+    forced = int(row[0]) if row and str(row[0]).isdigit() else 0
+    nxt = max((max(nums) + 1) if nums else 1, forced)
+    if reserve:
+        cur.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('zakaz_raqam_keyingi', ?)", (str(nxt + 1),)
+        )
+    return nxt
+
+
+def tayyor_counts():
+    """{model: tayyor komplekt soni} - faqat to'liq komplekt detallari bor modellar uchun."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT model, item, quantity FROM products")
+    stock = {}
+    for m, i, q in cur.fetchall():
+        stock[(m.lower(), i.lower())] = q
+    demand = {(m.lower(), i.lower()): q for (m, i), q in compute_all_pending_demand(cur).items()}
+    out = {}
+    for model in sorted({m for m, _ in stock}):
+        if any((model, it) not in stock for it in KOMPLEKT_ITEMS):
+            continue
+        cur.execute("SELECT item, soni FROM komplekt_tarkibi WHERE model = ? COLLATE NOCASE", (model,))
+        per_item = {i.lower(): (s or 1) for i, s in cur.fetchall()}
+        counts = []
+        for it in KOMPLEKT_ITEMS:
+            have = max(stock.get((model, it), 0), 0)
+            if it == "krovat":
+                have = min(have, spinka_get(cur, model, "krovat"))
+            free = have - demand.get((model, it), 0)
+            counts.append(max(free, 0) // max(per_item.get(it, 1), 1))
+        out[model] = min(counts)
+    conn.close()
+    return out
+
+
+async def zk_allowed(update, context) -> bool:
+    if is_member(update):
+        return True
+    gid = zk_group_id()
+    user = update.effective_user
+    if not gid or not user:
+        return False
+    try:
+        member = await context.bot.get_chat_member(gid, user.id)
+        return member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        logger.warning("Zakaz huquqini tekshirib bo'lmadi: %s", e)
+        return False
+
+
+def zk_cart_lines(zk):
+    lines = []
+    for model, c in zk["cart"].items():
+        name = model.capitalize()
+        if c["k"]:
+            lines.append(f"• {name} komplekt — {c['k']} ta")
+            for v, q in c["sw"].items():
+                if q:
+                    lines.append(f"   🔄 {UPGRADE_BASE_ITEM[v]} o'rniga {v} — {q} ta")
+        for it, q in c["it"].items():
+            if q:
+                lines.append(f"• {name} {it} — {q} ta" + (" (qo'shimcha)" if c["k"] else ""))
+    return lines
+
+
+def zk_entries(zk):
+    out = []
+    for model, c in zk["cart"].items():
+        if c["k"]:
+            out.append((model, None, c["k"], None))
+            for v, q in c["sw"].items():
+                if q:
+                    out.append((model, v, q, "+"))
+        for it, q in c["it"].items():
+            if q:
+                out.append((model, it, q, None))
+    return out
+
+
+def zk_price(zk):
+    entries = zk_entries(zk)
+    if not entries:
+        return 0, 0
+    conn = get_conn()
+    try:
+        return compute_rows_sale(conn.cursor(), [(m, i, a, mt, 1 if zk.get("dastavka") else 0) for m, i, a, mt in entries])
+    finally:
+        conn.close()
+
+
+def zk_models_view(zk):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT model FROM products ORDER BY model")
+    models = [r[0] for r in cur.fetchall()]
+    conn.close()
+    counts = tayyor_counts()
+    lines = ["🆕 Zakaz — modelni tanlang", "(✅ — hozir tayyor turgan komplektlar soni)"]
+    cart = zk_cart_lines(zk)
+    if cart:
+        lines += ["", "🛒 Tanlanganlar:"] + cart
+    buttons = []
+    for m in models:
+        n = counts.get(m.lower())
+        label = m.capitalize() if n is None else (f"{m.capitalize()} ✅ {n}" if n > 0 else f"{m.capitalize()} ⏳ 0")
+        buttons.append(InlineKeyboardButton(label, callback_data=f"zk:m:{m}"[:64]))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if cart:
+        rows.append([InlineKeyboardButton("➡️ Davom etish", callback_data="zk:next")])
+    rows.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="zk:cancel")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def zk_items_view(zk):
+    model = zk["model"]
+    c = zk["cart"].setdefault(model, {"k": 0, "sw": {}, "it": {}})
+    items = zk["items"][model]
+    low = {i.lower() for i in items}
+    has_komplekt = all(it in low for it in KOMPLEKT_ITEMS)
+    n = tayyor_counts().get(model.lower())
+    head = f"🆕 Zakaz — {model.capitalize()}" + (f" (✅ {n} ta tayyor)" if n is not None else "")
+    lines = [head, "➕ / ➖ bilan sonini tering."]
+    if has_komplekt:
+        lines.append("📦 Komplekt = shkaf, krovat, kamod, parta, tumba. Alohida detallar — qo'shimcha.")
+    cart = zk_cart_lines(zk)
+    if cart:
+        lines += ["", "🛒 Tanlanganlar:"] + cart
+    rows = []
+    if has_komplekt:
+        rows.append([
+            InlineKeyboardButton("➖", callback_data="zk:k:-"),
+            InlineKeyboardButton(f"{'✅ ' if c['k'] else ''}📦 Komplekt: {c['k']}", callback_data="zk:k:+"),
+            InlineKeyboardButton("➕", callback_data="zk:k:+"),
+        ])
+        if c["k"]:
+            for v, base in UPGRADE_BASE_ITEM.items():
+                if v in low and base in low:
+                    q = c["sw"].get(v, 0)
+                    rows.append([
+                        InlineKeyboardButton("➖", callback_data=f"zk:s:-:{v}"),
+                        InlineKeyboardButton(f"{'✅' if q else '🔄'} {base} → {v}: {q}", callback_data=f"zk:s:+:{v}"),
+                        InlineKeyboardButton("➕", callback_data=f"zk:s:+:{v}"),
+                    ])
+    for idx, it in enumerate(items):
+        q = c["it"].get(it, 0)
+        rows.append([
+            InlineKeyboardButton("➖", callback_data=f"zk:i:-:{idx}"),
+            InlineKeyboardButton(f"{'✅ ' if q else ''}{it}: {q}", callback_data=f"zk:i:+:{idx}"),
+            InlineKeyboardButton("➕", callback_data=f"zk:i:+:{idx}"),
+        ])
+    rows.append([InlineKeyboardButton("🛒 Boshqa model qo'shish", callback_data="zk:models")])
+    rows.append([
+        InlineKeyboardButton("➡️ Davom etish", callback_data="zk:next"),
+        InlineKeyboardButton("❌ Bekor", callback_data="zk:cancel"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def zk_vil_view(zk):
+    lines = ["🆕 Zakaz", "", "🛒 Tanlanganlar:"] + zk_cart_lines(zk) + ["", "🚛 Viloyatga ketadimi?"]
+    return "\n".join(lines), InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚛 Ha, viloyatga", callback_data="zk:v:1"),
+         InlineKeyboardButton("🏠 Yo'q", callback_data="zk:v:0")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:back")],
+    ])
+
+
+def zk_date_view(zk):
+    today = datetime.now(TASHKENT_TZ).date()
+    buttons = []
+    for i in range(0, 15):
+        d = today + timedelta(days=i)
+        label = "Bugun" if i == 0 else ("Ertaga" if i == 1 else f"{d.day:02d}.{d.month:02d} {ZK_WEEKDAYS[d.weekday()]}")
+        buttons.append(InlineKeyboardButton(label, callback_data=f"zk:d:{d.isoformat()}"))
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("📅 Boshqa sana (yozaman)", callback_data="zk:d:other")])
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:back")])
+    return "📅 Muddat — qachon kerak?", InlineKeyboardMarkup(rows)
+
+
+def zk_izoh_view():
+    return (
+        "📝 Izoh bormi? (masalan: rangi, o'lchami, polka qo'shish)\n"
+        "Yozib yuboring yoki tugmani bosing.",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Izohsiz", callback_data="zk:izoh:none")]]),
+    )
+
+
+def zk_deadline_display(d):
+    return f"{d.day} {ZK_OYLAR[d.month]}"
+
+
+def zk_summary_view(zk):
+    d = date.fromisoformat(zk["deadline"])
+    total, missing = zk_price(zk)
+    lines = ["📝 Zakazingizni tekshiring:", "", f"🏪 {zk_store_name()}"] + zk_cart_lines(zk)
+    lines.append(f"📅 Muddat: {zk_deadline_display(d)}")
+    if zk.get("dastavka"):
+        lines.append("🚛 Viloyatga")
+    if zk.get("izoh"):
+        lines.append(f"📝 Izoh: {zk['izoh']}")
+    lines.append(f"💰 Narxi: {format_money(total, 'usd')}" + (" (viloyat narxi)" if zk.get("dastavka") else ""))
+    if missing:
+        lines.append("⚠️ Ba'zi detallarga narx belgilanmagan — narx keyin aniqlashtiriladi.")
+    return "\n".join(lines), InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yuborish", callback_data="zk:send")],
+        [InlineKeyboardButton("✏️ O'zgartirish", callback_data="zk:models"),
+         InlineKeyboardButton("❌ Bekor", callback_data="zk:cancel")],
+    ])
+
+
+async def zk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        await zk_group_button(update, context)
+        return
+    if not await zk_allowed(update, context):
+        await update.message.reply_text(
+            "Kechirasiz, zakaz berish faqat do'kon guruhi a'zolari uchun. Guruh egasiga murojaat qiling."
+        )
+        return
+    context.user_data["awaiting"] = None
+    context.user_data["zk"] = {"cart": {}, "items": {}, "model": None}
+    text, kb = zk_models_view(context.user_data["zk"])
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def zk_group_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guruhda /zakaz - shaxsiy chatga olib o'tadigan tugma."""
+    username = context.bot.username
+    await update.effective_message.reply_text(
+        "🆕 Zakaz berish uchun tugmani bosing (bot bilan shaxsiy chat ochiladi):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🆕 Zakaz berish", url=f"https://t.me/{username}?start=zakaz")]]),
+    )
+
+
+async def zakaztugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ega: do'kon guruhiga '🆕 Zakaz berish' tugmali xabar yuboradi va qadab qo'yishga urinadi."""
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    gid = zk_group_id()
+    if not gid:
+        await update.message.reply_text("Zakaz guruhi belgilanmagan. Guruh ichida /buyurtmaguruhi yuboring.")
+        return
+    username = context.bot.username
+    msg = await context.bot.send_message(
+        chat_id=gid,
+        text=(
+            "🆕 ZAKAZ BERISH\n\n"
+            "Pastdagi tugmani bosing — bot bilan shaxsiy chat ochiladi.\n"
+            "U yerda model, detallar, muddatni tugmalar bilan tanlaysiz va narxini ko'rasiz.\n"
+            "Zakaz raqami avtomatik beriladi va shu guruhga chiqadi."
+        ),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🆕 Zakaz berish", url=f"https://t.me/{username}?start=zakaz")]]),
+    )
+    pinned = False
+    try:
+        await context.bot.pin_chat_message(chat_id=gid, message_id=msg.message_id, disable_notification=True)
+        pinned = True
+    except Exception as e:
+        logger.warning("Zakaz tugmasi qadalmadi: %s", e)
+    await update.message.reply_text(
+        "✅ Guruhga '🆕 Zakaz berish' tugmasi yuborildi"
+        + (" va qadab qo'yildi." if pinned else ".\n⚠️ Qadab qo'yolmadim (bot guruhda admin emas) — xabarni o'zingiz qadang.")
+    )
+
+
+async def zakazraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = context.args or []
+    if args and args[0].isdigit() and int(args[0]) > 0:
+        set_setting("zakaz_raqam_keyingi", str(int(args[0])))
+    conn = get_conn()
+    nxt = zk_next_number(conn.cursor())
+    conn.close()
+    await update.message.reply_text(
+        f"🔢 Keyingi do'kon zakazi raqami: №{nxt}\n\n"
+        "O'zgartirish: /zakazraqam <raqam>  (masalan /zakazraqam 75)\n"
+        "(0 bilan boshlanadigan shaxsiy mijoz raqamlari hisobga olinmaydi.)"
+    )
+
+
+async def zk_edit(query, view):
+    text, kb = view
+    try:
+        await query.edit_message_text(text, reply_markup=kb)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    zk = context.user_data.get("zk")
+    data = query.data
+    if zk is None:
+        if data == "zk:new":
+            if not await zk_allowed(update, context):
+                await query.edit_message_text("Kechirasiz, zakaz berish faqat do'kon guruhi a'zolari uchun.")
+                return
+            context.user_data["zk"] = {"cart": {}, "items": {}, "model": None}
+            text, kb = zk_models_view(context.user_data["zk"])
+            await query.message.reply_text(text, reply_markup=kb)
+            return
+        await query.edit_message_text("Bu zakaz oynasi eskirgan. Guruhdagi '🆕 Zakaz berish' tugmasini qayta bosing.")
+        return
+
+    if data == "zk:cancel":
+        context.user_data["zk"] = None
+        context.user_data["awaiting"] = None
+        await query.edit_message_text("❌ Zakaz bekor qilindi.")
+        return
+    if data == "zk:models":
+        context.user_data["awaiting"] = None
+        await zk_edit(query, zk_models_view(zk))
+        return
+    if data.startswith("zk:m:"):
+        model = data[5:]
+        if model not in zk["items"]:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT item FROM products WHERE model = ? ORDER BY item", (model,))
+            zk["items"][model] = [r[0] for r in cur.fetchall()]
+            conn.close()
+        zk["model"] = model
+        await zk_edit(query, zk_items_view(zk))
+        return
+    if data.startswith(("zk:k:", "zk:s:", "zk:i:")) and zk.get("model"):
+        c = zk["cart"].setdefault(zk["model"], {"k": 0, "sw": {}, "it": {}})
+        parts = data.split(":")
+        delta = 1 if parts[2] == "+" else -1
+        if parts[1] == "k":
+            c["k"] = max(0, c["k"] + delta)
+            for v in list(c["sw"]):
+                c["sw"][v] = min(c["sw"][v], c["k"])
+        elif parts[1] == "s":
+            v = parts[3]
+            c["sw"][v] = max(0, min(c["sw"].get(v, 0) + delta, c["k"]))
+        else:
+            it = zk["items"][zk["model"]][int(parts[3])]
+            c["it"][it] = max(0, c["it"].get(it, 0) + delta)
+        await zk_edit(query, zk_items_view(zk))
+        return
+    if data == "zk:next":
+        if not zk_entries(zk):
+            text, kb = zk_items_view(zk) if zk.get("model") else zk_models_view(zk)
+            await zk_edit(query, (text + "\n\n⚠️ Hali hech narsa tanlanmadi — ➕ bilan son tering.", kb))
+            return
+        await zk_edit(query, zk_vil_view(zk))
+        return
+    if data == "zk:back":
+        await zk_edit(query, zk_items_view(zk) if zk.get("model") else zk_models_view(zk))
+        return
+    if data.startswith("zk:v:"):
+        zk["dastavka"] = data.endswith("1")
+        await zk_edit(query, zk_date_view(zk))
+        return
+    if data == "zk:d:other":
+        context.user_data["awaiting"] = "zk_sana"
+        await query.edit_message_text("📅 Sanani kun.oy ko'rinishida yozing, masalan: 05.12")
+        return
+    if data.startswith("zk:d:"):
+        zk["deadline"] = data[5:]
+        context.user_data["awaiting"] = "zk_izoh"
+        await zk_edit(query, zk_izoh_view())
+        return
+    if data == "zk:izoh:none":
+        zk["izoh"] = None
+        context.user_data["awaiting"] = None
+        await zk_edit(query, zk_summary_view(zk))
+        return
+    if data == "zk:send":
+        await zk_send(update, context, query, zk)
+        return
+
+
+async def zk_text(update: Update, context: ContextTypes.DEFAULT_TYPE, awaiting: str, text: str):
+    zk = context.user_data.get("zk")
+    if zk is None:
+        context.user_data["awaiting"] = None
+        return
+    if awaiting == "zk_sana":
+        try:
+            d = parse_kun_oy(text)
+            today = datetime.now(TASHKENT_TZ).date()
+            if d < today:
+                d = d.replace(year=d.year + 1)
+        except (ValueError, IndexError):
+            await update.message.reply_text("Sanani tushunmadim. Masalan: 05.12")
+            return
+        zk["deadline"] = d.isoformat()
+        context.user_data["awaiting"] = "zk_izoh"
+        text_, kb = zk_izoh_view()
+        await update.message.reply_text(f"📅 Muddat: {zk_deadline_display(d)}\n\n" + text_, reply_markup=kb)
+        return
+    if awaiting == "zk_izoh":
+        zk["izoh"] = text[:300]
+        context.user_data["awaiting"] = None
+        text_, kb = zk_summary_view(zk)
+        await update.message.reply_text(text_, reply_markup=kb)
+
+
+async def zk_send(update, context, query, zk):
+    entries = zk_entries(zk)
+    if not entries or not zk.get("deadline"):
+        await query.edit_message_text("Zakaz to'liq emas. Guruhdagi tugmani qayta bosing.")
+        context.user_data["zk"] = None
+        return
+    d = date.fromisoformat(zk["deadline"])
+    display = zk_deadline_display(d)
+    store = zk_store_name()
+    seller = update.effective_user.full_name if update.effective_user else "?"
+    gid = zk_group_id()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    raqam = str(zk_next_number(cur, reserve=True))
+    group_lines = [f"🆕 Zakaz №{raqam}", f"🏪 {store} · ✍️ {seller}", ""] + zk_cart_lines(zk)
+    group_lines.append(f"📅 Muddat: {display}")
+    if zk.get("dastavka"):
+        group_lines.append("🚛 Viloyatga")
+    if zk.get("izoh"):
+        group_lines.append(f"📝 Izoh: {zk['izoh']}")
+    group_text = "\n".join(group_lines)
+    main_model = entries[0][0]
+    cur.execute(
+        """
+        INSERT INTO pending_group_orders
+            (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id,
+             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'kutilmoqda', ?, ?, ?, ?, NULL, NULL)
+        """,
+        (
+            main_model,
+            json.dumps([[it, am, mt, m] for m, it, am, mt in entries]),
+            d.isoformat(), display, store, group_text, gid,
+            datetime.now(TASHKENT_TZ).isoformat(timespec="seconds"),
+            raqam, zk.get("izoh"), 1 if zk.get("dastavka") else 0,
+        ),
+    )
+    pid = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    posted_ok = False
+    if gid:
+        try:
+            msg = await context.bot.send_message(chat_id=gid, text=group_text)
+            posted_ok = True
+            conn = get_conn()
+            conn.execute("UPDATE pending_group_orders SET source_message_id = ? WHERE id = ?", (msg.message_id, pid))
+            conn.commit()
+            conn.close()
+            await set_group_reaction(context, gid, msg.message_id, "👀")
+        except Exception as e:
+            logger.warning("Zakaz guruhga yuborilmadi: %s", e)
+
+    if OWNER_ID is not None:
+        try:
+            card_text, kb = pending_card(pid)
+            card_text = card_text.replace("🔔 Guruhda yangi zakaz", f"🔔 Yangi zakaz (tugma orqali, {seller})", 1)
+            await context.bot.send_message(chat_id=OWNER_ID, text=card_text, reply_markup=kb)
+        except Exception as e:
+            logger.warning("Zakaz kartasi egaga yuborilmadi: %s", e)
+
+    context.user_data["zk"] = None
+    context.user_data["awaiting"] = None
+    await query.edit_message_text(
+        f"✅ Zakaz №{raqam} yuborildi!\n\n" + "\n".join(zk_cart_lines(zk)) + f"\n📅 Muddat: {display}\n\n"
+        + ("Guruhga chiqdi. " if posted_ok else "")
+        + "Tasdiqlangach ishga tushadi.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆕 Yana zakaz", callback_data="zk:new")]]),
+    )
+
+
 def close_already_written_pendings():
     """Raqami botda allaqachon bor kutilayotgan guruh xabarlarini 'yozilgan' deb yopadi."""
     conn = get_conn()
@@ -12077,7 +12584,7 @@ def main():
             from telegram import BotCommand, BotCommandScopeAllGroupChats
 
             await application.bot.set_my_commands(
-                [BotCommand("tayyor", "Hozir tayyor komplektlar")],
+                [BotCommand("tayyor", "Hozir tayyor komplektlar"), BotCommand("zakaz", "🆕 Zakaz berish")],
                 scope=BotCommandScopeAllGroupChats(),
             )
         except Exception as e:
@@ -12087,6 +12594,10 @@ def main():
     app.add_handler(CommandHandler(["start", "yordam", "help"], start))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("buyurtmaguruhi", buyurtmaguruhi))
+    app.add_handler(CommandHandler("zakaz", zk_start))
+    app.add_handler(CommandHandler("zakaztugma", zakaztugma))
+    app.add_handler(CommandHandler("zakazraqam", zakazraqam))
+    app.add_handler(CallbackQueryHandler(zk_callback, pattern=r"^zk:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['qoldiq']}$"), qoldiq))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['buyurtmalar']}$"), buyurtmalar))
