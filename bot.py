@@ -2356,7 +2356,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-24 (54) | do'kon uchun 🆕 Zakaz berish tugmasi"
+BOT_VERSION = "2026-11-24 (55) | zakaz oynasi soddalashtirildi, /zakaz javobi o'chadi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8347,6 +8347,7 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🆕 DO'KON ZAKAZI: guruhdagi tugma -> shaxsiy chatda tugmalar bilan zakaz -> guruhga matn + egaga tasdiq
 # ---------------------------------------------------------------------------
 ZK_WEEKDAYS = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+ZK_SWAP_LABEL = {"krovat110": "110 lik krovat", "shkaf4eshik": "4 eshikli shkaf"}
 ZK_OYLAR = {v: k for k, v in MONTH_NAMES.items()}
 
 
@@ -8444,7 +8445,7 @@ def zk_cart_lines(zk):
             lines.append(f"• {name} komplekt — {c['k']} ta")
             for v, q in c["sw"].items():
                 if q:
-                    lines.append(f"   🔄 {UPGRADE_BASE_ITEM[v]} o'rniga {v} — {q} ta")
+                    lines.append(f"   🔄 {ZK_SWAP_LABEL.get(v, v)} (komplekt ichida) — {q} ta")
         for it, q in c["it"].items():
             if q:
                 lines.append(f"• {name} {it} — {q} ta" + (" (qo'shimcha)" if c["k"] else ""))
@@ -8507,26 +8508,32 @@ def zk_items_view(zk):
     has_komplekt = all(it in low for it in KOMPLEKT_ITEMS)
     n = tayyor_counts().get(model.lower())
     head = f"🆕 Zakaz — {model.capitalize()}" + (f" (✅ {n} ta tayyor)" if n is not None else "")
-    lines = [head, "➕ / ➖ bilan sonini tering."]
+    lines = [head, ""]
     if has_komplekt:
-        lines.append("📦 Komplekt = shkaf, krovat, kamod, parta, tumba. Alohida detallar — qo'shimcha.")
+        lines.append("📦 Komplekt — to'liq to'plam: shkaf, krovat, kamod, parta, tumba")
+        lines.append("🔄 110 lik krovat / 4 eshikli shkaf — komplekt ichidagisini almashtirish")
+        lines.append("➕ Pastdagi detallar — komplektdan tashqari, alohida")
+    else:
+        lines.append("➕ / ➖ bilan sonini tering.")
     cart = zk_cart_lines(zk)
     if cart:
         lines += ["", "🛒 Tanlanganlar:"] + cart
     rows = []
     if has_komplekt:
+        rows.append([InlineKeyboardButton(
+            f"{'✅ ' if c['k'] else ''}📦 Komplekt: {c['k']} ta", callback_data="zk:k:+")])
         rows.append([
             InlineKeyboardButton("➖", callback_data="zk:k:-"),
-            InlineKeyboardButton(f"{'✅ ' if c['k'] else ''}📦 Komplekt: {c['k']}", callback_data="zk:k:+"),
             InlineKeyboardButton("➕", callback_data="zk:k:+"),
         ])
         if c["k"]:
             for v, base in UPGRADE_BASE_ITEM.items():
                 if v in low and base in low:
                     q = c["sw"].get(v, 0)
+                    rows.append([InlineKeyboardButton(
+                        f"{'✅' if q else '🔄'} {ZK_SWAP_LABEL.get(v, v)}: {q} ta", callback_data=f"zk:s:+:{v}")])
                     rows.append([
                         InlineKeyboardButton("➖", callback_data=f"zk:s:-:{v}"),
-                        InlineKeyboardButton(f"{'✅' if q else '🔄'} {base} → {v}: {q}", callback_data=f"zk:s:+:{v}"),
                         InlineKeyboardButton("➕", callback_data=f"zk:s:+:{v}"),
                     ])
     for idx, it in enumerate(items):
@@ -8616,11 +8623,26 @@ async def zk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def zk_group_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guruhda /zakaz - shaxsiy chatga olib o'tadigan tugma."""
     username = context.bot.username
-    await update.effective_message.reply_text(
-        "🆕 Zakaz berish uchun tugmani bosing (bot bilan shaxsiy chat ochiladi):",
+    sent = await update.effective_message.reply_text(
+        "🆕 Zakaz berish uchun tugmani bosing 👇\n(bu xabar 1 daqiqada o'chadi)",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
             "🆕 Zakaz berish", url=f"https://t.me/{username}?start=zakaz")]]),
     )
+    chat = update.effective_chat
+    if chat and chat.type != "private" and context.job_queue is not None:
+        ids = [sent.message_id]
+        if update.effective_message:
+            ids.append(update.effective_message.message_id)
+        context.job_queue.run_once(zk_delete_job, 60, data=(chat.id, ids))
+
+
+async def zk_delete_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, ids = context.job.data
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception as e:
+            logger.info("Xabar o'chirilmadi (%s): %s", mid, e)
 
 
 async def zakaztugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8633,17 +8655,22 @@ async def zakaztugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Zakaz guruhi belgilanmagan. Guruh ichida /buyurtmaguruhi yuboring.")
         return
     username = context.bot.username
+    old = get_setting("zakaz_tugma_msg")
+    old_deleted = None
+    if old and old.isdigit():
+        try:
+            await context.bot.delete_message(chat_id=gid, message_id=int(old))
+            old_deleted = True
+        except Exception as e:
+            logger.info("Eski zakaz tugmasi o'chirilmadi: %s", e)
+            old_deleted = False
     msg = await context.bot.send_message(
         chat_id=gid,
-        text=(
-            "🆕 ZAKAZ BERISH\n\n"
-            "Pastdagi tugmani bosing — bot bilan shaxsiy chat ochiladi.\n"
-            "U yerda model, detallar, muddatni tugmalar bilan tanlaysiz va narxini ko'rasiz.\n"
-            "Zakaz raqami avtomatik beriladi va shu guruhga chiqadi."
-        ),
+        text="🆕 Zakaz berish uchun tugmani bosing 👇",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
             "🆕 Zakaz berish", url=f"https://t.me/{username}?start=zakaz")]]),
     )
+    set_setting("zakaz_tugma_msg", str(msg.message_id))
     pinned = False
     try:
         await context.bot.pin_chat_message(chat_id=gid, message_id=msg.message_id, disable_notification=True)
@@ -8653,6 +8680,9 @@ async def zakaztugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Guruhga '🆕 Zakaz berish' tugmasi yuborildi"
         + (" va qadab qo'yildi." if pinned else ".\n⚠️ Qadab qo'yolmadim (bot guruhda admin emas) — xabarni o'zingiz qadang.")
+        + ("\n🗑 Eski tugmali xabar o'chirildi." if old_deleted else "")
+        + ("\n⚠️ Eski tugmali xabarni o'chirolmadim — uni o'zingiz o'chiring." if old_deleted is False else "")
+        + ("\nℹ️ Oldingi uzun '🆕 ZAKAZ BERISH' xabari bo'lsa, uni qo'lda o'chiring." if old is None else "")
     )
 
 
