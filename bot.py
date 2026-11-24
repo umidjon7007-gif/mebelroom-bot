@@ -2356,7 +2356,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-24 (56) | zakaz: bitta-bitta savol (sodda)"
+BOT_VERSION = "2026-11-24 (57) | zakaz: Qayerga? boshida, komplekt turlari, sodda muddat, narx har qadamda"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -8518,7 +8518,21 @@ def zk_variants(zk, model):
 
 def zk_cart_block(zk):
     cart = zk_cart_lines(zk)
-    return (["", "🛒 Hozircha tanlandi:"] + cart) if cart else []
+    if not cart:
+        return []
+    total, missing = zk_price(zk)
+    price = f"💰 Hozircha: {format_money(total, 'usd')}" + (" (viloyat narxi)" if zk.get("dastavka") else "")
+    if missing:
+        price += " ⚠️ ba'zi narxlar yo'q"
+    return ["", "🛒 Hozircha tanlandi:"] + cart + [price]
+
+
+ZK_KVAR = {
+    "o": ([], "📦 Komplekt"),
+    "k": (["krovat110"], "📦 Komplekt — 110 lik krovat bilan"),
+    "s": (["shkaf4eshik"], "📦 Komplekt — 4 eshikli shkaf bilan"),
+    "ks": (["krovat110", "shkaf4eshik"], "📦 Komplekt — 110 lik krovat + 4 eshikli shkaf"),
+}
 
 
 def zk_type_view(zk):
@@ -8526,11 +8540,14 @@ def zk_type_view(zk):
     n = tayyor_counts().get(model.lower())
     lines = [f"🛏 {model.capitalize()}" + (f" — ✅ {n} ta tayyor komplekt" if n else ""), "", "Nima kerak?"]
     lines += zk_cart_block(zk)
-    return "\n".join(lines), InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 Komplekt", callback_data="zk:t:k")],
-        [InlineKeyboardButton("🧩 Alohida detal", callback_data="zk:t:d")],
-        [InlineKeyboardButton("⬅️ Boshqa model", callback_data="zk:models")],
-    ])
+    have = set(zk_variants(zk, model))
+    rows = []
+    for code, (vs, label) in ZK_KVAR.items():
+        if all(v in have for v in vs):
+            rows.append([InlineKeyboardButton(label, callback_data=f"zk:tk:{code}")])
+    rows.append([InlineKeyboardButton("🧩 Alohida detal", callback_data="zk:t:d")])
+    rows.append([InlineKeyboardButton("⬅️ Boshqa model", callback_data="zk:models")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 def zk_qty_view(zk, title):
@@ -8553,28 +8570,14 @@ def zk_detail_pick_view(zk):
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-def zk_variant_view(zk):
-    v = zk["vq"][0]
-    q, a, b = ZK_SWAP_Q[v]
-    n = zk["last_k"]
-    lines = [q]
-    if n > 1:
-        lines.append(f"({n} ta komplektning hammasi uchun; aralash bo'lsa izohga yozing)")
-    lines += zk_cart_block(zk)
-    return "\n".join(lines), InlineKeyboardMarkup([
-        [InlineKeyboardButton(a, callback_data=f"zk:vk:{v}:0")],
-        [InlineKeyboardButton(b, callback_data=f"zk:vk:{v}:1")],
-    ])
-
-
 def zk_more_view(zk):
-    lines = ["🛒 Hozircha tanlandi:"] + zk_cart_lines(zk) + ["", "Yana nima qo'shasiz?"]
+    lines = zk_cart_block(zk)[1:] + ["", "Yana nima qo'shasiz?"]
     model = zk.get("model")
     rows = []
     if model:
         rows.append([InlineKeyboardButton(f"🧩 {model.capitalize()}dan alohida detal", callback_data="zk:t:d")])
         if zk_has_komplekt(zk, model):
-            rows.append([InlineKeyboardButton(f"📦 {model.capitalize()}dan yana komplekt", callback_data="zk:t:k")])
+            rows.append([InlineKeyboardButton(f"📦 {model.capitalize()}dan komplekt", callback_data="zk:t:k")])
     rows.append([InlineKeyboardButton("🛏 Boshqa model", callback_data="zk:models")])
     if zk.get("hist"):
         rows.append([InlineKeyboardButton("↩️ Oxirgisini o'chirish", callback_data="zk:undo")])
@@ -8583,16 +8586,16 @@ def zk_more_view(zk):
 
 
 def zk_apply_qty(zk, n):
-    """Tanlangan sonni savatga qo'shadi. Qaytaradi: keyingi ko'rinish."""
+    """Tanlangan sonni savatga qo'shadi va 'Yana nima?' ko'rinishini qaytaradi."""
     model = zk["model"]
     c = zk["cart"].setdefault(model, {"k": 0, "sw": {}, "it": {}})
     if zk.get("qmode") == "k":
         c["k"] += n
-        zk.setdefault("hist", []).append(("k", model, n, {}))
-        zk["last_k"] = n
-        zk["vq"] = zk_variants(zk, model)
-        if zk["vq"]:
-            return zk_variant_view(zk)
+        added = {}
+        for v in zk.get("kvar", []):
+            c["sw"][v] = c["sw"].get(v, 0) + n
+            added[v] = n
+        zk.setdefault("hist", []).append(("k", model, n, added))
         return zk_more_view(zk)
     it = zk["qitem"]
     c["it"][it] = c["it"].get(it, 0) + n
@@ -8600,26 +8603,57 @@ def zk_apply_qty(zk, n):
     return zk_more_view(zk)
 
 
-def zk_vil_view(zk):
-    lines = ["🆕 Zakaz", "", "🛒 Tanlanganlar:"] + zk_cart_lines(zk) + ["", "🚛 Viloyatga ketadimi?"]
-    return "\n".join(lines), InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚛 Ha, viloyatga", callback_data="zk:v:1"),
-         InlineKeyboardButton("🏠 Yo'q", callback_data="zk:v:0")],
-        [InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:more")],
-    ])
+def zk_loc_view():
+    return (
+        "🆕 Zakaz\n\n📍 Qayerga?",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏙 Toshkent (o'rnatib beriladi)", callback_data="zk:loc:t")],
+            [InlineKeyboardButton("🚛 Viloyatga (o'rnatishsiz)", callback_data="zk:loc:v")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="zk:cancel")],
+        ]),
+    )
 
 
 def zk_date_view(zk):
     today = datetime.now(TASHKENT_TZ).date()
-    buttons = []
-    for i in range(0, 15):
-        d = today + timedelta(days=i)
-        label = "Bugun" if i == 0 else ("Ertaga" if i == 1 else f"{d.day:02d}.{d.month:02d} {ZK_WEEKDAYS[d.weekday()]}")
-        buttons.append(InlineKeyboardButton(label, callback_data=f"zk:d:{d.isoformat()}"))
-    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([InlineKeyboardButton("📅 Boshqa sana (yozaman)", callback_data="zk:d:other")])
-    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:next")])
-    return "📅 Muddat — qachon kerak?", InlineKeyboardMarkup(rows)
+    opts = [(0, "Bugun"), (1, "Ertaga"), (2, "2 kundan keyin"), (3, "3 kundan keyin"), (7, "1 haftadan keyin")]
+    rows = []
+    for add, label in opts:
+        d = today + timedelta(days=add)
+        rows.append([InlineKeyboardButton(f"{label} ({d.day:02d}.{d.month:02d})", callback_data=f"zk:d:{d.isoformat()}")])
+    rows.append([InlineKeyboardButton("📅 Boshqa sana", callback_data="zk:dm")])
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:more")])
+    lines = ["📅 Qachonga kerak?"] + zk_cart_block(zk)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def zk_month_view():
+    today = datetime.now(TASHKENT_TZ).date()
+    rows = []
+    y, m = today.year, today.month
+    for _ in range(3):
+        rows.append([InlineKeyboardButton(ZK_OYLAR[m].capitalize(), callback_data=f"zk:dmo:{y}-{m:02d}")])
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:date")])
+    return "📅 Qaysi oy?", InlineKeyboardMarkup(rows)
+
+
+def zk_day_view(ym):
+    y, m = map(int, ym.split("-"))
+    today = datetime.now(TASHKENT_TZ).date()
+    first = date(y, m, 1)
+    nxt = date(y + (m == 12), m % 12 + 1, 1)
+    btns = []
+    d = first
+    while d < nxt:
+        if d >= today:
+            btns.append(InlineKeyboardButton(str(d.day), callback_data=f"zk:d:{d.isoformat()}"))
+        d += timedelta(days=1)
+    rows = [btns[i:i + 7] for i in range(0, len(btns), 7)]
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="zk:dm")])
+    return f"📅 {ZK_OYLAR[m].capitalize()} — qaysi kun?", InlineKeyboardMarkup(rows)
 
 
 def zk_izoh_view():
@@ -8639,8 +8673,7 @@ def zk_summary_view(zk):
     total, missing = zk_price(zk)
     lines = ["📝 Zakazingizni tekshiring:", "", f"🏪 {zk_store_name()}"] + zk_cart_lines(zk)
     lines.append(f"📅 Muddat: {zk_deadline_display(d)}")
-    if zk.get("dastavka"):
-        lines.append("🚛 Viloyatga")
+    lines.append("🚛 Viloyatga (o'rnatishsiz)" if zk.get("dastavka") else "🏙 Toshkent (o'rnatib beriladi)")
     if zk.get("izoh"):
         lines.append(f"📝 Izoh: {zk['izoh']}")
     lines.append(f"💰 Narxi: {format_money(total, 'usd')}" + (" (viloyat narxi)" if zk.get("dastavka") else ""))
@@ -8665,7 +8698,7 @@ async def zk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["awaiting"] = None
     context.user_data["zk"] = {"cart": {}, "items": {}, "model": None}
-    text, kb = zk_models_view(context.user_data["zk"])
+    text, kb = zk_loc_view()
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -8772,7 +8805,7 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Kechirasiz, zakaz berish faqat do'kon guruhi a'zolari uchun.")
                 return
             context.user_data["zk"] = {"cart": {}, "items": {}, "model": None}
-            text, kb = zk_models_view(context.user_data["zk"])
+            text, kb = zk_loc_view()
             await query.message.reply_text(text, reply_markup=kb)
             return
         await query.edit_message_text("Bu zakaz oynasi eskirgan. Guruhdagi '🆕 Zakaz berish' tugmasini qayta bosing.")
@@ -8803,10 +8836,20 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zk["back"] = "models"
             await zk_edit(query, zk_detail_pick_view(zk))
         return
+    if data.startswith("zk:loc:"):
+        zk["dastavka"] = data.endswith(":v")
+        await zk_edit(query, zk_models_view(zk))
+        return
     if data == "zk:t:k" and zk.get("model"):
-        zk["qmode"] = "k"
         zk["back"] = "type"
-        await zk_edit(query, zk_qty_view(zk, f"📦 {zk['model'].capitalize()} komplekt"))
+        await zk_edit(query, zk_type_view(zk))
+        return
+    if data.startswith("zk:tk:") and zk.get("model"):
+        vs, label = ZK_KVAR.get(data[6:], ([], "📦 Komplekt"))
+        zk["qmode"] = "k"
+        zk["kvar"] = vs
+        zk["back"] = "type"
+        await zk_edit(query, zk_qty_view(zk, f"{label.replace('📦 Komplekt', '📦 ' + zk['model'].capitalize() + ' komplekt')}"))
         return
     if data == "zk:t:d" and zk.get("model"):
         zk["back"] = "type" if zk_has_komplekt(zk, zk["model"]) else "models"
@@ -8824,16 +8867,6 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith("zk:q:") and zk.get("model"):
         await zk_edit(query, zk_apply_qty(zk, int(data[5:])))
-        return
-    if data.startswith("zk:vk:") and zk.get("vq"):
-        _, _, v, yes = data.split(":")
-        c = zk["cart"][zk["model"]]
-        if yes == "1":
-            c["sw"][v] = c["sw"].get(v, 0) + zk["last_k"]
-            if zk.get("hist") and zk["hist"][-1][0] == "k":
-                zk["hist"][-1][3][v] = zk["last_k"]
-        zk["vq"] = [x for x in zk["vq"] if x != v]
-        await zk_edit(query, zk_variant_view(zk) if zk["vq"] else zk_more_view(zk))
         return
     if data == "zk:more":
         await zk_edit(query, zk_more_view(zk) if zk_entries(zk) else zk_models_view(zk))
@@ -8856,7 +8889,16 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, kb = zk_models_view(zk)
             await zk_edit(query, (text + "\n\n⚠️ Hali hech narsa tanlanmadi.", kb))
             return
-        await zk_edit(query, zk_vil_view(zk))
+        await zk_edit(query, zk_date_view(zk))
+        return
+    if data == "zk:date":
+        await zk_edit(query, zk_date_view(zk))
+        return
+    if data == "zk:dm":
+        await zk_edit(query, zk_month_view())
+        return
+    if data.startswith("zk:dmo:"):
+        await zk_edit(query, zk_day_view(data[7:]))
         return
     if data == "zk:back":
         back = zk.get("back")
@@ -8867,14 +8909,6 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await zk_edit(query, zk_detail_pick_view(zk))
         else:
             await zk_edit(query, zk_models_view(zk))
-        return
-    if data.startswith("zk:v:"):
-        zk["dastavka"] = data.endswith("1")
-        await zk_edit(query, zk_date_view(zk))
-        return
-    if data == "zk:d:other":
-        context.user_data["awaiting"] = "zk_sana"
-        await query.edit_message_text("📅 Sanani kun.oy ko'rinishida yozing, masalan: 05.12")
         return
     if data.startswith("zk:d:"):
         zk["deadline"] = data[5:]
