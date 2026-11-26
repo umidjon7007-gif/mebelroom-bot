@@ -2378,7 +2378,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-24 (59) | komplektdan olib tashlash; mijoz pulida buyurtma tarkibi"
+BOT_VERSION = "2026-11-26 (60) | mijoz puli: har buyurtma uchun ✅ olindi"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -10131,6 +10131,59 @@ def order_short_desc(cur, guruh_id):
     return ("🏪 " + cust + ": " if cust else "") + ", ".join(parts)
 
 
+def kassa_open_orders(cur, worker):
+    """Ishchida hali turgan (egaga berilmagan) buyurtma pullari:
+    [(kassa_id, guruh_id, currency, qolgan, sana, tashqi_raqam)].
+    Buyurtmaga bog'langan 'berdi' - o'sha buyurtmadan, umumiy berdi/maosh - eng eskisidan yopadi."""
+    cur.execute(
+        "SELECT k.id, k.guruh_id, k.currency, k.amount, substr(k.created_at, 1, 10), "
+        "(SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = k.guruh_id LIMIT 1) "
+        "FROM kassa k WHERE LOWER(k.worker) = LOWER(?) AND k.turi = 'olindi' AND k.status = 'tasdiqlandi' ORDER BY k.id",
+        (worker,),
+    )
+    rows = [list(r) for r in cur.fetchall()]
+    cur.execute(
+        "SELECT guruh_id, currency, amount FROM kassa WHERE LOWER(worker) = LOWER(?) "
+        "AND turi IN ('berdi', 'maosh') AND status = 'tasdiqlandi' ORDER BY id",
+        (worker,),
+    )
+    deds = cur.fetchall()
+    pool = {}
+    for gid, currency, amount in deds:
+        left = amount or 0
+        if gid is not None:
+            for r in rows:
+                if left <= 0:
+                    break
+                if r[1] == gid and r[2] == currency and r[3] > 0:
+                    t = min(r[3], left)
+                    r[3] -= t
+                    left -= t
+        if left > 0:
+            pool[currency] = pool.get(currency, 0) + left
+    for r in rows:
+        left = pool.get(r[2], 0)
+        if left > 0 and r[3] > 0:
+            t = min(r[3], left)
+            r[3] -= t
+            pool[r[2]] = left - t
+    return [tuple(r) for r in rows if r[3] > 0]
+
+
+def mijoz_puli_keyboard(cur, worker, back_wid=None):
+    rows = []
+    open_rows = kassa_open_orders(cur, worker)
+    for kid, gid, currency, rem, d, tashqi in open_rows[-15:][::-1]:
+        rows.append([InlineKeyboardButton(f"✅ №{tashqi or gid} — {fmt_cash(currency, rem)} olindi", callback_data=f"ko:o:{kid}")])
+    if open_rows:
+        rows.append([InlineKeyboardButton(f"✅ Hammasi olindi — {kassa_balance_text(kassa_balance(cur, worker))}",
+                                          callback_data=f"ko:all:{worker}"[:64])])
+        rows.append([InlineKeyboardButton("✏️ Boshqa summa", callback_data=f"ko:sum:{worker}"[:64])])
+    if back_wid is not None:
+        rows.append([InlineKeyboardButton(f"⬅️ {worker}", callback_data=f"wk:w:{back_wid}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 def mijoz_puli_lines(cur, worker, header):
     """Ishchi qo'lidagi mijoz puli va oxirgi olingan pullar ro'yxati."""
     bal = kassa_balance(cur, worker)
@@ -10159,13 +10212,18 @@ def mijoz_puli_lines(cur, worker, header):
         return f"{p[2]}.{p[1]}" if len(p) == 3 else d
 
     lines = [f"{header} {kassa_balance_text(bal)}"]
-    if recent:
-        lines += ["", "📥 Mijozlardan olingan (oxirgilari):"]
-        for gid, c, a, d, tashqi in recent:
+    open_rows = kassa_open_orders(cur, worker)
+    if open_rows:
+        lines += ["", "📥 Hali egaga berilmagan:"]
+        for kid, gid, c, a, d, tashqi in open_rows[-15:][::-1]:
             lines.append(f"   №{tashqi or gid} — {fmt_cash(c, a)} ({dm(d)})")
             what = order_short_desc(cur, gid)
             if what:
                 lines.append(f"      {what}")
+        if len(open_rows) > 15:
+            lines.append(f"   ... yana {len(open_rows) - 15} ta eskiroq")
+    elif recent:
+        lines += ["", "✅ Hamma buyurtma pullari egaga berilgan."]
     if given:
         lines += ["", "📤 Berilgan (oxirgilari):"]
         for t, c, a, d in given:
@@ -10370,14 +10428,14 @@ def kassa_olindi_keyboard():
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-def kassa_owner_take(worker, currency, amount):
+def kassa_owner_take(worker, currency, amount, guruh_id=None):
     now = datetime.now(TASHKENT_TZ).isoformat(timespec="seconds")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO kassa (worker, currency, amount, turi, guruh_id, status, created_at, confirmed_at) "
-        "VALUES (?, ?, ?, 'berdi', NULL, 'tasdiqlandi', ?, ?)",
-        (worker, currency, amount, now, now),
+        "VALUES (?, ?, ?, 'berdi', ?, 'tasdiqlandi', ?, ?)",
+        (worker, currency, amount, guruh_id, now, now),
     )
     bal = kassa_balance(cur, worker)
     tg = worker_telegram_id(cur, worker)
@@ -10401,12 +10459,58 @@ async def kassa_take_done(bot, worker, taken, bal, tg):
     return text
 
 
+async def kassa_order_taken(update, context, query, kid):
+    """Bitta buyurtma pulini egaga berildi deb yozadi va ro'yxatni yangilaydi."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT worker FROM kassa WHERE id = ?", (kid,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        await query.edit_message_text("Bu yozuv topilmadi.")
+        return
+    worker = r[0]
+    row = next((x for x in kassa_open_orders(cur, worker) if x[0] == kid), None)
+    cur.execute("SELECT rowid FROM workers WHERE LOWER(name) = LOWER(?)", (worker,))
+    w = cur.fetchone()
+    wid = w[0] if w else None
+    conn.close()
+    if row is not None:
+        _, gid, currency, rem, _, tashqi = row
+        bal, tg = kassa_owner_take(worker, currency, rem, gid)
+        if tg:
+            try:
+                await context.bot.send_message(
+                    chat_id=tg,
+                    text=f"💵 Ega №{tashqi or gid} uchun {fmt_cash(currency, rem)} mijoz pulini oldi deb yozdi.\n"
+                         f"💰 Sizda qoldi: {kassa_balance_text(bal)}",
+                )
+            except Exception as e:
+                logger.warning("Ishchiga kassa xabari yuborilmadi: %s", e)
+    conn = get_conn()
+    cur = conn.cursor()
+    lines = mijoz_puli_lines(cur, worker, f"💰 {worker}dagi mijoz puli:")
+    if row is not None:
+        lines = [f"✅ №{row[5] or row[1]} — {fmt_cash(row[2], row[3])} olindi", ""] + lines
+    else:
+        lines = ["ℹ️ Bu buyurtma puli allaqachon olingan.", ""] + lines
+    kb = mijoz_puli_keyboard(cur, worker, wid)
+    conn.close()
+    try:
+        await query.edit_message_text("\n".join(lines), reply_markup=kb)
+    except BadRequest:
+        pass
+
+
 async def kassa_olindi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_owner(update):
         await query.answer("Bu faqat egasi uchun.", show_alert=True)
         return
     await query.answer()
+    if query.data.startswith("ko:o:"):
+        await kassa_order_taken(update, context, query, int(query.data[5:]))
+        return
     _, action, worker = query.data.split(":", 2)
     conn = get_conn()
     cur = conn.cursor()
@@ -12191,8 +12295,9 @@ async def wk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = get_conn()
         cur = conn.cursor()
         lines = mijoz_puli_lines(cur, worker, f"💰 {worker}dagi mijoz puli:")
+        kb = mijoz_puli_keyboard(cur, worker, wid)
         conn.close()
-        await query.edit_message_text("\n".join(lines), reply_markup=back)
+        await query.edit_message_text("\n".join(lines), reply_markup=kb or back)
         return
     if action == "tarix":
         conn = get_conn()
