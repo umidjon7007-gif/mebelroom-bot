@@ -415,7 +415,7 @@ def init_db():
     if "source_message_id" not in pending_columns:
         cur.execute("ALTER TABLE pending_group_orders ADD COLUMN source_message_id INTEGER")
     for col, coltype in (("tashqi_raqam", "TEXT"), ("izoh", "TEXT"), ("dastavka", "INTEGER"),
-                         ("ai_json", "TEXT"), ("savol", "TEXT")):
+                         ("ai_json", "TEXT"), ("savol", "TEXT"), ("aksessuar_json", "TEXT")):
         if col not in pending_columns:
             cur.execute(f"ALTER TABLE pending_group_orders ADD COLUMN {col} {coltype}")
 
@@ -543,6 +543,26 @@ def init_db():
         )
         """
     )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_aksessuar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guruh_id INTEGER NOT NULL,
+            nomi TEXT NOT NULL COLLATE NOCASE,
+            soni INTEGER NOT NULL,
+            narx INTEGER NOT NULL
+        )
+        """
+    )
+    cur.execute("SELECT value FROM settings WHERE key = 'aksessuar_seeded'")
+    if cur.fetchone() is None:
+        cur.execute("INSERT OR IGNORE INTO narxlar (turi, model, item, rate) VALUES ('aksessuar', '', 'truba', 5)")
+        cur.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('aksessuar_izoh:truba', ?)",
+            ("shkafga veshilka trubasi (turuba, truba shkafga, veshilka, shtanga)",),
+        )
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('aksessuar_seeded', '1')")
 
     # Viloyat chegirmalari ($): viloyatga ketsa sotish narxidan ayriladigan summa (bir marta yoziladi).
     cur.execute("SELECT value FROM settings WHERE key = 'viloyat_seeded'")
@@ -2378,7 +2398,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-26 (60) | mijoz puli: har buyurtma uchun ✅ olindi"
+BOT_VERSION = "2026-11-27 (61) | aksessuarlar (truba +5$), /aiqoida"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -7799,6 +7819,25 @@ def ai_catalog():
     return catalog
 
 
+def ai_extra_prompt():
+    parts = []
+    aks = aksessuar_list()
+    if aks:
+        parts.append(
+            "ACCESSORIES (priced extras, NOT furniture, not in the catalog). If the message mentions one, "
+            "do NOT treat it as a catalog item and do NOT ask about it; put it in \"aksessuar\" as "
+            "{name: count}, e.g. \"aksessuar\": {\"truba\": 1}:\n"
+            + "\n".join(f"- {n}: {iz}" for n, _, iz in aks)
+        )
+    try:
+        rules = json.loads(get_setting("ai_qoidalar") or "[]")
+    except ValueError:
+        rules = []
+    if rules:
+        parts.append("EXTRA RULES FROM THE OWNER (follow them):\n" + "\n".join(f"- {r}" for r in rules))
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 def ai_system_prompt(catalog):
     cat_lines = "\n".join(f"- {m}: {', '.join(items)}" for m, items in sorted(catalog.items()))
     return (
@@ -7828,10 +7867,11 @@ def ai_system_prompt(catalog):
         "- dastavka: true if it goes to a region / is shipped ('viloyat', 'dastavka', 'pochta', 'jo'natiladi').\n"
         "- buyurtma: false if the message is not an order (chat, question, greeting, report).\n"
         "- savol: a short Uzbek note on anything unclear, else null.\n\n"
+        + ai_extra_prompt() + "\n\n"
         "Reply with JSON only, no other text:\n"
         '{"buyurtma": true, "qatorlar": [{"model": "kafino", "item": "komplekt", "soni": 1, "tur": "oddiy"}, '
         '{"model": "kafino", "item": "kamod", "soni": 1, "tur": "ayir"}], "kun": 28, "oy": 10, '
-        '"raqam": "49", "izoh": null, "dastavka": false, "savol": null}'
+        '"raqam": "49", "izoh": null, "dastavka": false, "aksessuar": {}, "savol": null}'
     )
 
 
@@ -7891,6 +7931,21 @@ def ai_extract_json(text):
         return json.loads(text[start:end + 1])
     except ValueError:
         return None
+
+
+def ai_norm_aksessuar(raw):
+    known = {n.lower() for n, _, _ in aksessuar_list()}
+    out = {}
+    if isinstance(raw, dict):
+        for n, q in raw.items():
+            n = str(n).strip().lower()
+            try:
+                q = int(q)
+            except (TypeError, ValueError):
+                q = 1
+            if n in known and q > 0:
+                out[n] = out.get(n, 0) + q
+    return out
 
 
 def ai_normalize(result, catalog):
@@ -7955,6 +8010,7 @@ def ai_normalize(result, catalog):
         "raqam": raqam,
         "izoh": (str(result.get("izoh")).strip() or None) if result.get("izoh") else None,
         "dastavka": bool(result.get("dastavka")),
+        "aksessuar": ai_norm_aksessuar(result.get("aksessuar")),
         "problems": problems,
     }
 
@@ -8060,12 +8116,24 @@ def pending_card(pid):
     for e in entries:
         lines.append("• " + describe_entry(*e))
     lines.append(f"Muddat: {deadline_display}" if deadline else "Muddat: ❗ topilmadi")
+    aks = []
+    try:
+        aconn = get_conn()
+        acur = aconn.cursor()
+        acur.execute("SELECT aksessuar_json FROM pending_group_orders WHERE id = ?", (pid,))
+        ar = acur.fetchone()
+        aconn.close()
+        aks = aks_from_json(ar[0] if ar else None)
+    except Exception:
+        aks = []
+    lines += aksessuar_lines(aks)
     if entries:
         try:
             pconn = get_conn()
             total, missing = compute_rows_sale(
                 pconn.cursor(), [(m, i, a, mt, 1 if dastavka else 0) for m, i, a, mt in entries]
             )
+            total += sum(q * p for _, q, p in aks)
             pconn.close()
             lines.append(f"💰 Narxi: {format_money(total, 'usd')}" + (" (🚛 viloyat narxi)" if dastavka else ""))
             if missing:
@@ -8141,8 +8209,8 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
         """
         INSERT INTO pending_group_orders
             (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id,
-             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol, aksessuar_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             main_model,
@@ -8160,6 +8228,7 @@ async def send_group_order_confirmation(context: ContextTypes.DEFAULT_TYPE, chat
             1 if parsed["dastavka"] else 0,
             parsed.get("ai_json"),
             "; ".join(parsed["problems"]) or None,
+            json.dumps(parsed.get("aksessuar") or {}),
         ),
     )
     pending_id = cur.lastrowid
@@ -8347,6 +8416,10 @@ async def gord_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("UPDATE orders SET tashqi_raqam = ? WHERE guruh_id = ?", (tashqi_raqam, guruh_id))
     if izoh:
         cur.execute("UPDATE orders SET izoh = ? WHERE guruh_id = ?", (izoh, guruh_id))
+    cur.execute("SELECT aksessuar_json FROM pending_group_orders WHERE id = ?", (pending_id,))
+    ar = cur.fetchone()
+    for n, q, p in aks_from_json(ar[0] if ar else None):
+        cur.execute("INSERT INTO order_aksessuar (guruh_id, nomi, soni, narx) VALUES (?, ?, ?, ?)", (guruh_id, n, q, p))
     cur.execute("UPDATE pending_group_orders SET status = 'tasdiqlandi' WHERE id = ?", (pending_id,))
 
     shortage_text = shortage_warning_for_new_order(cur, entries)
@@ -8479,6 +8552,8 @@ def zk_cart_lines(zk):
         for it, q in c["it"].items():
             if q:
                 lines.append(f"• {name} {ZK_PRETTY.get(it, it)} — {q} ta")
+    for n, q, p in zk_aks_rows(zk):
+        lines.append(f"🔧 {n} — {q} ta")
     return lines
 
 
@@ -8498,13 +8573,18 @@ def zk_entries(zk):
     return out
 
 
+def zk_aks_rows(zk):
+    return [(n, q, aksessuar_narx(n) or 0) for n, q in zk.get("aks", {}).items() if q]
+
+
 def zk_price(zk):
     entries = zk_entries(zk)
     if not entries:
         return 0, 0
     conn = get_conn()
     try:
-        return compute_rows_sale(conn.cursor(), [(m, i, a, mt, 1 if zk.get("dastavka") else 0) for m, i, a, mt in entries])
+        total, missing = compute_rows_sale(conn.cursor(), [(m, i, a, mt, 1 if zk.get("dastavka") else 0) for m, i, a, mt in entries])
+        return total + sum(q * p for _, q, p in zk_aks_rows(zk)), missing
     finally:
         conn.close()
 
@@ -8590,6 +8670,9 @@ def zk_grid_view(zk, note=None):
     for idx in order:
         it = items[idx]
         rows.append([InlineKeyboardButton(f"{ZK_PRETTY.get(it, it)} — {c['it'].get(it, 0)} ta  ➕", callback_data=f"zk:a:i:{idx}")])
+    for n, p, _ in aksessuar_list():
+        q = zk.get("aks", {}).get(n, 0)
+        rows.append([InlineKeyboardButton(f"🔧 {n} (+{p}$) — {q} ta  ➕", callback_data=f"zk:x:{n}"[:64])])
     rows.append([
         InlineKeyboardButton("↩️ Oxirgisini o'chirish", callback_data="zk:undo"),
         InlineKeyboardButton("🗑 Tozalash", callback_data="zk:clear"),
@@ -8848,6 +8931,133 @@ async def zakaztugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def aksessuar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = context.args or []
+    if len(args) >= 2 and args[1].isdigit():
+        nomi = args[0].lower()
+        narx = int(args[1])
+        izoh = " ".join(args[2:]).strip()
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO narxlar (turi, model, item, rate) VALUES ('aksessuar', '', ?, ?)", (nomi, narx)
+        )
+        if izoh:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"aksessuar_izoh:{nomi}", izoh))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"✅ Aksessuar: {nomi} — {narx}$" + (f"\n📝 {izoh}" if izoh else ""))
+        return
+    rows = aksessuar_list()
+    lines = ["🔧 Aksessuarlar (narxga qo'shiladi, omborda sanalmaydi):", ""]
+    lines += [f"• {n} — {p}$" + (f"  ({iz})" if iz else "") for n, p, iz in rows] or ["(hali yo'q)"]
+    lines += [
+        "",
+        "Qo'shish/o'zgartirish: /aksessuar <nomi> <narx$> [AI uchun tushuntirish]",
+        "Misol: /aksessuar bortik 10 krovatga bortik (bortik, bortiq)",
+        "O'chirish: /aksessuarochir <nomi>",
+        "Buyurtmaga qo'shish: /aksessuarqoshish <bot raqami> <nomi> [soni]",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def aksessuarochir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Foydalanish: /aksessuarochir <nomi>")
+        return
+    nomi = context.args[0].lower()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM narxlar WHERE turi = 'aksessuar' AND model = '' AND item = ?", (nomi,))
+    n = cur.rowcount
+    cur.execute("DELETE FROM settings WHERE key = ?", (f"aksessuar_izoh:{nomi}",))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"🗑 {nomi} o'chirildi." if n else f"'{nomi}' topilmadi.")
+
+
+async def aksessuarqoshish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    args = context.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "Foydalanish: /aksessuarqoshish <bot raqami> <nomi> [soni]\nMisol: /aksessuarqoshish 352 truba 1\n"
+            "Olib tashlash: soni 0 deb yozing."
+        )
+        return
+    gid = int(args[0])
+    nomi = args[1].lower()
+    soni = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
+    narx = aksessuar_narx(nomi)
+    if narx is None:
+        await update.message.reply_text(f"'{nomi}' aksessuari yo'q. Ro'yxat: /aksessuar")
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM orders WHERE guruh_id = ? LIMIT 1", (gid,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        await update.message.reply_text(f"№{gid} buyurtma topilmadi.")
+        return
+    cur.execute("DELETE FROM order_aksessuar WHERE guruh_id = ? AND nomi = ?", (gid, nomi))
+    if soni > 0:
+        cur.execute("INSERT INTO order_aksessuar (guruh_id, nomi, soni, narx) VALUES (?, ?, ?, ?)", (gid, nomi, soni, narx))
+    conn.commit()
+    conn.close()
+    note = "" if r[0] == "kutilmoqda" else "\n⚠️ Buyurtma allaqachon topshirilgan — to'lov hisobi o'zgarmaydi, kerak bo'lsa /tolovtuzatish."
+    await update.message.reply_text(
+        (f"✅ №{gid}: 🔧 {nomi} ×{soni} (+{narx * soni}$)" if soni > 0 else f"🗑 №{gid}: {nomi} olib tashlandi")
+        + order_price_line(gid) + note
+    )
+
+
+async def aiqoida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    try:
+        rules = json.loads(get_setting("ai_qoidalar") or "[]")
+    except ValueError:
+        rules = []
+    text = " ".join(context.args or []).strip()
+    if text:
+        rules.append(text[:300])
+        set_setting("ai_qoidalar", json.dumps(rules, ensure_ascii=False))
+        await update.message.reply_text(f"✅ AI qoidasi qo'shildi (№{len(rules)}):\n{text}")
+        return
+    lines = ["🤖 AI uchun qoidalar:", ""]
+    lines += [f"{i}. {r}" for i, r in enumerate(rules, 1)] or ["(hali yo'q)"]
+    lines += ["", "Qo'shish: /aiqoida <qoida>",
+              "Misol: /aiqoida 'bortik' so'zi krovatga bortik degani, izohga yoz",
+              "O'chirish: /aiqoidaochir <raqam>"]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def aiqoidaochir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny_access(update)
+        return
+    try:
+        rules = json.loads(get_setting("ai_qoidalar") or "[]")
+    except ValueError:
+        rules = []
+    if not context.args or not context.args[0].isdigit() or not 1 <= int(context.args[0]) <= len(rules):
+        await update.message.reply_text("Foydalanish: /aiqoidaochir <raqam>  (ro'yxat: /aiqoida)")
+        return
+    r = rules.pop(int(context.args[0]) - 1)
+    set_setting("ai_qoidalar", json.dumps(rules, ensure_ascii=False))
+    await update.message.reply_text(f"🗑 O'chirildi: {r}")
+
+
 async def zakazraqam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await deny_access(update)
@@ -8929,6 +9139,13 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zk.setdefault("hist", []).append(("d", model, 1, it))
         await zk_edit(query, zk_grid_view(zk))
         return
+    if data.startswith("zk:x:") and zk.get("model"):
+        n = data[5:]
+        aks = zk.setdefault("aks", {})
+        aks[n] = aks.get(n, 0) + 1
+        zk.setdefault("hist", []).append(("x", zk["model"], 1, n))
+        await zk_edit(query, zk_grid_view(zk))
+        return
     if data == "zk:rm" and zk.get("model"):
         await zk_edit(query, zk_rm_view(zk))
         return
@@ -8944,6 +9161,7 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "zk:clear":
         zk["cart"] = {}
+        zk["aks"] = {}
         zk["hist"] = []
         await zk_edit(query, zk_grid_view(zk, "🗑 Hammasi tozalandi.") if zk.get("model") else zk_models_view(zk))
         return
@@ -8993,8 +9211,12 @@ async def zk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c["rm"] = []
                     for v, q in extra.items():
                         c["sw"][v] = max(0, c["sw"].get(v, 0) - q)
+                elif kind == "x":
+                    zk.setdefault("aks", {})[extra] = max(0, zk.get("aks", {}).get(extra, 0) - n)
                 else:
                     c["it"][extra] = max(0, c["it"].get(extra, 0) - n)
+            elif kind == "x":
+                zk.setdefault("aks", {})[extra] = max(0, zk.get("aks", {}).get(extra, 0) - n)
         await zk_edit(query, zk_grid_view(zk) if zk.get("model") else zk_models_view(zk))
         return
     if data == "zk:next":
@@ -9102,8 +9324,8 @@ async def zk_send(update, context, query, zk):
         """
         INSERT INTO pending_group_orders
             (model, entries_json, deadline, deadline_display, customer, raw_text, source_chat_id,
-             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol)
-        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'kutilmoqda', ?, ?, ?, ?, NULL, NULL)
+             source_message_id, status, created_at, tashqi_raqam, izoh, dastavka, ai_json, savol, aksessuar_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'kutilmoqda', ?, ?, ?, ?, NULL, NULL, ?)
         """,
         (
             main_model,
@@ -9111,6 +9333,7 @@ async def zk_send(update, context, query, zk):
             d.isoformat(), display, store, group_text, gid,
             datetime.now(TASHKENT_TZ).isoformat(timespec="seconds"),
             raqam, zk.get("izoh"), 1 if zk.get("dastavka") else 0,
+            json.dumps({n: q for n, q, _ in zk_aks_rows(zk)}),
         ),
     )
     pid = cur.lastrowid
@@ -9869,6 +10092,13 @@ def format_group_text(group):
         what = f"{model} komplekt" if item is None else f"{model} {item}"
         mark = "➕ " if mod_type == "+" else ("➖ " if mod_type == "-" else "")
         lines.append(f"• {mark}{what}: {amount} ta")
+    try:
+        conn = get_conn()
+        aks = order_aksessuar_rows(conn.cursor(), group["guruh_id"])
+        conn.close()
+        lines += aksessuar_lines(aks, with_price=False)
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -10127,6 +10357,8 @@ def order_short_desc(cur, guruh_id):
             parts.append(f"{name} komplekt ×{amount}" + (f" ({', '.join(ex)})" if ex else ""))
         else:
             parts.append(f"{name} {ZK_PRETTY.get(item, item)} ×{amount}")
+    for n, q, _ in order_aksessuar_rows(cur, guruh_id):
+        parts.append(f"🔧 {n} ×{q}")
     cust = rows[0][4]
     return ("🏪 " + cust + ": " if cust else "") + ", ".join(parts)
 
@@ -11631,9 +11863,58 @@ def compute_order_sale_detail(guruh_id: int):
     cur = conn.cursor()
     cur.execute("SELECT model, item, amount, mod_type, dastavka FROM orders WHERE guruh_id = ?", (guruh_id,))
     rows = cur.fetchall()
-    result = compute_rows_sale(cur, rows)
+    total, missing = compute_rows_sale(cur, rows)
+    total += sum(q * p for _, q, p in order_aksessuar_rows(cur, guruh_id))
     conn.close()
-    return result
+    return total, missing
+
+
+def aksessuar_list():
+    """[(nomi, narx$, izoh)] - mebel emas, faqat narxga qo'shiladigan qo'shimchalar (omborda sanalmaydi)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT item, rate FROM narxlar WHERE turi = 'aksessuar' AND model = '' ORDER BY item")
+    rows = cur.fetchall()
+    out = []
+    for nomi, narx in rows:
+        cur.execute("SELECT value FROM settings WHERE key = ?", (f"aksessuar_izoh:{nomi}",))
+        r = cur.fetchone()
+        out.append((nomi, narx, r[0] if r else ""))
+    conn.close()
+    return out
+
+
+def aksessuar_narx(nomi):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT rate FROM narxlar WHERE turi = 'aksessuar' AND model = '' AND item = ?", (nomi,))
+    r = cur.fetchone()
+    conn.close()
+    return r[0] if r else None
+
+
+def order_aksessuar_rows(cur, guruh_id):
+    cur.execute("SELECT nomi, soni, narx FROM order_aksessuar WHERE guruh_id = ? ORDER BY id", (guruh_id,))
+    return cur.fetchall()
+
+
+def aksessuar_lines(aks_rows, with_price=True):
+    """aks_rows: [(nomi, soni, narx)]"""
+    return [f"🔧 {n} ×{q}" + (f" (+{format_money(p * q, 'usd')})" if with_price else "") for n, q, p in aks_rows]
+
+
+def aks_from_json(js):
+    """{"truba": 1} -> [(nomi, soni, narx)] joriy narxlar bilan."""
+    try:
+        d = json.loads(js or "{}")
+    except ValueError:
+        return []
+    out = []
+    for n, q in d.items():
+        p = aksessuar_narx(n)
+        if p is not None and int(q) > 0:
+            out.append((n, int(q), p))
+    return out
 
 
 def viloyat_chegirma(cur, model, rate_key):
@@ -13015,6 +13296,11 @@ def main():
     app.add_handler(CommandHandler("zakaz", zk_start))
     app.add_handler(CommandHandler("zakaztugma", zakaztugma))
     app.add_handler(CommandHandler("zakazraqam", zakazraqam))
+    app.add_handler(CommandHandler("aksessuar", aksessuar_cmd))
+    app.add_handler(CommandHandler("aksessuarochir", aksessuarochir))
+    app.add_handler(CommandHandler("aksessuarqoshish", aksessuarqoshish))
+    app.add_handler(CommandHandler("aiqoida", aiqoida))
+    app.add_handler(CommandHandler("aiqoidaochir", aiqoidaochir))
     app.add_handler(CallbackQueryHandler(zk_callback, pattern=r"^zk:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['qoldiq']}$"), qoldiq))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_BUTTONS['modellar']}$"), modellar))
