@@ -408,6 +408,9 @@ def init_db():
         )
         """
     )
+    cur.execute("PRAGMA table_info(mijoz_tolovlar)")
+    if "izoh" not in {r[1] for r in cur.fetchall()}:
+        cur.execute("ALTER TABLE mijoz_tolovlar ADD COLUMN izoh TEXT")
     cur.execute("PRAGMA table_info(pending_group_orders)")
     pending_columns = {row[1] for row in cur.fetchall()}
     if "entries_json" not in pending_columns:
@@ -2247,6 +2250,10 @@ async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if awaiting in ("mij_tolov", "mij_qarz"):
+        await mijoz_text(update, context, awaiting, text)
+        return
+
     if awaiting == "ko_summa":
         await kassa_olindi_amount(update, context, text)
         return
@@ -2398,7 +2405,7 @@ async def qoldiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await modellar(update, context)
 
 
-BOT_VERSION = "2026-11-27 (61) | aksessuarlar (truba +5$), /aiqoida"
+BOT_VERSION = "2026-11-28 (62) | do'kon hisobi: to'lov oldim / qarzni to'g'irlash / hisob teng"
 
 KOMPLEKT_ITEMS = ["shkaf", "krovat", "tumba", "kamod", "parta"]
 
@@ -5688,7 +5695,7 @@ def build_holat_hisobot():
     since = (today - timedelta(days=30)).isoformat()
     cur.execute(
         "SELECT t.guruh_id, t.expected_value, (SELECT tashqi_raqam FROM orders o WHERE o.guruh_id = t.guruh_id LIMIT 1) "
-        "FROM mijoz_tolovlar t WHERE t.received_amount = 0 AND t.expected_value > 0 AND t.created_at >= ? "
+        "FROM mijoz_tolovlar t WHERE t.guruh_id > 0 AND t.received_amount = 0 AND t.expected_value > 0 AND t.created_at >= ? "
         "ORDER BY t.created_at",
         (since,),
     )
@@ -12198,11 +12205,22 @@ def build_mijoz_hisob_text(customer_query: str):
         )
 
     lines = [f"🏪 {customer_query} — hisob:"]
-    total_expected = 0
-    total_received = 0
+    total_expected = sum(r[1] for r in rows)
+    total_received = sum(r[2] for r in rows)
+    SHOW = 15
+    if len(rows) > SHOW:
+        lines.append(f"(oxirgi {SHOW} ta yozuv; oldingi {len(rows) - SHOW} tasi jami hisobga kirgan)")
+        rows = rows[-SHOW:]
     for guruh_id, expected, received, payment_created_at in rows:
-        total_expected += expected
-        total_received += received
+        if guruh_id < 0:
+            cur.execute("SELECT izoh FROM mijoz_tolovlar WHERE guruh_id = ?", (guruh_id,))
+            iz = (cur.fetchone() or [None])[0] or ""
+            d = payment_created_at[:10]
+            if iz.startswith("tolov"):
+                lines.append(f"\n💵 {d} — to'lov olindi: {format_money(received, 'usd')}")
+            else:
+                lines.append(f"\n✏️ {d} — hisob to'g'irlandi: {iz.split(':', 1)[-1].strip() or ''}")
+            continue
 
         cur.execute(
             "SELECT id, model, item, amount, mod_type, deadline_display, bajarildi_at "
@@ -12312,6 +12330,57 @@ async def mijozlar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏪 Do'konni tanlang:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
+def mijoz_balance(customer):
+    e, r = get_customer_totals(customer)
+    return e - r
+
+
+def mijoz_balance_text(qarz):
+    if qarz > 0:
+        return f"❗ Qarzi: {format_money(qarz, 'usd')}"
+    if qarz < 0:
+        return f"✅ Ortiqcha to'lagan (biz qarzmiz): {format_money(abs(qarz), 'usd')}"
+    return "✅ Hisob teng (0)"
+
+
+def mijoz_adjust(customer, expected, received, izoh):
+    """Buyurtmaga bog'lanmagan yozuv (manfiy guruh_id bilan)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT MIN(guruh_id) FROM mijoz_tolovlar")
+    mn = cur.fetchone()[0]
+    gid = min(-1, (mn or 0) - 1)
+    cur.execute(
+        "INSERT INTO mijoz_tolovlar (guruh_id, customer, expected_value, received_amount, created_at, izoh) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (gid, customer, expected, received, datetime.now(TASHKENT_TZ).isoformat(timespec="seconds"), izoh),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mijoz_set_balance(customer, target):
+    cur_q = mijoz_balance(customer)
+    delta = target - cur_q
+    if delta == 0:
+        return cur_q, target
+    note = f"tuzatish: {format_money(cur_q, 'usd')} → {format_money(target, 'usd')}"
+    if delta > 0:
+        mijoz_adjust(customer, delta, 0, note)
+    else:
+        mijoz_adjust(customer, 0, -delta, note)
+    return cur_q, target
+
+
+def mijoz_keyboard(customer):
+    c = customer[:50]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 To'lov oldim", callback_data=f"mjt:p:{c}")],
+        [InlineKeyboardButton("✏️ Qarzni to'g'irlash", callback_data=f"mjt:q:{c}")],
+        [InlineKeyboardButton("✅ Hisob teng (0)", callback_data=f"mjt:0:{c}")],
+    ])
+
+
 async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -12319,10 +12388,97 @@ async def mijoz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     customer = query.data.split(":", 1)[1]
     text = build_mijoz_hisob_text(customer)
     if len(text) <= 3900:
-        await query.edit_message_text(text)
+        await query.edit_message_text(text, reply_markup=mijoz_keyboard(customer))
     else:
         await query.edit_message_text(f"🏪 {customer} — hisob (quyida, bo'laklab yuborildi):")
         await send_chunked(query.message, text.split("\n"))
+        await query.message.reply_text(
+            f"🏪 {customer}\n{mijoz_balance_text(mijoz_balance(customer))}", reply_markup=mijoz_keyboard(customer)
+        )
+
+
+async def mijoz_tolov_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Bu faqat egasi uchun.", show_alert=True)
+        return
+    await query.answer()
+    _, action, customer = query.data.split(":", 2)
+    qarz = mijoz_balance(customer)
+    cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor", callback_data=f"mjt:x:{customer[:50]}")]])
+    if action == "x":
+        context.user_data["awaiting"] = None
+        await query.edit_message_text(f"🏪 {customer}\n{mijoz_balance_text(qarz)}", reply_markup=mijoz_keyboard(customer))
+        return
+    if action == "p":
+        context.user_data["awaiting"] = "mij_tolov"
+        context.user_data["mij_customer"] = customer
+        await query.edit_message_text(
+            f"🏪 {customer}\n{mijoz_balance_text(qarz)}\n\n💵 Qancha to'lov oldingiz? Masalan: 500  yoki  6000000som",
+            reply_markup=cancel,
+        )
+        return
+    if action == "q":
+        context.user_data["awaiting"] = "mij_qarz"
+        context.user_data["mij_customer"] = customer
+        await query.edit_message_text(
+            f"🏪 {customer}\nBotda hozir: {mijoz_balance_text(qarz)}\n\n"
+            "✏️ Hozirgi TO'G'RI qarzni yozing ($):\n"
+            "• 250 — do'kon bizga 250$ qarz\n• 0 — hisob teng\n• -125 — biz do'konga 125$ qarzmiz",
+            reply_markup=cancel,
+        )
+        return
+    if action == "0":
+        await query.edit_message_text(
+            f"🏪 {customer}\nBotda hozir: {mijoz_balance_text(qarz)}\n\nHisobni 0 (teng) qilaymi?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Ha, teng", callback_data=f"mjt:0ok:{customer[:50]}"),
+                InlineKeyboardButton("❌ Yo'q", callback_data=f"mjt:x:{customer[:50]}"),
+            ]]),
+        )
+        return
+    if action == "0ok":
+        old, new = mijoz_set_balance(customer, 0)
+        await query.edit_message_text(
+            f"✅ {customer} — hisob teng qilindi.\n({format_money(old, 'usd')} → 0)", reply_markup=mijoz_keyboard(customer)
+        )
+        return
+
+
+async def mijoz_text(update, context, awaiting, text):
+    customer = context.user_data.get("mij_customer")
+    if not customer:
+        context.user_data["awaiting"] = None
+        return
+    if awaiting == "mij_tolov":
+        parsed = parse_money_amount(text)
+        if not parsed or parsed[0] <= 0:
+            await update.message.reply_text("Summani tushunmadim. Masalan: 500  yoki  6000000som")
+            return
+        amount, was_som = parsed
+        context.user_data["awaiting"] = None
+        mijoz_adjust(customer, 0, amount, f"tolov: {text.strip()}")
+        await update.message.reply_text(
+            f"✅ {customer} — {format_money(amount, 'usd')} to'lov yozildi"
+            + (f" ({text.strip()})" if was_som else "")
+            + f"\n{mijoz_balance_text(mijoz_balance(customer))}",
+            reply_markup=mijoz_keyboard(customer),
+        )
+        return
+    if awaiting == "mij_qarz":
+        t = text.strip().replace(" ", "").replace("$", "")
+        neg = t.startswith("-")
+        if not t.lstrip("-").isdigit():
+            await update.message.reply_text("Faqat son yozing: 250, 0 yoki -125")
+            return
+        target = int(t.lstrip("-")) * (-1 if neg else 1)
+        context.user_data["awaiting"] = None
+        old, new = mijoz_set_balance(customer, target)
+        await update.message.reply_text(
+            f"✅ {customer} — qarz to'g'irlandi: {format_money(old, 'usd')} → {format_money(new, 'usd')}\n"
+            f"{mijoz_balance_text(mijoz_balance(customer))}",
+            reply_markup=mijoz_keyboard(customer),
+        )
 
 
 async def kopsotilgan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13423,6 +13579,7 @@ def main():
     app.add_handler(CommandHandler("topshirilganibekor", topshirilganibekor))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mijoz_callback, pattern=r"^mij:"))
+    app.add_handler(CallbackQueryHandler(mijoz_tolov_callback, pattern=r"^mjt:"))
     app.add_handler(CallbackQueryHandler(ob_callback, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(orddone_callback, pattern=r"^orddone:"))
     app.add_handler(CallbackQueryHandler(chiqdi_callback, pattern=r"^chiqdi:"))
